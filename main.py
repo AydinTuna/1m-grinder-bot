@@ -240,8 +240,8 @@ class LiveConfig:
     algo_price_protect: bool = False
 
     # Execution controls
-    entry_delay_min_seconds: float = 3.0
-    entry_delay_max_seconds: float = 3.0
+    entry_delay_min_seconds: float = 30.0
+    entry_delay_max_seconds: float = 30.0
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 1.0
