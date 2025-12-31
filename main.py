@@ -21,6 +21,7 @@ Implementation details:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -240,13 +241,14 @@ class LiveConfig:
     algo_price_protect: bool = False
 
     # Execution controls
-    entry_delay_min_seconds: float = 30.0
-    entry_delay_max_seconds: float = 30.0
+    entry_delay_min_seconds: float = 15.0
+    entry_delay_max_seconds: float = 15.0
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 1.0
     entry_order_timeout_seconds: float = 55.0
     log_path: str = "trade_log.jsonl"
+    live_trades_csv: str = "live_trades.csv"
     post_only: bool = True
     use_testnet: bool = False
 
@@ -481,6 +483,9 @@ class LiveState:
     entry_price: Optional[float] = None
     entry_qty: Optional[float] = None
     last_atr: Optional[float] = None
+    entry_side: Optional[int] = None
+    entry_time_iso: Optional[str] = None
+    entry_signal_ms: Optional[int] = None
     had_position: bool = False
 
 
@@ -494,6 +499,52 @@ def log_event(log_path: str, event: Dict[str, object]) -> None:
     with open(log_path, "a", encoding="ascii") as f:
         json.dump(payload, f, ensure_ascii=True)
         f.write("\n")
+
+
+def format_float_1(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_float_2(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_float_2_str(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def interval_to_ms(interval: str) -> Optional[int]:
+    if not interval or len(interval) < 2:
+        return None
+    num_part = interval[:-1]
+    unit = interval[-1]
+    if not num_part.isdigit():
+        return None
+    value = int(num_part)
+    if unit == "m":
+        return value * 60_000
+    if unit == "h":
+        return value * 3_600_000
+    if unit == "d":
+        return value * 86_400_000
+    if unit == "w":
+        return value * 604_800_000
+    return None
 
 
 def format_to_step(value: float, step: float) -> str:
@@ -758,6 +809,42 @@ def algo_order_inactive(order: Optional[Dict[str, object]]) -> bool:
     return status in {"CANCELED", "EXPIRED", "REJECTED"}
 
 
+LIVE_TRADE_FIELDS = [
+    "entry_time",
+    "exit_time",
+    "side",
+    "entry_price",
+    "exit_price",
+    "signal_atr",
+    "tp_atr_mult",
+    "sl_atr_mult",
+    "target_price",
+    "stop_price",
+    "exit_reason",
+    "roi_net",
+    "pnl_net",
+    "margin_used",
+    "notional",
+    "equity_after",
+    "bars_held",
+]
+
+
+def append_live_trade(csv_path: str, trade: Dict[str, object]) -> None:
+    if not csv_path:
+        return
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="ascii") as f:
+        writer = csv.DictWriter(f, fieldnames=LIVE_TRADE_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        row = {}
+        for field in LIVE_TRADE_FIELDS:
+            value = trade.get(field)
+            row[field] = "" if value is None else value
+        writer.writerow(row)
+
+
 def klines_to_df(klines: List[List[object]]) -> pd.DataFrame:
     rows = []
     for k in klines:
@@ -833,7 +920,13 @@ def run_live(cfg: LiveConfig) -> None:
         pass
 
     state = LiveState()
-    log_event(cfg.log_path, {"event": "startup", "symbol": cfg.symbol, "leverage": cfg.leverage, "margin_usd": cfg.margin_usd})
+    interval_ms = interval_to_ms(cfg.interval)
+    log_event(cfg.log_path, {
+        "event": "startup",
+        "symbol": cfg.symbol,
+        "leverage": cfg.leverage,
+        "margin_usd": format_float_2(cfg.margin_usd),
+    })
 
     while True:
         try:
@@ -855,6 +948,9 @@ def run_live(cfg: LiveConfig) -> None:
                     state.pending_atr = None
                     state.pending_side = None
                     state.entry_close_ms = None
+                    state.entry_side = None
+                    state.entry_time_iso = None
+                    state.entry_signal_ms = None
                     order = None
                 if order is None:
                     time.sleep(cfg.poll_interval_seconds)
@@ -872,6 +968,12 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_order_time = None
                     state.entry_price = entry_price
                     state.entry_qty = qty
+                    state.entry_side = side
+                    state.entry_time_iso = _utc_now_iso()
+                    if state.last_close_ms is not None:
+                        state.entry_signal_ms = state.last_close_ms
+                    else:
+                        state.entry_signal_ms = entry_close_ms
 
                     entry_atr = state.active_atr if state.active_atr is not None else state.last_atr
                     if entry_atr is None:
@@ -927,11 +1029,11 @@ def run_live(cfg: LiveConfig) -> None:
                         "event": "entry_filled",
                         "order_id": order.get("orderId"),
                         "side": "LONG" if side == 1 else "SHORT",
-                        "entry_price": entry_price,
-                        "quantity": qty,
-                        "entry_atr": state.active_atr,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
+                        "entry_price": format_float_2(entry_price),
+                        "quantity": format_float_2(qty),
+                        "entry_atr": format_float_2(state.active_atr),
+                        "tp_price": format_float_2(tp_price),
+                        "sl_price": format_float_2(sl_price),
                         "tp_algo_id": state.tp_algo_id,
                         "sl_algo_id": state.sl_algo_id,
                     })
@@ -954,6 +1056,9 @@ def run_live(cfg: LiveConfig) -> None:
                         state.pending_atr = None
                         state.pending_side = None
                         state.entry_close_ms = None
+                        state.entry_side = None
+                        state.entry_time_iso = None
+                        state.entry_signal_ms = None
 
             if not in_position and state.had_position:
                 tp_order = query_algo_order(
@@ -981,15 +1086,48 @@ def run_live(cfg: LiveConfig) -> None:
                     exit_reason = "EXIT"
                     exit_price = None
 
+                side_sign = state.entry_side or 0
+                pnl_net = None
+                roi_net = None
+                notional = None
+                bars_held = None
+                if exit_price is not None and state.entry_price is not None and state.entry_qty is not None and side_sign != 0:
+                    pnl_net = (exit_price - state.entry_price) * state.entry_qty * side_sign
+                    notional = state.entry_price * state.entry_qty
+                    if cfg.margin_usd:
+                        roi_net = pnl_net / cfg.margin_usd
+                if interval_ms and state.entry_signal_ms and state.last_close_ms:
+                    bars_held = max(0, int((state.last_close_ms - state.entry_signal_ms) / interval_ms))
+
                 log_event(cfg.log_path, {
                     "event": "exit_filled",
                     "exit_reason": exit_reason,
-                    "exit_price": exit_price,
-                    "entry_price": state.entry_price,
-                    "quantity": state.entry_qty,
-                    "entry_atr": state.active_atr,
+                    "exit_price": format_float_2(exit_price),
+                    "entry_price": format_float_2(state.entry_price),
+                    "quantity": format_float_2(state.entry_qty),
+                    "entry_atr": format_float_2(state.active_atr),
                     "tp_algo_id": state.tp_algo_id,
                     "sl_algo_id": state.sl_algo_id,
+                })
+
+                append_live_trade(cfg.live_trades_csv, {
+                    "entry_time": state.entry_time_iso,
+                    "exit_time": _utc_now_iso(),
+                    "side": "LONG" if side_sign == 1 else ("SHORT" if side_sign == -1 else ""),
+                    "entry_price": format_float_2_str(state.entry_price),
+                    "exit_price": format_float_2_str(exit_price),
+                    "signal_atr": format_float_2_str(state.active_atr),
+                    "tp_atr_mult": format_float_2_str(cfg.tp_atr_mult),
+                    "sl_atr_mult": format_float_2_str(cfg.sl_atr_mult),
+                    "target_price": format_float_2_str(state.tp_price),
+                    "stop_price": format_float_2_str(state.sl_price),
+                    "exit_reason": exit_reason,
+                    "roi_net": format_float_2_str(roi_net),
+                    "pnl_net": format_float_2_str(pnl_net),
+                    "margin_used": format_float_2_str(cfg.margin_usd),
+                    "notional": format_float_2_str(notional),
+                    "equity_after": "",
+                    "bars_held": "" if bars_held is None else str(bars_held),
                 })
 
                 if state.tp_algo_id or state.tp_client_algo_id:
@@ -1007,6 +1145,9 @@ def run_live(cfg: LiveConfig) -> None:
                 state.pending_atr = None
                 state.entry_price = None
                 state.entry_qty = None
+                state.entry_side = None
+                state.entry_time_iso = None
+                state.entry_signal_ms = None
                 state.had_position = False
                 exit_filled = True
 
@@ -1030,6 +1171,9 @@ def run_live(cfg: LiveConfig) -> None:
                 state.pending_atr = None
                 state.entry_price = None
                 state.entry_qty = None
+                state.entry_side = None
+                state.entry_time_iso = None
+                state.entry_signal_ms = None
                 state.had_position = False
 
             if in_position:
@@ -1059,6 +1203,8 @@ def run_live(cfg: LiveConfig) -> None:
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
                 qty = abs(position_amt)
+                if state.entry_side is None:
+                    state.entry_side = side
                 entry_atr = state.active_atr or state.pending_atr or state.last_atr
                 if entry_atr is None:
                     log_event(cfg.log_path, {"event": "missing_atr", "stage": "exit_recover"})
@@ -1128,14 +1274,14 @@ def run_live(cfg: LiveConfig) -> None:
                     log_event(cfg.log_path, {
                         "event": "candle_close",
                         "close_time_ms": close_time_ms,
-                        "open": float(candle["open"]),
-                        "high": float(candle["high"]),
-                        "low": float(candle["low"]),
-                        "close": float(candle["close"]),
-                        "body": body,
-                        "atr": atr_value,
+                        "open": format_float_1(candle["open"]),
+                        "high": format_float_1(candle["high"]),
+                        "low": format_float_1(candle["low"]),
+                        "close": format_float_1(candle["close"]),
+                        "body": format_float_1(body),
+                        "atr": format_float_1(atr_value),
                         "signal": signal,
-                        "signal_atr": signal_atr,
+                        "signal_atr": format_float_1(signal_atr),
                     })
 
                     if position_amt == 0.0 and state.entry_order_id is None and signal != 0 and signal_atr is not None and atr_value is not None:
@@ -1148,7 +1294,7 @@ def run_live(cfg: LiveConfig) -> None:
                         mid = (bid + ask) / 2.0
                         spread_pct = (ask - bid) / mid if mid else 1.0
                         if spread_pct > cfg.spread_max_pct:
-                            log_event(cfg.log_path, {"event": "skip_spread", "spread_pct": spread_pct})
+                            log_event(cfg.log_path, {"event": "skip_spread", "spread_pct": format_float_2(spread_pct)})
                         else:
                             offset = atr_value * cfg.atr_offset_mult
                             if signal == 1:
@@ -1167,14 +1313,14 @@ def run_live(cfg: LiveConfig) -> None:
                                         limit_price = max(limit_price, ask + tick)
 
                             if limit_price <= 0:
-                                log_event(cfg.log_path, {"event": "skip_price", "limit_price": limit_price})
+                                log_event(cfg.log_path, {"event": "skip_price", "limit_price": format_float_2(limit_price)})
                             else:
                                 limit_price_str = format_to_step(limit_price, filters["tick_size"])
                                 notional = cfg.margin_usd * cfg.leverage
                                 qty = notional / limit_price
                                 qty_str = format_to_step(qty, filters["step_size"])
                                 if float(qty_str) < filters["min_qty"]:
-                                    log_event(cfg.log_path, {"event": "skip_qty", "quantity": qty_str})
+                                    log_event(cfg.log_path, {"event": "skip_qty", "quantity": format_float_2(qty_str)})
                                 else:
                                     tif = "GTX" if cfg.post_only else "GTC"
                                     entry_order = limit_order(
@@ -1197,11 +1343,11 @@ def run_live(cfg: LiveConfig) -> None:
                                             "event": "entry_order",
                                             "order_id": state.entry_order_id,
                                             "side": side,
-                                            "limit_price": float(limit_price_str),
-                                            "quantity": float(qty_str),
-                                            "signal_atr": signal_atr,
-                                            "spread_pct": spread_pct,
-                                            "offset": offset,
+                                            "limit_price": format_float_2(limit_price_str),
+                                            "quantity": format_float_2(qty_str),
+                                            "signal_atr": format_float_2(signal_atr),
+                                            "spread_pct": format_float_2(spread_pct),
+                                            "offset": format_float_2(offset),
                                         })
         except Exception as exc:
             logging.exception("Live loop error")
