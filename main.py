@@ -682,6 +682,7 @@ def compute_tp_sl_prices(
     return target_price, stop_price
 
 
+
 def run_live(cfg: LiveConfig) -> None:
     if load_dotenv is not None:
         load_dotenv()
