@@ -241,8 +241,8 @@ class LiveConfig:
     algo_price_protect: bool = False
 
     # Execution controls
-    entry_delay_min_seconds: float = 15.0
-    entry_delay_max_seconds: float = 15.0
+    entry_delay_min_seconds: float = 5.0
+    entry_delay_max_seconds: float = 5.0
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 1.0
@@ -1364,8 +1364,8 @@ def run_backtest() -> None:
     df = fetch_ohlcv_binance(
         symbol="BTC/USDT",
         timeframe="1m",
-        start_utc="2025-06-01 00:00:00",
-        end_utc="2025-12-30 00:00:00",
+        start_utc="2025-12-30 00:00:00",
+        end_utc="2025-12-31 00:00:00",
     )
     #
     # Option B: Load your own CSV (must contain datetime + OHLCV)
