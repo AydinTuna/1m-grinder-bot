@@ -233,7 +233,7 @@ class LiveConfig:
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 1.5
+    tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
 
     # Algo order controls
@@ -1385,7 +1385,7 @@ def run_backtest() -> None:
         sl_atr_mult=1.00,
         thr1=2.0,
         thr2=2.0,
-        tp_atr_mult=1.50,
+        tp_atr_mult=2.00,
     )
 
     trades, df_bt, stats = backtest_atr_grinder(df, cfg)
