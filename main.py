@@ -15,7 +15,7 @@ Implementation details:
 - TP/SL ATR uses the signal candle's ATR.
 - Fees and slippage are modeled.
 - Signals are ignored for the first atr_warmup_bars (defaults to atr_len).
-- Margin per trade can be sized from target profit/loss; otherwise uses initial_capital (notional = leverage * margin).
+- Margin per trade is capped by initial_capital/margin_usd; leverage may be adjusted from targets to keep TP/SL $ consistency.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
+
+from config import BacktestConfig, LiveConfig, LIVE_TRADE_FIELDS
 
 try:
     from dotenv import load_dotenv
@@ -199,66 +201,6 @@ def build_signals_body_opposite(
 # -----------------------------
 # Backtest engine
 # -----------------------------
-@dataclass
-class BacktestConfig:
-    atr_len: int = 14
-    atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
-    leverage: float = 10.0
-    initial_capital: float = 400.0  # starting equity (default margin per trade)
-
-    # Position sizing targets (optional)
-    target_profit_usd: Optional[float] = 0.75
-    target_loss_usd: Optional[float] = 0.50
-
-    # Costs
-    fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
-    slippage: float = 0.0000    # price impact fraction applied on entry/exit
-
-    # Strategy thresholds
-    thr1: float = 1.5
-    thr2: float = 2.0
-
-    # Risk/exit controls
-    tp_atr_mult: float = 1.5
-    sl_atr_mult: float = 1.0
-
-
-@dataclass
-class LiveConfig:
-    symbol: str = "BTCUSDC"
-    interval: str = "1m"
-    atr_len: int = 14
-    atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
-    leverage: int = 20
-    margin_usd: float = 35.0  # default margin if targets are not set
-    target_profit_usd: Optional[float] = 0.75
-    target_loss_usd: Optional[float] = 0.50
-
-    # Strategy thresholds
-    thr1: float = 2.0
-    thr2: float = 2.0
-
-    # Risk/exit controls
-    tp_atr_mult: float = 1.5
-    sl_atr_mult: float = 1.0
-
-    # Algo order controls
-    algo_working_type: str = "CONTRACT_PRICE"
-    algo_price_protect: bool = False
-
-    # Execution controls
-    entry_delay_min_seconds: float = 5.0
-    entry_delay_max_seconds: float = 5.0
-    spread_max_pct: float = 0.0001  # 0.01%
-    atr_offset_mult: float = 0.02
-    poll_interval_seconds: float = 1.0
-    entry_order_timeout_seconds: float = 55.0
-    log_path: str = "trade_log.jsonl"
-    live_trades_csv: str = "live_trades.csv"
-    post_only: bool = True
-    use_testnet: bool = False
-
-
 def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
     """
     Returns:
@@ -290,7 +232,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     equity_series.iloc[0] = equity
 
     active_margin = cfg.initial_capital
-    active_notional = active_margin * cfg.leverage
+    active_leverage = cfg.leverage
+    active_notional = active_margin * active_leverage
 
     position = 0  # +1 long, -1 short, 0 flat
     entry_price = None
@@ -321,7 +264,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             # exit action is opposite of position
             return price * (1 - slip) if side == 1 else price * (1 + slip)
 
-    def net_roi_from_prices(entry_p: float, exit_p: float, side: int) -> float:
+    def net_roi_from_prices(entry_p: float, exit_p: float, side: int, leverage: float) -> float:
         """
         Compute net leveraged ROI after fees.
         Underlying return = side*(exit-entry)/entry
@@ -329,8 +272,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         Fees: charged per side on notional; approximate as fee_rate * leverage per side => 2*fee_rate*leverage
         """
         underlying_ret = side * ((exit_p - entry_p) / entry_p)
-        gross_roi = underlying_ret * cfg.leverage
-        fee_cost = 2.0 * cfg.fee_rate * cfg.leverage
+        gross_roi = underlying_ret * leverage
+        fee_cost = 2.0 * cfg.fee_rate * leverage
         return gross_roi - fee_cost
 
     for i in range(1, len(df)):
@@ -365,7 +308,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 exited = True
 
             if exited:
-                roi_net = net_roi_from_prices(entry_price, exit_price, position)
+                roi_net = net_roi_from_prices(entry_price, exit_price, position, active_leverage)
                 pnl_net = roi_net * active_margin
                 equity += pnl_net
 
@@ -398,7 +341,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 entry_index = None
                 used_signal_atr = None
                 active_margin = cfg.initial_capital
-                active_notional = active_margin * cfg.leverage
+                active_leverage = cfg.leverage
+                active_notional = active_margin * active_leverage
 
         # --- ENTRY logic (signal on prev candle, enter at this open) ---
         if position == 0:
@@ -406,33 +350,40 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             prev_signal_atr = df.at[prev_t, "signal_atr"]
 
             if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
-                position = prev_signal
-                entry_time = t
-                entry_index = i
-                used_signal_atr = float(prev_signal_atr)
+                side = prev_signal
+                signal_atr_value = float(prev_signal_atr)
 
-                entry_price = apply_slippage(o, position, is_entry=True)
+                entry_price = apply_slippage(o, side, is_entry=True)
 
-                target_price, stop_price = compute_tp_sl_prices(
-                    entry_price,
-                    position,
-                    used_signal_atr,
-                    cfg.tp_atr_mult,
-                    cfg.sl_atr_mult,
-                )
-                trade_margin = compute_margin_from_targets(
+                trade_margin, trade_leverage, _ = resolve_trade_sizing(
                     entry_price=entry_price,
-                    atr_value=used_signal_atr,
+                    atr_value=signal_atr_value,
                     tp_atr_mult=cfg.tp_atr_mult,
                     sl_atr_mult=cfg.sl_atr_mult,
-                    leverage=cfg.leverage,
+                    margin_cap=cfg.initial_capital,
+                    max_leverage=cfg.leverage,
+                    min_leverage=cfg.min_leverage,
                     target_profit_usd=cfg.target_profit_usd,
                     target_loss_usd=cfg.target_loss_usd,
                 )
-                if trade_margin is None or trade_margin <= 0:
-                    trade_margin = cfg.initial_capital
+                if trade_margin is None or trade_leverage is None:
+                    continue
+
+                target_price, stop_price = compute_tp_sl_prices(
+                    entry_price,
+                    side,
+                    signal_atr_value,
+                    cfg.tp_atr_mult,
+                    cfg.sl_atr_mult,
+                )
+
+                position = side
+                entry_time = t
+                entry_index = i
+                used_signal_atr = signal_atr_value
                 active_margin = trade_margin
-                active_notional = active_margin * cfg.leverage
+                active_leverage = trade_leverage
+                active_notional = active_margin * active_leverage
 
         equity_series.at[t] = equity
 
@@ -504,6 +455,8 @@ class LiveState:
     entry_price: Optional[float] = None
     entry_qty: Optional[float] = None
     entry_margin_usd: Optional[float] = None
+    entry_leverage: Optional[int] = None
+    current_leverage: Optional[int] = None
     last_atr: Optional[float] = None
     entry_side: Optional[int] = None
     entry_time_iso: Optional[str] = None
@@ -831,27 +784,6 @@ def algo_order_inactive(order: Optional[Dict[str, object]]) -> bool:
     return status in {"CANCELED", "EXPIRED", "REJECTED"}
 
 
-LIVE_TRADE_FIELDS = [
-    "entry_time",
-    "exit_time",
-    "side",
-    "entry_price",
-    "exit_price",
-    "signal_atr",
-    "tp_atr_mult",
-    "sl_atr_mult",
-    "target_price",
-    "stop_price",
-    "exit_reason",
-    "roi_net",
-    "pnl_net",
-    "margin_used",
-    "notional",
-    "equity_after",
-    "bars_held",
-]
-
-
 def append_live_trade(csv_path: str, trade: Dict[str, object]) -> None:
     if not csv_path:
         return
@@ -949,6 +881,72 @@ def compute_margin_from_targets(
     return None
 
 
+def compute_required_leverage(
+    entry_price: float,
+    atr_value: float,
+    tp_atr_mult: float,
+    sl_atr_mult: float,
+    margin_usd: float,
+    target_profit_usd: Optional[float],
+    target_loss_usd: Optional[float],
+) -> Optional[float]:
+    if entry_price <= 0 or atr_value <= 0 or margin_usd <= 0:
+        return None
+    move_tp = atr_value * tp_atr_mult
+    move_sl = atr_value * sl_atr_mult
+    if target_loss_usd is not None and target_loss_usd > 0 and move_sl > 0:
+        return (target_loss_usd * entry_price) / (move_sl * margin_usd)
+    if target_profit_usd is not None and target_profit_usd > 0 and move_tp > 0:
+        return (target_profit_usd * entry_price) / (move_tp * margin_usd)
+    return None
+
+
+def resolve_trade_sizing(
+    entry_price: float,
+    atr_value: float,
+    tp_atr_mult: float,
+    sl_atr_mult: float,
+    margin_cap: float,
+    max_leverage: float,
+    min_leverage: float,
+    target_profit_usd: Optional[float],
+    target_loss_usd: Optional[float],
+    leverage_step: float = 0.0,
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    if margin_cap <= 0 or max_leverage <= 0:
+        return None, None, "invalid_config"
+    req_leverage = compute_required_leverage(
+        entry_price=entry_price,
+        atr_value=atr_value,
+        tp_atr_mult=tp_atr_mult,
+        sl_atr_mult=sl_atr_mult,
+        margin_usd=margin_cap,
+        target_profit_usd=target_profit_usd,
+        target_loss_usd=target_loss_usd,
+    )
+    if req_leverage is None:
+        return margin_cap, max_leverage, None
+    leverage_used = max(req_leverage, min_leverage)
+    if leverage_step and leverage_step > 0:
+        leverage_used = math.ceil(leverage_used / leverage_step) * leverage_step
+    if leverage_used > max_leverage:
+        return None, None, "leverage_exceeds_max"
+    margin_required = compute_margin_from_targets(
+        entry_price=entry_price,
+        atr_value=atr_value,
+        tp_atr_mult=tp_atr_mult,
+        sl_atr_mult=sl_atr_mult,
+        leverage=leverage_used,
+        target_profit_usd=target_profit_usd,
+        target_loss_usd=target_loss_usd,
+    )
+    if margin_required is None or margin_required <= 0:
+        return margin_cap, leverage_used, None
+    if margin_required > margin_cap:
+        return None, None, "margin_exceeds_cap"
+    return margin_required, leverage_used, None
+
+
 
 def run_live(cfg: LiveConfig) -> None:
     if load_dotenv is not None:
@@ -969,6 +967,7 @@ def run_live(cfg: LiveConfig) -> None:
         pass
 
     state = LiveState()
+    state.current_leverage = cfg.leverage
     interval_ms = interval_to_ms(cfg.interval)
     log_event(cfg.log_path, {
         "event": "startup",
@@ -1000,6 +999,7 @@ def run_live(cfg: LiveConfig) -> None:
                     state.pending_side = None
                     state.entry_close_ms = None
                     state.entry_margin_usd = None
+                    state.entry_leverage = None
                     state.entry_side = None
                     state.entry_time_iso = None
                     state.entry_signal_ms = None
@@ -1022,6 +1022,8 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_qty = qty
                     if state.entry_margin_usd is None:
                         state.entry_margin_usd = cfg.margin_usd
+                    if state.entry_leverage is None:
+                        state.entry_leverage = state.current_leverage or cfg.leverage
                     state.entry_side = side
                     state.entry_time_iso = _utc_now_iso()
                     if state.last_close_ms is not None:
@@ -1087,6 +1089,7 @@ def run_live(cfg: LiveConfig) -> None:
                         "quantity": format_float_2(qty),
                         "entry_atr": format_float_2(state.active_atr),
                         "margin_usd": format_float_2(state.entry_margin_usd),
+                        "leverage": state.entry_leverage,
                         "tp_price": format_float_2(tp_price),
                         "sl_price": format_float_2(sl_price),
                         "tp_algo_id": state.tp_algo_id,
@@ -1100,6 +1103,7 @@ def run_live(cfg: LiveConfig) -> None:
                     state.pending_side = None
                     state.entry_close_ms = None
                     state.entry_margin_usd = None
+                    state.entry_leverage = None
                 else:
                     if state.entry_order_time and (time.time() - state.entry_order_time) > cfg.entry_order_timeout_seconds:
                         try:
@@ -1113,6 +1117,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.pending_side = None
                         state.entry_close_ms = None
                         state.entry_margin_usd = None
+                        state.entry_leverage = None
                         state.entry_side = None
                         state.entry_time_iso = None
                         state.entry_signal_ms = None
@@ -1165,6 +1170,7 @@ def run_live(cfg: LiveConfig) -> None:
                     "quantity": format_float_2(state.entry_qty),
                     "entry_atr": format_float_2(state.active_atr),
                     "margin_usd": format_float_2(margin_used),
+                    "leverage": state.entry_leverage or state.current_leverage or cfg.leverage,
                     "tp_algo_id": state.tp_algo_id,
                     "sl_algo_id": state.sl_algo_id,
                 })
@@ -1205,6 +1211,7 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_price = None
                 state.entry_qty = None
                 state.entry_margin_usd = None
+                state.entry_leverage = None
                 state.entry_side = None
                 state.entry_time_iso = None
                 state.entry_signal_ms = None
@@ -1232,6 +1239,7 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_price = None
                 state.entry_qty = None
                 state.entry_margin_usd = None
+                state.entry_leverage = None
                 state.entry_side = None
                 state.entry_time_iso = None
                 state.entry_signal_ms = None
@@ -1377,18 +1385,35 @@ def run_live(cfg: LiveConfig) -> None:
                                 log_event(cfg.log_path, {"event": "skip_price", "limit_price": format_float_2(limit_price)})
                             else:
                                 limit_price_str = format_to_step(limit_price, filters["tick_size"])
-                                margin_usd = compute_margin_from_targets(
+                                margin_usd, leverage_used, skip_reason = resolve_trade_sizing(
                                     entry_price=limit_price,
                                     atr_value=signal_atr,
                                     tp_atr_mult=cfg.tp_atr_mult,
                                     sl_atr_mult=cfg.sl_atr_mult,
-                                    leverage=cfg.leverage,
+                                    margin_cap=cfg.margin_usd,
+                                    max_leverage=cfg.leverage,
+                                    min_leverage=cfg.min_leverage,
                                     target_profit_usd=cfg.target_profit_usd,
                                     target_loss_usd=cfg.target_loss_usd,
+                                    leverage_step=1.0,
                                 )
-                                if margin_usd is None or margin_usd <= 0:
-                                    margin_usd = cfg.margin_usd
-                                notional = margin_usd * cfg.leverage
+                                if margin_usd is None or leverage_used is None:
+                                    log_event(cfg.log_path, {
+                                        "event": "skip_leverage",
+                                        "reason": skip_reason,
+                                        "margin_cap": format_float_2(cfg.margin_usd),
+                                        "max_leverage": cfg.leverage,
+                                    })
+                                    continue
+                                leverage_int = int(round(leverage_used))
+                                if state.current_leverage != leverage_int:
+                                    try:
+                                        client.change_leverage(symbol=cfg.symbol, leverage=leverage_int)
+                                        state.current_leverage = leverage_int
+                                    except ClientError:
+                                        log_event(cfg.log_path, {"event": "leverage_change_error", "leverage": leverage_int})
+                                        continue
+                                notional = margin_usd * leverage_int
                                 qty = notional / limit_price
                                 qty_str = format_to_step(qty, filters["step_size"])
                                 if float(qty_str) < filters["min_qty"]:
@@ -1412,6 +1437,7 @@ def run_live(cfg: LiveConfig) -> None:
                                         state.pending_side = 1 if side == "BUY" else -1
                                         state.entry_close_ms = close_time_ms
                                         state.entry_margin_usd = margin_usd
+                                        state.entry_leverage = leverage_int
                                         log_event(cfg.log_path, {
                                             "event": "entry_order",
                                             "order_id": state.entry_order_id,
@@ -1420,6 +1446,7 @@ def run_live(cfg: LiveConfig) -> None:
                                             "quantity": format_float_2(qty_str),
                                             "signal_atr": format_float_2(signal_atr),
                                             "margin_usd": format_float_2(margin_usd),
+                                            "leverage": leverage_int,
                                             "spread_pct": format_float_2(spread_pct),
                                             "offset": format_float_2(offset),
                                         })
