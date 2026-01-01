@@ -57,6 +57,7 @@ class LiveConfig:
     interval: str = "1m"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
+    atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
     leverage: int = 50  # max leverage for dynamic sizing
     min_leverage: int = 20
     margin_usd: float = 50.0  # margin cap per trade if targets are set

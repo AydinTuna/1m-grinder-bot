@@ -2,7 +2,7 @@
 ATR-based 1-minute grinder (body trigger, ATR-based TP/SL)
 
 Rules:
-- Compute ATR (Wilder) on 1m candles.
+- Compute ATR (EMA) on 1m candles.
 - If candle body >= thr1*ATR: enter opposite direction at next candle open.
 - If candle body >= thr2*ATR: enter opposite direction at next candle open.
 - Take profit when price moves tp_atr_mult * ATR from entry.
@@ -130,9 +130,9 @@ def fetch_ohlcv_binance(
 # -----------------------------
 # Indicators
 # -----------------------------
-def atr_wilder(df: pd.DataFrame, length: int = 14) -> pd.Series:
+def atr_ema(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
-    Wilder ATR using EMA with alpha=1/length.
+    ATR using EMA smoothing (alpha=2/(length+1)) with SMA seed.
     """
     high = df["high"]
     low = df["low"]
@@ -148,7 +148,15 @@ def atr_wilder(df: pd.DataFrame, length: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
 
-    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    atr = pd.Series(np.nan, index=tr.index, dtype=float)
+    if length <= 0 or len(tr) < length:
+        return atr
+
+    alpha = 2.0 / (length + 1.0)
+    atr.iloc[length - 1] = tr.iloc[:length].mean()
+    for i in range(length, len(tr)):
+        atr.iloc[i] = (tr.iloc[i] - atr.iloc[i - 1]) * alpha + atr.iloc[i - 1]
+
     return atr
 
 
@@ -213,7 +221,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
 
-    df["atr"] = atr_wilder(df, cfg.atr_len)
+    df["atr"] = atr_ema(df, cfg.atr_len)
 
     df["signal"], df["signal_atr"] = build_signals_body_opposite(
         df, df["atr"],
@@ -870,7 +878,7 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
     if len(df) <= warmup:
         return 0, None, None
 
-    atr = atr_wilder(df, cfg.atr_len)
+    atr = atr_ema(df, cfg.atr_len)
     signal, signal_atr = build_signals_body_opposite(
         df,
         atr,
@@ -1363,7 +1371,10 @@ def run_live(cfg: LiveConfig) -> None:
                     state.sl_price = sl_price
 
             # New candle check
-            klines = client.klines(symbol=cfg.symbol, interval=cfg.interval, limit=cfg.atr_len + 2)
+            history = max(cfg.atr_history_bars, cfg.atr_len + 2)
+            if history > 1000:
+                history = 1000
+            klines = client.klines(symbol=cfg.symbol, interval=cfg.interval, limit=history)
             if len(klines) >= 2:
                 closed_klines = klines[:-1]
                 close_time_ms = int(closed_klines[-1][6])
