@@ -35,8 +35,7 @@ class BacktestConfig:
     min_leverage: float = 1.0
     initial_capital: float = 400.0  # starting equity (margin cap per trade)
 
-    # Position sizing targets (optional)
-    target_profit_usd: Optional[float] = 0.75
+    # Position sizing target (optional, profit implied by TP/SL ratio)
     target_loss_usd: Optional[float] = 0.50
 
     # Costs
@@ -61,7 +60,6 @@ class LiveConfig:
     leverage: int = 50  # max leverage for dynamic sizing
     min_leverage: int = 20
     margin_usd: float = 50.0  # margin cap per trade if targets are set
-    target_profit_usd: Optional[float] = 0.75
     target_loss_usd: Optional[float] = 0.50
 
     # Strategy thresholds

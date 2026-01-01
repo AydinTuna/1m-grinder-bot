@@ -15,7 +15,7 @@ Implementation details:
 - TP/SL ATR uses the signal candle's ATR.
 - Fees and slippage are modeled.
 - Signals are ignored for the first atr_warmup_bars (defaults to atr_len).
-- Margin per trade is capped by initial_capital/margin_usd; leverage may be adjusted from targets to keep TP/SL $ consistency.
+- Margin per trade is capped by initial_capital/margin_usd; leverage may be adjusted from target loss to keep TP/SL $ consistency.
 """
 
 from __future__ import annotations
@@ -358,12 +358,10 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 trade_margin, trade_leverage, _ = resolve_trade_sizing(
                     entry_price=entry_price,
                     atr_value=signal_atr_value,
-                    tp_atr_mult=cfg.tp_atr_mult,
                     sl_atr_mult=cfg.sl_atr_mult,
                     margin_cap=cfg.initial_capital,
                     max_leverage=cfg.leverage,
                     min_leverage=cfg.min_leverage,
-                    target_profit_usd=cfg.target_profit_usd,
                     target_loss_usd=cfg.target_loss_usd,
                 )
                 if trade_margin is None or trade_leverage is None:
@@ -857,59 +855,43 @@ def compute_tp_sl_prices(
 def compute_margin_from_targets(
     entry_price: float,
     atr_value: float,
-    tp_atr_mult: float,
     sl_atr_mult: float,
     leverage: float,
-    target_profit_usd: Optional[float],
     target_loss_usd: Optional[float],
 ) -> Optional[float]:
     if entry_price <= 0 or atr_value <= 0 or leverage <= 0:
         return None
-    move_tp = atr_value * tp_atr_mult
     move_sl = atr_value * sl_atr_mult
-    if move_tp <= 0 or move_sl <= 0:
+    if move_sl <= 0:
         return None
-    roi_tp = (move_tp / entry_price) * leverage
     roi_sl = (move_sl / entry_price) * leverage
-    margin_from_loss = None
     if target_loss_usd is not None and target_loss_usd > 0 and roi_sl > 0:
-        margin_from_loss = target_loss_usd / roi_sl
-    if margin_from_loss is not None:
-        return margin_from_loss
-    if target_profit_usd is not None and target_profit_usd > 0 and roi_tp > 0:
-        return target_profit_usd / roi_tp
+        return target_loss_usd / roi_sl
     return None
 
 
 def compute_required_leverage(
     entry_price: float,
     atr_value: float,
-    tp_atr_mult: float,
     sl_atr_mult: float,
     margin_usd: float,
-    target_profit_usd: Optional[float],
     target_loss_usd: Optional[float],
 ) -> Optional[float]:
     if entry_price <= 0 or atr_value <= 0 or margin_usd <= 0:
         return None
-    move_tp = atr_value * tp_atr_mult
     move_sl = atr_value * sl_atr_mult
     if target_loss_usd is not None and target_loss_usd > 0 and move_sl > 0:
         return (target_loss_usd * entry_price) / (move_sl * margin_usd)
-    if target_profit_usd is not None and target_profit_usd > 0 and move_tp > 0:
-        return (target_profit_usd * entry_price) / (move_tp * margin_usd)
     return None
 
 
 def resolve_trade_sizing(
     entry_price: float,
     atr_value: float,
-    tp_atr_mult: float,
     sl_atr_mult: float,
     margin_cap: float,
     max_leverage: float,
     min_leverage: float,
-    target_profit_usd: Optional[float],
     target_loss_usd: Optional[float],
     leverage_step: float = 0.0,
 ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -918,10 +900,8 @@ def resolve_trade_sizing(
     req_leverage = compute_required_leverage(
         entry_price=entry_price,
         atr_value=atr_value,
-        tp_atr_mult=tp_atr_mult,
         sl_atr_mult=sl_atr_mult,
         margin_usd=margin_cap,
-        target_profit_usd=target_profit_usd,
         target_loss_usd=target_loss_usd,
     )
     if req_leverage is None:
@@ -934,10 +914,8 @@ def resolve_trade_sizing(
     margin_required = compute_margin_from_targets(
         entry_price=entry_price,
         atr_value=atr_value,
-        tp_atr_mult=tp_atr_mult,
         sl_atr_mult=sl_atr_mult,
         leverage=leverage_used,
-        target_profit_usd=target_profit_usd,
         target_loss_usd=target_loss_usd,
     )
     if margin_required is None or margin_required <= 0:
@@ -974,7 +952,6 @@ def run_live(cfg: LiveConfig) -> None:
         "symbol": cfg.symbol,
         "leverage": cfg.leverage,
         "margin_usd": format_float_2(cfg.margin_usd),
-        "target_profit_usd": format_float_2(cfg.target_profit_usd),
         "target_loss_usd": format_float_2(cfg.target_loss_usd),
     })
 
@@ -1388,12 +1365,10 @@ def run_live(cfg: LiveConfig) -> None:
                                 margin_usd, leverage_used, skip_reason = resolve_trade_sizing(
                                     entry_price=limit_price,
                                     atr_value=signal_atr,
-                                    tp_atr_mult=cfg.tp_atr_mult,
                                     sl_atr_mult=cfg.sl_atr_mult,
                                     margin_cap=cfg.margin_usd,
                                     max_leverage=cfg.leverage,
                                     min_leverage=cfg.min_leverage,
-                                    target_profit_usd=cfg.target_profit_usd,
                                     target_loss_usd=cfg.target_loss_usd,
                                     leverage_step=1.0,
                                 )
