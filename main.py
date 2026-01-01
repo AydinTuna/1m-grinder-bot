@@ -443,9 +443,9 @@ class LiveState:
     pending_atr: Optional[float] = None
     pending_side: Optional[int] = None
     active_atr: Optional[float] = None
-    tp_algo_id: Optional[int] = None
+    tp_order_id: Optional[int] = None
+    tp_client_order_id: Optional[str] = None
     sl_algo_id: Optional[int] = None
-    tp_client_algo_id: Optional[str] = None
     sl_client_algo_id: Optional[str] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
@@ -624,6 +624,58 @@ def limit_order(
             getattr(error, "error_message", None),
         )
         return None
+
+
+def query_limit_order(
+    client: UMFutures,
+    symbol: str,
+    order_id: Optional[int] = None,
+) -> Optional[Dict[str, object]]:
+    if order_id is None:
+        return None
+    try:
+        return client.query_order(symbol=symbol, orderId=order_id)
+    except ClientError as error:
+        logging.error(
+            "Order query error. status: %s, code: %s, message: %s",
+            getattr(error, "status_code", None),
+            getattr(error, "error_code", None),
+            getattr(error, "error_message", None),
+        )
+        return None
+
+
+def cancel_limit_order(
+    client: UMFutures,
+    symbol: str,
+    order_id: Optional[int] = None,
+) -> Optional[Dict[str, object]]:
+    if order_id is None:
+        return None
+    try:
+        return client.cancel_order(symbol=symbol, orderId=order_id)
+    except ClientError as error:
+        logging.error(
+            "Order cancel error. status: %s, code: %s, message: %s",
+            getattr(error, "status_code", None),
+            getattr(error, "error_code", None),
+            getattr(error, "error_message", None),
+        )
+        return None
+
+
+def limit_order_filled(order: Optional[Dict[str, object]]) -> bool:
+    if not order:
+        return False
+    status = str(order.get("status") or "").upper()
+    return status == "FILLED"
+
+
+def limit_order_inactive(order: Optional[Dict[str, object]]) -> bool:
+    if not order:
+        return False
+    status = str(order.get("status") or "").upper()
+    return status in {"CANCELED", "EXPIRED", "REJECTED"}
 
 
 def stop_limit_order(
@@ -1022,20 +1074,24 @@ def run_live(cfg: LiveConfig) -> None:
                     sl_side = "SELL" if side == 1 else "BUY"
                     tp_client_id = f"ATR_TP_{entry_close_ms or ''}"
                     sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
-                    tp_order = algo_order(
+                    # Place TP as a resting limit to avoid taker fees when possible.
+                    tp_tif = "GTX" if cfg.tp_post_only else "GTC"
+                    tp_order = limit_order(
                         cfg.symbol,
                         tp_side,
-                        "TAKE_PROFIT",
                         qty_str,
-                        tp_price_str,
                         client,
                         price=tp_price_str,
-                        time_in_force="GTC",
+                        time_in_force=tp_tif,
                         reduce_only=True,
-                        client_algo_id=tp_client_id,
-                        working_type=cfg.algo_working_type,
-                        price_protect=cfg.algo_price_protect,
+                        client_order_id=tp_client_id,
                     )
+                    if tp_order is None:
+                        log_event(cfg.log_path, {
+                            "event": "tp_order_rejected",
+                            "tp_price": format_float_2(tp_price),
+                            "post_only": cfg.tp_post_only,
+                        })
                     sl_order = algo_order(
                         cfg.symbol,
                         sl_side,
@@ -1050,9 +1106,9 @@ def run_live(cfg: LiveConfig) -> None:
                         working_type=cfg.algo_working_type,
                         price_protect=cfg.algo_price_protect,
                     )
-                    state.tp_algo_id = tp_order.get("algoId") if tp_order else None
+                    state.tp_order_id = tp_order.get("orderId") if tp_order else None
                     state.sl_algo_id = sl_order.get("algoId") if sl_order else None
-                    state.tp_client_algo_id = (tp_order.get("clientAlgoId") if tp_order else None) or (tp_client_id if tp_order else None)
+                    state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
                     state.sl_client_algo_id = (sl_order.get("clientAlgoId") if sl_order else None) or (sl_client_id if sl_order else None)
                     state.tp_price = tp_price
                     state.sl_price = sl_price
@@ -1069,7 +1125,7 @@ def run_live(cfg: LiveConfig) -> None:
                         "leverage": state.entry_leverage,
                         "tp_price": format_float_2(tp_price),
                         "sl_price": format_float_2(sl_price),
-                        "tp_algo_id": state.tp_algo_id,
+                        "tp_order_id": state.tp_order_id,
                         "sl_algo_id": state.sl_algo_id,
                     })
                 elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
@@ -1100,25 +1156,24 @@ def run_live(cfg: LiveConfig) -> None:
                         state.entry_signal_ms = None
 
             if not in_position and state.had_position:
-                tp_order = query_algo_order(
+                tp_order = query_limit_order(
                     client,
                     cfg.symbol,
-                    algo_id=state.tp_algo_id,
-                    client_algo_id=state.tp_client_algo_id,
-                ) if (state.tp_algo_id or state.tp_client_algo_id) else None
+                    order_id=state.tp_order_id,
+                ) if state.tp_order_id else None
                 sl_order = query_algo_order(
                     client,
                     cfg.symbol,
                     algo_id=state.sl_algo_id,
                     client_algo_id=state.sl_client_algo_id,
                 ) if (state.sl_algo_id or state.sl_client_algo_id) else None
-                tp_triggered = algo_order_triggered(tp_order)
+                tp_filled = limit_order_filled(tp_order)
                 sl_triggered = algo_order_triggered(sl_order)
 
-                if tp_triggered and not sl_triggered:
+                if tp_filled and not sl_triggered:
                     exit_reason = "TP"
                     exit_price = state.tp_price
-                elif sl_triggered and not tp_triggered:
+                elif sl_triggered and not tp_filled:
                     exit_reason = "SL"
                     exit_price = state.sl_price
                 else:
@@ -1148,7 +1203,7 @@ def run_live(cfg: LiveConfig) -> None:
                     "entry_atr": format_float_2(state.active_atr),
                     "margin_usd": format_float_2(margin_used),
                     "leverage": state.entry_leverage or state.current_leverage or cfg.leverage,
-                    "tp_algo_id": state.tp_algo_id,
+                    "tp_order_id": state.tp_order_id,
                     "sl_algo_id": state.sl_algo_id,
                 })
 
@@ -1172,14 +1227,14 @@ def run_live(cfg: LiveConfig) -> None:
                     "bars_held": "" if bars_held is None else str(bars_held),
                 })
 
-                if state.tp_algo_id or state.tp_client_algo_id:
-                    cancel_algo_order(client, cfg.symbol, algo_id=state.tp_algo_id, client_algo_id=state.tp_client_algo_id)
+                if state.tp_order_id and not tp_filled:
+                    cancel_limit_order(client, cfg.symbol, order_id=state.tp_order_id)
                 if state.sl_algo_id or state.sl_client_algo_id:
                     cancel_algo_order(client, cfg.symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
 
-                state.tp_algo_id = None
+                state.tp_order_id = None
                 state.sl_algo_id = None
-                state.tp_client_algo_id = None
+                state.tp_client_order_id = None
                 state.sl_client_algo_id = None
                 state.tp_price = None
                 state.sl_price = None
@@ -1199,15 +1254,15 @@ def run_live(cfg: LiveConfig) -> None:
                 time.sleep(cfg.poll_interval_seconds)
                 continue
 
-            if not in_position and state.entry_price is None and (state.tp_algo_id or state.sl_algo_id):
-                if state.tp_algo_id or state.tp_client_algo_id:
-                    cancel_algo_order(client, cfg.symbol, algo_id=state.tp_algo_id, client_algo_id=state.tp_client_algo_id)
+            if not in_position and state.entry_price is None and (state.tp_order_id or state.sl_algo_id):
+                if state.tp_order_id:
+                    cancel_limit_order(client, cfg.symbol, order_id=state.tp_order_id)
                 if state.sl_algo_id or state.sl_client_algo_id:
                     cancel_algo_order(client, cfg.symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
                 log_event(cfg.log_path, {"event": "position_closed"})
-                state.tp_algo_id = None
+                state.tp_order_id = None
                 state.sl_algo_id = None
-                state.tp_client_algo_id = None
+                state.tp_client_order_id = None
                 state.sl_client_algo_id = None
                 state.tp_price = None
                 state.sl_price = None
@@ -1223,16 +1278,15 @@ def run_live(cfg: LiveConfig) -> None:
                 state.had_position = False
 
             if in_position:
-                if state.tp_algo_id or state.tp_client_algo_id:
-                    tp_order = query_algo_order(
+                if state.tp_order_id:
+                    tp_order = query_limit_order(
                         client,
                         cfg.symbol,
-                        algo_id=state.tp_algo_id,
-                        client_algo_id=state.tp_client_algo_id,
+                        order_id=state.tp_order_id,
                     )
-                    if algo_order_inactive(tp_order):
-                        state.tp_algo_id = None
-                        state.tp_client_algo_id = None
+                    if limit_order_inactive(tp_order):
+                        state.tp_order_id = None
+                        state.tp_client_order_id = None
                 if state.sl_algo_id or state.sl_client_algo_id:
                     sl_order = query_algo_order(
                         client,
@@ -1245,7 +1299,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_client_algo_id = None
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and (state.tp_algo_id is None or state.sl_algo_id is None):
+            if in_position and (state.tp_order_id is None or state.sl_algo_id is None):
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
                 qty = abs(position_amt)
@@ -1266,24 +1320,27 @@ def run_live(cfg: LiveConfig) -> None:
                 tp_side = "SELL" if side == 1 else "BUY"
                 sl_side = "SELL" if side == 1 else "BUY"
 
-                if state.tp_algo_id is None:
+                if state.tp_order_id is None:
                     tp_client_id = f"ATR_TP_RECOVER_{int(time.time())}"
-                    tp_order = algo_order(
+                    tp_tif = "GTX" if cfg.tp_post_only else "GTC"
+                    tp_order = limit_order(
                         cfg.symbol,
                         tp_side,
-                        "TAKE_PROFIT",
                         qty_str,
                         tp_price_str,
                         client,
-                        price=tp_price_str,
-                        time_in_force="GTC",
+                        time_in_force=tp_tif,
                         reduce_only=True,
-                        client_algo_id=tp_client_id,
-                        working_type=cfg.algo_working_type,
-                        price_protect=cfg.algo_price_protect,
+                        client_order_id=tp_client_id,
                     )
-                    state.tp_algo_id = tp_order.get("algoId") if tp_order else None
-                    state.tp_client_algo_id = (tp_order.get("clientAlgoId") if tp_order else None) or (tp_client_id if tp_order else None)
+                    if tp_order is None:
+                        log_event(cfg.log_path, {
+                            "event": "tp_order_rejected",
+                            "tp_price": format_float_2(tp_price),
+                            "post_only": cfg.tp_post_only,
+                        })
+                    state.tp_order_id = tp_order.get("orderId") if tp_order else None
+                    state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
                     state.tp_price = tp_price
                 if state.sl_algo_id is None:
                     sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"

@@ -75,6 +75,7 @@ class LiveConfig:
     algo_price_protect: bool = False
 
     # Execution controls
+    tp_post_only: bool = True
     entry_delay_min_seconds: float = 5.0
     entry_delay_max_seconds: float = 5.0
     spread_max_pct: float = 0.0001  # 0.01%
