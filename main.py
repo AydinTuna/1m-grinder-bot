@@ -168,6 +168,7 @@ def build_signals_body_opposite(
     atr: pd.Series,
     thr1: float = 1.5,
     thr2: float = 2.0,
+    tolerance_pct: float = 0.0,
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Returns:
@@ -178,8 +179,12 @@ def build_signals_body_opposite(
       body = abs(close-open)
       candle_dir = sign(close-open)
       entry_dir = -candle_dir (opposite)
-      if body >= thr1*ATR => signal
-      if body >= thr2*ATR => signal (overwrites thr1 if both)
+      if tolerance_pct > 0:
+        thr*ATR*(1-tol) <= body <= thr*ATR*(1+tol)
+      else:
+        body >= thr*ATR
+      if body meets thr1 => signal
+      if body meets thr2 => signal (overwrites thr1 if both)
     """
     body = (df["close"] - df["open"]).abs()
     candle_dir = np.sign(df["close"] - df["open"]).astype(int)  # -1,0,+1
@@ -188,8 +193,19 @@ def build_signals_body_opposite(
     signal = pd.Series(0, index=df.index, dtype=int)
     signal_atr = pd.Series(np.nan, index=df.index, dtype=float)
 
-    cond1 = body >= thr1 * atr
-    cond2 = body >= thr2 * atr
+    tol = max(0.0, float(tolerance_pct or 0.0))
+    target1 = thr1 * atr
+    target2 = thr2 * atr
+    if tol > 0.0:
+        lower1 = target1 * (1.0 - tol)
+        upper1 = target1 * (1.0 + tol)
+        lower2 = target2 * (1.0 - tol)
+        upper2 = target2 * (1.0 + tol)
+        cond1 = (body >= lower1) & (body <= upper1)
+        cond2 = (body >= lower2) & (body <= upper2)
+    else:
+        cond1 = body >= target1
+        cond2 = body >= target2
 
     # 1.5x
     signal[cond1] = entry_dir[cond1]
@@ -225,7 +241,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
 
     df["signal"], df["signal_atr"] = build_signals_body_opposite(
         df, df["atr"],
-        thr1=cfg.thr1, thr2=cfg.thr2,
+        thr1=cfg.thr1, thr2=cfg.thr2, tolerance_pct=cfg.signal_atr_tolerance_pct,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -914,6 +930,7 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
         atr,
         thr1=cfg.thr1,
         thr2=cfg.thr2,
+        tolerance_pct=cfg.signal_atr_tolerance_pct,
     )
 
     signal_val = int(signal.iloc[-1])
@@ -1647,8 +1664,8 @@ def run_backtest() -> None:
     df = fetch_ohlcv_binance(
         symbol="BTC/USDT",
         timeframe="1m",
-        start_utc="2025-12-30 00:00:00",
-        end_utc="2025-12-31 00:00:00",
+        start_utc="2025-06-30 00:00:00",
+        end_utc="2025-12-30 00:00:00",
     )
     #
     # Option B: Load your own CSV (must contain datetime + OHLCV)
@@ -1661,8 +1678,8 @@ def run_backtest() -> None:
     # 2) Run backtest
     cfg = BacktestConfig(
         atr_len=14,
-        leverage=20.0,
-        initial_capital=1000.0,
+        leverage=50.0,
+        initial_capital=100.0,
         fee_rate=0.0000,
         slippage=0.0000,
         sl_atr_mult=1.00,

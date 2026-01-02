@@ -31,6 +31,7 @@ LIVE_TRADE_FIELDS: List[str] = [
 class BacktestConfig:
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
+    signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
     leverage: float = 10.0  # max leverage for dynamic sizing
     min_leverage: float = 1.0
     initial_capital: float = 400.0  # starting equity (margin cap per trade)
@@ -43,11 +44,11 @@ class BacktestConfig:
     slippage: float = 0.0000    # price impact fraction applied on entry/exit
 
     # Strategy thresholds
-    thr1: float = 1.5
+    thr1: float = 2.0
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 1.5
+    tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
 
 
@@ -58,6 +59,7 @@ class LiveConfig:
     interval: str = "1m"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
+    signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
     atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
     leverage: int = 50  # max leverage for dynamic sizing
     min_leverage: int = 20
