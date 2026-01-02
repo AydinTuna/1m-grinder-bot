@@ -31,7 +31,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
@@ -555,12 +555,35 @@ def interval_to_ms(interval: str) -> Optional[int]:
     return None
 
 
-def format_to_step(value: float, step: float) -> str:
+def format_to_step(value: float, step: float, rounding=ROUND_DOWN) -> str:
     step_dec = Decimal(str(step))
     if step_dec == 0:
         return format(Decimal(str(value)), "f")
-    quant = (Decimal(str(value)) / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+    quant = (Decimal(str(value)) / step_dec).to_integral_value(rounding=rounding) * step_dec
     return format(quant, "f")
+
+
+def format_price_to_tick(value: float, tick_size: float, side: str, post_only: bool) -> str:
+    rounding = ROUND_DOWN
+    if post_only and str(side).upper() == "SELL":
+        rounding = ROUND_UP
+    return format_to_step(value, tick_size, rounding=rounding)
+
+
+def reprice_post_only(price: float, side: str, bid: float, ask: float, tick_size: float) -> float:
+    """
+    Keeps a post-only LIMIT order outside the spread by at least 1 tick.
+    BUY: price <= bid - tick
+    SELL: price >= ask + tick
+    """
+    if tick_size <= 0:
+        return price
+    side_u = str(side).upper()
+    if side_u == "BUY":
+        return min(price, bid - tick_size)
+    if side_u == "SELL":
+        return max(price, ask + tick_size)
+    return price
 
 
 def get_um_futures_client(cfg: LiveConfig) -> UMFutures:
@@ -626,58 +649,147 @@ def limit_order(
     reduce_only: bool = False,
     client_order_id: Optional[str] = None,
     post_only_fallback: bool = False,
+    tick_size: Optional[float] = None,
+    post_only_max_reprices: int = 3,
 ) -> Optional[Dict[str, object]]:
     """
     Places a limit order on Binance Futures.
     """
-    try:
-        params: Dict[str, object] = {
-            "symbol": symbol,
-            "side": side,
-            "type": "LIMIT",
-            "quantity": quantity,
-            "timeInForce": time_in_force,
-            "price": price,
-        }
-        if reduce_only:
-            params["reduceOnly"] = True
-        if client_order_id:
-            params["newClientOrderId"] = client_order_id
-        return client.new_order(**params)
-    except ClientError as error:
-        if getattr(error, "error_code", None) == -5022:
-            if post_only_fallback and time_in_force == "GTX":
+    params: Dict[str, object] = {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT",
+        "quantity": quantity,
+        "timeInForce": time_in_force,
+        "price": price,
+    }
+    if reduce_only:
+        params["reduceOnly"] = True
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+
+    post_only_reprices = 0
+
+    while True:
+        try:
+            return client.new_order(**params)
+        except ClientError as error:
+            error_code = getattr(error, "error_code", None)
+            status_code = getattr(error, "status_code", None)
+            error_message = getattr(error, "error_message", None)
+
+            if error_code != -5022:
+                logging.error(
+                    "Order error. status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            tif = str(params.get("timeInForce") or "")
+            if tif == "GTX" and post_only_fallback:
                 logging.info(
                     "Post-only order rejected, retrying as GTC. status: %s, code: %s, message: %s",
-                    getattr(error, "status_code", None),
-                    getattr(error, "error_code", None),
-                    getattr(error, "error_message", None),
+                    status_code,
+                    error_code,
+                    error_message,
                 )
                 params["timeInForce"] = "GTC"
+                post_only_fallback = False
+                continue
+
+            if tif != "GTX":
+                logging.info(
+                    "Post-only order rejected. status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            # Entry post-only: reprice to stay maker and retry.
+            post_only_reprices += 1
+            if post_only_reprices > max(0, int(post_only_max_reprices or 0)):
+                logging.info(
+                    "Post-only order rejected (max reprices). status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            resolved_tick = tick_size
+            if resolved_tick is None:
                 try:
-                    return client.new_order(**params)
-                except ClientError as retry_error:
-                    logging.error(
-                        "Order error. status: %s, code: %s, message: %s",
-                        getattr(retry_error, "status_code", None),
-                        getattr(retry_error, "error_code", None),
-                        getattr(retry_error, "error_message", None),
-                    )
-                    return None
+                    resolved_tick = get_symbol_filters(client, symbol).get("tick_size")
+                except Exception:
+                    resolved_tick = None
+            if resolved_tick is None or resolved_tick <= 0:
+                logging.info(
+                    "Post-only order rejected (missing tick_size). status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            try:
+                bid, ask = get_book_ticker(client, symbol)
+            except Exception:
+                logging.info(
+                    "Post-only order rejected (book ticker unavailable). status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            try:
+                current_price = float(params.get("price") or 0.0)
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if current_price <= 0:
+                logging.info(
+                    "Post-only order rejected (invalid price). status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            new_price = reprice_post_only(current_price, side, bid, ask, float(resolved_tick))
+            if new_price <= 0:
+                logging.info(
+                    "Post-only order rejected (invalid reprice). status: %s, code: %s, message: %s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+                return None
+
+            rounding = ROUND_DOWN if str(side).upper() == "BUY" else ROUND_UP
+            new_price_str = format_to_step(new_price, float(resolved_tick), rounding=rounding)
+            if new_price_str == params.get("price"):
+                nudge = float(resolved_tick)
+                if str(side).upper() == "BUY":
+                    new_price_str = format_to_step(max(0.0, new_price - nudge), nudge, rounding=ROUND_DOWN)
+                else:
+                    new_price_str = format_to_step(new_price + nudge, nudge, rounding=ROUND_UP)
+
             logging.info(
-                "Post-only order rejected. status: %s, code: %s, message: %s",
-                getattr(error, "status_code", None),
-                getattr(error, "error_code", None),
-                getattr(error, "error_message", None),
+                "Post-only order rejected, repricing and retrying. symbol=%s side=%s price=%s -> %s bid=%s ask=%s attempt=%s",
+                symbol,
+                side,
+                params.get("price"),
+                new_price_str,
+                bid,
+                ask,
+                post_only_reprices,
             )
-            return None
-        logging.error(
-            "Order error. status: %s, code: %s, message: %s",
-            getattr(error, "status_code", None),
-            getattr(error, "error_code", None),
-            getattr(error, "error_message", None),
-        )
-        return None
+
+            params["price"] = new_price_str
+            continue
 
 
 def query_limit_order(
@@ -1133,16 +1245,17 @@ def run_live(cfg: LiveConfig) -> None:
         if cfg.post_only:
             tick = filters["tick_size"]
             if tick > 0:
-                if side == "BUY":
-                    limit_price = min(limit_price, bid - tick)
-                else:
-                    limit_price = max(limit_price, ask + tick)
+                limit_price = reprice_post_only(limit_price, side, bid, ask, tick)
 
+        limit_price_str = format_price_to_tick(limit_price, filters["tick_size"], side=side, post_only=cfg.post_only)
+        try:
+            limit_price = float(limit_price_str)
+        except (TypeError, ValueError):
+            limit_price = 0.0
         if limit_price <= 0:
             log_event(cfg.log_path, {"event": "skip_price", "symbol": symbol, "limit_price": format_float_2(limit_price)})
             return False
 
-        limit_price_str = format_to_step(limit_price, filters["tick_size"])
         margin_usd, leverage_used, skip_reason = resolve_trade_sizing(
             entry_price=limit_price,
             atr_value=signal_atr,
@@ -1187,6 +1300,7 @@ def run_live(cfg: LiveConfig) -> None:
             time_in_force=tif,
             reduce_only=False,
             client_order_id=f"ATR_E_{close_time_ms}",
+            tick_size=filters["tick_size"],
         )
         if entry_order:
             state.entry_order_id = entry_order.get("orderId")
@@ -1343,6 +1457,7 @@ def run_live(cfg: LiveConfig) -> None:
                         reduce_only=True,
                         client_order_id=tp_client_id,
                         post_only_fallback=cfg.tp_post_only,
+                        tick_size=filters["tick_size"],
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
@@ -1609,6 +1724,7 @@ def run_live(cfg: LiveConfig) -> None:
                         reduce_only=True,
                         client_order_id=tp_client_id,
                         post_only_fallback=cfg.tp_post_only,
+                        tick_size=filters["tick_size"],
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
