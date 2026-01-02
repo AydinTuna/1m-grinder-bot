@@ -501,6 +501,16 @@ def format_float_2(value: Optional[float]) -> Optional[float]:
         return None
 
 
+def is_btc_symbol(symbol: str) -> bool:
+    return symbol.upper().startswith("BTC")
+
+
+def format_float_by_symbol(value: Optional[float], symbol: str) -> Optional[float]:
+    if is_btc_symbol(symbol):
+        return format_float_1(value)
+    return format_float_2(value)
+
+
 def format_float_2_str(value: Optional[float]) -> str:
     if value is None:
         return ""
@@ -1068,14 +1078,14 @@ def run_live(cfg: LiveConfig) -> None:
             "event": "candle_close",
             "symbol": symbol,
             "close_time_ms": close_time_ms,
-            "open": format_float_1(candle["open"]),
-            "high": format_float_1(candle["high"]),
-            "low": format_float_1(candle["low"]),
-            "close": format_float_1(candle["close"]),
-            "body": format_float_1(body),
-            "atr": format_float_1(atr_value),
+            "open": format_float_by_symbol(candle["open"], symbol),
+            "high": format_float_by_symbol(candle["high"], symbol),
+            "low": format_float_by_symbol(candle["low"], symbol),
+            "close": format_float_by_symbol(candle["close"], symbol),
+            "body": format_float_by_symbol(body, symbol),
+            "atr": format_float_by_symbol(atr_value, symbol),
             "signal": signal,
-            "signal_atr": format_float_1(signal_atr),
+            "signal_atr": format_float_by_symbol(signal_atr, symbol),
         })
 
         if not allow_entry:
