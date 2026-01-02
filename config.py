@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 
@@ -54,6 +54,7 @@ class BacktestConfig:
 @dataclass
 class LiveConfig:
     symbol: str = "BTCUSDC"
+    symbols: List[str] = field(default_factory=lambda: ["BTCUSDC", "ETHUSDC", "SOLUSDC"])
     interval: str = "1m"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None

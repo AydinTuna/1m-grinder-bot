@@ -445,6 +445,7 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
 # -----------------------------
 @dataclass
 class LiveState:
+    active_symbol: Optional[str] = None
     last_close_ms: Optional[int] = None
     entry_order_id: Optional[int] = None
     entry_order_time: Optional[float] = None
