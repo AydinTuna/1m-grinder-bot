@@ -598,6 +598,7 @@ def limit_order(
     time_in_force: str = "GTC",
     reduce_only: bool = False,
     client_order_id: Optional[str] = None,
+    post_only_fallback: bool = False,
 ) -> Optional[Dict[str, object]]:
     """
     Places a limit order on Binance Futures.
@@ -618,6 +619,24 @@ def limit_order(
         return client.new_order(**params)
     except ClientError as error:
         if getattr(error, "error_code", None) == -5022:
+            if post_only_fallback and time_in_force == "GTX":
+                logging.info(
+                    "Post-only order rejected, retrying as GTC. status: %s, code: %s, message: %s",
+                    getattr(error, "status_code", None),
+                    getattr(error, "error_code", None),
+                    getattr(error, "error_message", None),
+                )
+                params["timeInForce"] = "GTC"
+                try:
+                    return client.new_order(**params)
+                except ClientError as retry_error:
+                    logging.error(
+                        "Order error. status: %s, code: %s, message: %s",
+                        getattr(retry_error, "status_code", None),
+                        getattr(retry_error, "error_code", None),
+                        getattr(retry_error, "error_message", None),
+                    )
+                    return None
             logging.info(
                 "Post-only order rejected. status: %s, code: %s, message: %s",
                 getattr(error, "status_code", None),
@@ -1085,14 +1104,15 @@ def run_live(cfg: LiveConfig) -> None:
                     # Place TP as a resting limit to avoid taker fees when possible.
                     tp_tif = "GTX" if cfg.tp_post_only else "GTC"
                     tp_order = limit_order(
-                        cfg.symbol,
-                        tp_side,
-                        qty_str,
-                        client,
+                        symbol=cfg.symbol,
+                        side=tp_side,
+                        quantity=qty_str,
                         price=tp_price_str,
+                        client=client,
                         time_in_force=tp_tif,
                         reduce_only=True,
                         client_order_id=tp_client_id,
+                        post_only_fallback=cfg.tp_post_only,
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
@@ -1332,14 +1352,15 @@ def run_live(cfg: LiveConfig) -> None:
                     tp_client_id = f"ATR_TP_RECOVER_{int(time.time())}"
                     tp_tif = "GTX" if cfg.tp_post_only else "GTC"
                     tp_order = limit_order(
-                        cfg.symbol,
-                        tp_side,
-                        qty_str,
-                        tp_price_str,
-                        client,
+                        symbol=cfg.symbol,
+                        side=tp_side,
+                        quantity=qty_str,
+                        price=tp_price_str,
+                        client=client,
                         time_in_force=tp_tif,
                         reduce_only=True,
                         client_order_id=tp_client_id,
+                        post_only_fallback=cfg.tp_post_only,
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
