@@ -1011,44 +1011,242 @@ def run_live(cfg: LiveConfig) -> None:
     symbol_override = getenv("LIVE_SYMBOL")
     if symbol_override:
         cfg.symbol = symbol_override
+    symbols = list(dict.fromkeys(cfg.symbols or []))
+    if cfg.symbol and cfg.symbol not in symbols:
+        symbols.insert(0, cfg.symbol)
+    if symbol_override:
+        symbols = [symbol_override]
+    if not symbols:
+        raise RuntimeError("No live symbols configured.")
+    cfg.symbols = symbols
     if getenv("LIVE_TRADING") != "1":
         raise RuntimeError("Set LIVE_TRADING=1 to enable live trading.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     client = get_um_futures_client(cfg)
-    filters = get_symbol_filters(client, cfg.symbol)
-
-    try:
-        client.change_leverage(symbol=cfg.symbol, leverage=cfg.leverage)
-    except ClientError:
-        pass
+    filters_by_symbol = {sym: get_symbol_filters(client, sym) for sym in symbols}
+    current_leverage_by_symbol: Dict[str, Optional[int]] = {}
+    for sym in symbols:
+        try:
+            client.change_leverage(symbol=sym, leverage=cfg.leverage)
+            current_leverage_by_symbol[sym] = cfg.leverage
+        except ClientError:
+            current_leverage_by_symbol[sym] = None
 
     state = LiveState()
-    state.current_leverage = cfg.leverage
     interval_ms = interval_to_ms(cfg.interval)
+    last_close_ms_by_symbol: Dict[str, Optional[int]] = {sym: None for sym in symbols}
+    last_atr_by_symbol: Dict[str, Optional[float]] = {sym: None for sym in symbols}
     log_event(cfg.log_path, {
         "event": "startup",
-        "symbol": cfg.symbol,
+        "symbols": symbols,
         "leverage": cfg.leverage,
         "margin_usd": format_float_2(cfg.margin_usd),
         "target_loss_usd": format_float_2(cfg.target_loss_usd),
     })
 
+    def process_symbol_candle(symbol: str, allow_entry: bool) -> bool:
+        filters = filters_by_symbol[symbol]
+        history = max(cfg.atr_history_bars, cfg.atr_len + 2)
+        if history > 1000:
+            history = 1000
+        klines = client.klines(symbol=symbol, interval=cfg.interval, limit=history)
+        if len(klines) < 2:
+            return False
+        closed_klines = klines[:-1]
+        close_time_ms = int(closed_klines[-1][6])
+        if close_time_ms == last_close_ms_by_symbol.get(symbol):
+            return False
+        last_close_ms_by_symbol[symbol] = close_time_ms
+        df = klines_to_df(closed_klines)
+        signal, signal_atr, atr_value = compute_live_signal(df, cfg)
+        last_atr_by_symbol[symbol] = atr_value
+        candle = df.iloc[-1]
+        body = abs(float(candle["close"]) - float(candle["open"]))
+        log_event(cfg.log_path, {
+            "event": "candle_close",
+            "symbol": symbol,
+            "close_time_ms": close_time_ms,
+            "open": format_float_1(candle["open"]),
+            "high": format_float_1(candle["high"]),
+            "low": format_float_1(candle["low"]),
+            "close": format_float_1(candle["close"]),
+            "body": format_float_1(body),
+            "atr": format_float_1(atr_value),
+            "signal": signal,
+            "signal_atr": format_float_1(signal_atr),
+        })
+
+        if not allow_entry:
+            return False
+        if signal == 0 or signal_atr is None or atr_value is None:
+            return False
+
+        delay = cfg.entry_delay_min_seconds
+        if cfg.entry_delay_max_seconds > cfg.entry_delay_min_seconds:
+            delay = random.uniform(cfg.entry_delay_min_seconds, cfg.entry_delay_max_seconds)
+        time.sleep(delay)
+
+        bid, ask = get_book_ticker(client, symbol)
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid else 1.0
+        if spread_pct > cfg.spread_max_pct:
+            log_event(cfg.log_path, {"event": "skip_spread", "symbol": symbol, "spread_pct": format_float_2(spread_pct)})
+            return False
+
+        offset = atr_value * cfg.atr_offset_mult
+        if signal == 1:
+            limit_price = bid - offset
+            side = "BUY"
+        else:
+            limit_price = ask + offset
+            side = "SELL"
+
+        if cfg.post_only:
+            tick = filters["tick_size"]
+            if tick > 0:
+                if side == "BUY":
+                    limit_price = min(limit_price, bid - tick)
+                else:
+                    limit_price = max(limit_price, ask + tick)
+
+        if limit_price <= 0:
+            log_event(cfg.log_path, {"event": "skip_price", "symbol": symbol, "limit_price": format_float_2(limit_price)})
+            return False
+
+        limit_price_str = format_to_step(limit_price, filters["tick_size"])
+        margin_usd, leverage_used, skip_reason = resolve_trade_sizing(
+            entry_price=limit_price,
+            atr_value=signal_atr,
+            sl_atr_mult=cfg.sl_atr_mult,
+            margin_cap=cfg.margin_usd,
+            max_leverage=cfg.leverage,
+            min_leverage=cfg.min_leverage,
+            target_loss_usd=cfg.target_loss_usd,
+            leverage_step=1.0,
+        )
+        if margin_usd is None or leverage_used is None:
+            log_event(cfg.log_path, {
+                "event": "skip_leverage",
+                "symbol": symbol,
+                "reason": skip_reason,
+                "margin_cap": format_float_2(cfg.margin_usd),
+                "max_leverage": cfg.leverage,
+            })
+            return False
+        leverage_int = int(round(leverage_used))
+        current_leverage = current_leverage_by_symbol.get(symbol)
+        if current_leverage != leverage_int:
+            try:
+                client.change_leverage(symbol=symbol, leverage=leverage_int)
+                current_leverage_by_symbol[symbol] = leverage_int
+            except ClientError:
+                log_event(cfg.log_path, {"event": "leverage_change_error", "symbol": symbol, "leverage": leverage_int})
+                return False
+        notional = margin_usd * leverage_int
+        qty = notional / limit_price
+        qty_str = format_to_step(qty, filters["step_size"])
+        if float(qty_str) < filters["min_qty"]:
+            log_event(cfg.log_path, {"event": "skip_qty", "symbol": symbol, "quantity": format_float_2(qty_str)})
+            return False
+        tif = "GTX" if cfg.post_only else "GTC"
+        entry_order = limit_order(
+            symbol,
+            side,
+            qty_str,
+            limit_price_str,
+            client,
+            time_in_force=tif,
+            reduce_only=False,
+            client_order_id=f"ATR_E_{close_time_ms}",
+        )
+        if entry_order:
+            state.entry_order_id = entry_order.get("orderId")
+            state.entry_order_time = time.time()
+            state.pending_atr = signal_atr
+            state.pending_side = 1 if side == "BUY" else -1
+            state.entry_close_ms = close_time_ms
+            state.entry_margin_usd = margin_usd
+            state.entry_leverage = leverage_int
+            state.active_symbol = symbol
+            log_event(cfg.log_path, {
+                "event": "entry_order",
+                "symbol": symbol,
+                "order_id": state.entry_order_id,
+                "side": side,
+                "limit_price": format_float_2(limit_price_str),
+                "quantity": format_float_2(qty_str),
+                "signal_atr": format_float_2(signal_atr),
+                "margin_usd": format_float_2(margin_usd),
+                "leverage": leverage_int,
+                "spread_pct": format_float_2(spread_pct),
+                "offset": format_float_2(offset),
+            })
+            return True
+        return False
+
     while True:
         try:
-            position = get_position_info(client, cfg.symbol)
-            position_amt = float(position.get("positionAmt", 0.0))
+            positions: Dict[str, Dict[str, str]] = {}
+            open_symbols: List[str] = []
+            for sym in symbols:
+                pos = get_position_info(client, sym)
+                positions[sym] = pos
+                try:
+                    amt = float(pos.get("positionAmt", 0.0))
+                except (TypeError, ValueError):
+                    amt = 0.0
+                if amt != 0.0:
+                    open_symbols.append(sym)
+
+            multi_position = len(open_symbols) > 1
+            if multi_position:
+                log_event(cfg.log_path, {
+                    "event": "multi_position_detected",
+                    "symbols": open_symbols,
+                })
+
+            active_symbol = state.active_symbol
+            if active_symbol and active_symbol not in symbols:
+                log_event(cfg.log_path, {
+                    "event": "active_symbol_missing",
+                    "symbol": active_symbol,
+                })
+                active_symbol = None
+                state.active_symbol = None
+
+            if active_symbol is None and open_symbols:
+                active_symbol = open_symbols[0]
+                state.active_symbol = active_symbol
+
+            if state.entry_order_id is not None and active_symbol is None:
+                log_event(cfg.log_path, {
+                    "event": "entry_order_symbol_missing",
+                    "order_id": state.entry_order_id,
+                })
+                time.sleep(cfg.poll_interval_seconds)
+                continue
+
+            position = positions.get(active_symbol) if active_symbol else {}
+            try:
+                position_amt = float(position.get("positionAmt", 0.0)) if position else 0.0
+            except (TypeError, ValueError):
+                position_amt = 0.0
             exit_filled = False
             in_position = position_amt != 0.0
             if in_position:
                 state.had_position = True
 
             # Manage open entry order
-            if state.entry_order_id is not None:
+            if state.entry_order_id is not None and active_symbol is not None:
                 try:
-                    order = client.query_order(symbol=cfg.symbol, orderId=state.entry_order_id)
+                    order = client.query_order(symbol=active_symbol, orderId=state.entry_order_id)
                 except ClientError:
-                    log_event(cfg.log_path, {"event": "entry_order_query_error", "order_id": state.entry_order_id})
+                    log_event(cfg.log_path, {
+                        "event": "entry_order_query_error",
+                        "symbol": active_symbol,
+                        "order_id": state.entry_order_id,
+                    })
                     state.entry_order_id = None
                     state.entry_order_time = None
                     state.pending_atr = None
@@ -1059,12 +1257,15 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_side = None
                     state.entry_time_iso = None
                     state.entry_signal_ms = None
+                    if not in_position:
+                        state.active_symbol = None
                     order = None
                 if order is None:
                     time.sleep(cfg.poll_interval_seconds)
                     continue
                 status = order.get("status")
                 if status == "FILLED":
+                    filters = filters_by_symbol[active_symbol]
                     entry_price = float(order.get("avgPrice") or order.get("price"))
                     qty = float(order.get("executedQty") or order.get("origQty"))
                     side = state.pending_side or (1 if position_amt > 0 else -1)
@@ -1079,17 +1280,18 @@ def run_live(cfg: LiveConfig) -> None:
                     if state.entry_margin_usd is None:
                         state.entry_margin_usd = cfg.margin_usd
                     if state.entry_leverage is None:
-                        state.entry_leverage = state.current_leverage or cfg.leverage
+                        state.entry_leverage = current_leverage_by_symbol.get(active_symbol) or cfg.leverage
                     state.entry_side = side
                     state.entry_time_iso = _utc_now_iso()
-                    if state.last_close_ms is not None:
-                        state.entry_signal_ms = state.last_close_ms
+                    last_close_ms = last_close_ms_by_symbol.get(active_symbol)
+                    if last_close_ms is not None:
+                        state.entry_signal_ms = last_close_ms
                     else:
                         state.entry_signal_ms = entry_close_ms
 
-                    entry_atr = state.active_atr if state.active_atr is not None else state.last_atr
+                    entry_atr = state.active_atr if state.active_atr is not None else last_atr_by_symbol.get(active_symbol)
                     if entry_atr is None:
-                        log_event(cfg.log_path, {"event": "missing_atr", "stage": "entry_filled"})
+                        log_event(cfg.log_path, {"event": "missing_atr", "stage": "entry_filled", "symbol": active_symbol})
                         entry_atr = 0.0
                     state.active_atr = entry_atr
                     tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
@@ -1104,7 +1306,7 @@ def run_live(cfg: LiveConfig) -> None:
                     # Place TP as a resting limit to avoid taker fees when possible.
                     tp_tif = "GTX" if cfg.tp_post_only else "GTC"
                     tp_order = limit_order(
-                        symbol=cfg.symbol,
+                        symbol=active_symbol,
                         side=tp_side,
                         quantity=qty_str,
                         price=tp_price_str,
@@ -1117,11 +1319,12 @@ def run_live(cfg: LiveConfig) -> None:
                     if tp_order is None:
                         log_event(cfg.log_path, {
                             "event": "tp_order_rejected",
+                            "symbol": active_symbol,
                             "tp_price": format_float_2(tp_price),
                             "post_only": cfg.tp_post_only,
                         })
                     sl_order = algo_order(
-                        cfg.symbol,
+                        active_symbol,
                         sl_side,
                         "STOP",
                         qty_str,
@@ -1144,6 +1347,7 @@ def run_live(cfg: LiveConfig) -> None:
 
                     log_event(cfg.log_path, {
                         "event": "entry_filled",
+                        "symbol": active_symbol,
                         "order_id": order.get("orderId"),
                         "side": "LONG" if side == 1 else "SHORT",
                         "entry_price": format_float_2(entry_price),
@@ -1157,7 +1361,12 @@ def run_live(cfg: LiveConfig) -> None:
                         "sl_algo_id": state.sl_algo_id,
                     })
                 elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
-                    log_event(cfg.log_path, {"event": "entry_order_closed", "order_id": state.entry_order_id, "status": status})
+                    log_event(cfg.log_path, {
+                        "event": "entry_order_closed",
+                        "symbol": active_symbol,
+                        "order_id": state.entry_order_id,
+                        "status": status,
+                    })
                     state.entry_order_id = None
                     state.entry_order_time = None
                     state.pending_atr = None
@@ -1165,13 +1374,18 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_close_ms = None
                     state.entry_margin_usd = None
                     state.entry_leverage = None
+                    state.active_symbol = None
                 else:
                     if state.entry_order_time and (time.time() - state.entry_order_time) > cfg.entry_order_timeout_seconds:
                         try:
-                            client.cancel_order(symbol=cfg.symbol, orderId=state.entry_order_id)
+                            client.cancel_order(symbol=active_symbol, orderId=state.entry_order_id)
                         except ClientError:
                             pass
-                        log_event(cfg.log_path, {"event": "entry_order_timeout", "order_id": state.entry_order_id})
+                        log_event(cfg.log_path, {
+                            "event": "entry_order_timeout",
+                            "symbol": active_symbol,
+                            "order_id": state.entry_order_id,
+                        })
                         state.entry_order_id = None
                         state.entry_order_time = None
                         state.pending_atr = None
@@ -1182,16 +1396,17 @@ def run_live(cfg: LiveConfig) -> None:
                         state.entry_side = None
                         state.entry_time_iso = None
                         state.entry_signal_ms = None
+                        state.active_symbol = None
 
-            if not in_position and state.had_position:
+            if active_symbol and not in_position and state.had_position:
                 tp_order = query_limit_order(
                     client,
-                    cfg.symbol,
+                    active_symbol,
                     order_id=state.tp_order_id,
                 ) if state.tp_order_id else None
                 sl_order = query_algo_order(
                     client,
-                    cfg.symbol,
+                    active_symbol,
                     algo_id=state.sl_algo_id,
                     client_algo_id=state.sl_client_algo_id,
                 ) if (state.sl_algo_id or state.sl_client_algo_id) else None
@@ -1219,18 +1434,20 @@ def run_live(cfg: LiveConfig) -> None:
                     notional = state.entry_price * state.entry_qty
                     if margin_used:
                         roi_net = pnl_net / margin_used
-                if interval_ms and state.entry_signal_ms and state.last_close_ms:
-                    bars_held = max(0, int((state.last_close_ms - state.entry_signal_ms) / interval_ms))
+                last_close_ms = last_close_ms_by_symbol.get(active_symbol)
+                if interval_ms and state.entry_signal_ms and last_close_ms:
+                    bars_held = max(0, int((last_close_ms - state.entry_signal_ms) / interval_ms))
 
                 log_event(cfg.log_path, {
                     "event": "exit_filled",
+                    "symbol": active_symbol,
                     "exit_reason": exit_reason,
                     "exit_price": format_float_2(exit_price),
                     "entry_price": format_float_2(state.entry_price),
                     "quantity": format_float_2(state.entry_qty),
                     "entry_atr": format_float_2(state.active_atr),
                     "margin_usd": format_float_2(margin_used),
-                    "leverage": state.entry_leverage or state.current_leverage or cfg.leverage,
+                    "leverage": state.entry_leverage or current_leverage_by_symbol.get(active_symbol) or cfg.leverage,
                     "tp_order_id": state.tp_order_id,
                     "sl_algo_id": state.sl_algo_id,
                 })
@@ -1256,9 +1473,9 @@ def run_live(cfg: LiveConfig) -> None:
                 })
 
                 if state.tp_order_id and not tp_filled:
-                    cancel_limit_order(client, cfg.symbol, order_id=state.tp_order_id)
+                    cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
                 if state.sl_algo_id or state.sl_client_algo_id:
-                    cancel_algo_order(client, cfg.symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
+                    cancel_algo_order(client, active_symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
 
                 state.tp_order_id = None
                 state.sl_algo_id = None
@@ -1276,18 +1493,19 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_time_iso = None
                 state.entry_signal_ms = None
                 state.had_position = False
+                state.active_symbol = None
                 exit_filled = True
 
             if exit_filled:
                 time.sleep(cfg.poll_interval_seconds)
                 continue
 
-            if not in_position and state.entry_price is None and (state.tp_order_id or state.sl_algo_id):
+            if active_symbol and not in_position and state.entry_price is None and (state.tp_order_id or state.sl_algo_id):
                 if state.tp_order_id:
-                    cancel_limit_order(client, cfg.symbol, order_id=state.tp_order_id)
+                    cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
                 if state.sl_algo_id or state.sl_client_algo_id:
-                    cancel_algo_order(client, cfg.symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
-                log_event(cfg.log_path, {"event": "position_closed"})
+                    cancel_algo_order(client, active_symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
+                log_event(cfg.log_path, {"event": "position_closed", "symbol": active_symbol})
                 state.tp_order_id = None
                 state.sl_algo_id = None
                 state.tp_client_order_id = None
@@ -1304,12 +1522,13 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_time_iso = None
                 state.entry_signal_ms = None
                 state.had_position = False
+                state.active_symbol = None
 
-            if in_position:
+            if in_position and active_symbol:
                 if state.tp_order_id:
                     tp_order = query_limit_order(
                         client,
-                        cfg.symbol,
+                        active_symbol,
                         order_id=state.tp_order_id,
                     )
                     if limit_order_inactive(tp_order):
@@ -1318,7 +1537,7 @@ def run_live(cfg: LiveConfig) -> None:
                 if state.sl_algo_id or state.sl_client_algo_id:
                     sl_order = query_algo_order(
                         client,
-                        cfg.symbol,
+                        active_symbol,
                         algo_id=state.sl_algo_id,
                         client_algo_id=state.sl_client_algo_id,
                     )
@@ -1327,15 +1546,16 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_client_algo_id = None
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and (state.tp_order_id is None or state.sl_algo_id is None):
+            if in_position and active_symbol and (state.tp_order_id is None or state.sl_algo_id is None):
+                filters = filters_by_symbol[active_symbol]
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
                 qty = abs(position_amt)
                 if state.entry_side is None:
                     state.entry_side = side
-                entry_atr = state.active_atr or state.pending_atr or state.last_atr
+                entry_atr = state.active_atr or state.pending_atr or last_atr_by_symbol.get(active_symbol)
                 if entry_atr is None:
-                    log_event(cfg.log_path, {"event": "missing_atr", "stage": "exit_recover"})
+                    log_event(cfg.log_path, {"event": "missing_atr", "stage": "exit_recover", "symbol": active_symbol})
                     entry_atr = 0.0
                 state.active_atr = entry_atr
                 state.entry_price = entry_price
@@ -1352,7 +1572,7 @@ def run_live(cfg: LiveConfig) -> None:
                     tp_client_id = f"ATR_TP_RECOVER_{int(time.time())}"
                     tp_tif = "GTX" if cfg.tp_post_only else "GTC"
                     tp_order = limit_order(
-                        symbol=cfg.symbol,
+                        symbol=active_symbol,
                         side=tp_side,
                         quantity=qty_str,
                         price=tp_price_str,
@@ -1365,6 +1585,7 @@ def run_live(cfg: LiveConfig) -> None:
                     if tp_order is None:
                         log_event(cfg.log_path, {
                             "event": "tp_order_rejected",
+                            "symbol": active_symbol,
                             "tp_price": format_float_2(tp_price),
                             "post_only": cfg.tp_post_only,
                         })
@@ -1374,7 +1595,7 @@ def run_live(cfg: LiveConfig) -> None:
                 if state.sl_algo_id is None:
                     sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
                     sl_order = algo_order(
-                        cfg.symbol,
+                        active_symbol,
                         sl_side,
                         "STOP",
                         qty_str,
@@ -1391,129 +1612,15 @@ def run_live(cfg: LiveConfig) -> None:
                     state.sl_client_algo_id = (sl_order.get("clientAlgoId") if sl_order else None) or (sl_client_id if sl_order else None)
                     state.sl_price = sl_price
 
-            # New candle check
-            history = max(cfg.atr_history_bars, cfg.atr_len + 2)
-            if history > 1000:
-                history = 1000
-            klines = client.klines(symbol=cfg.symbol, interval=cfg.interval, limit=history)
-            if len(klines) >= 2:
-                closed_klines = klines[:-1]
-                close_time_ms = int(closed_klines[-1][6])
-                if close_time_ms != state.last_close_ms:
-                    state.last_close_ms = close_time_ms
-                    df = klines_to_df(closed_klines)
-                    signal, signal_atr, atr_value = compute_live_signal(df, cfg)
-                    state.last_atr = atr_value
-                    candle = df.iloc[-1]
-                    body = abs(float(candle["close"]) - float(candle["open"]))
-                    log_event(cfg.log_path, {
-                        "event": "candle_close",
-                        "close_time_ms": close_time_ms,
-                        "open": format_float_1(candle["open"]),
-                        "high": format_float_1(candle["high"]),
-                        "low": format_float_1(candle["low"]),
-                        "close": format_float_1(candle["close"]),
-                        "body": format_float_1(body),
-                        "atr": format_float_1(atr_value),
-                        "signal": signal,
-                        "signal_atr": format_float_1(signal_atr),
-                    })
-
-                    if position_amt == 0.0 and state.entry_order_id is None and signal != 0 and signal_atr is not None and atr_value is not None:
-                        delay = cfg.entry_delay_min_seconds
-                        if cfg.entry_delay_max_seconds > cfg.entry_delay_min_seconds:
-                            delay = random.uniform(cfg.entry_delay_min_seconds, cfg.entry_delay_max_seconds)
-                        time.sleep(delay)
-
-                        bid, ask = get_book_ticker(client, cfg.symbol)
-                        mid = (bid + ask) / 2.0
-                        spread_pct = (ask - bid) / mid if mid else 1.0
-                        if spread_pct > cfg.spread_max_pct:
-                            log_event(cfg.log_path, {"event": "skip_spread", "spread_pct": format_float_2(spread_pct)})
-                        else:
-                            offset = atr_value * cfg.atr_offset_mult
-                            if signal == 1:
-                                limit_price = bid - offset
-                                side = "BUY"
-                            else:
-                                limit_price = ask + offset
-                                side = "SELL"
-
-                            if cfg.post_only:
-                                tick = filters["tick_size"]
-                                if tick > 0:
-                                    if side == "BUY":
-                                        limit_price = min(limit_price, bid - tick)
-                                    else:
-                                        limit_price = max(limit_price, ask + tick)
-
-                            if limit_price <= 0:
-                                log_event(cfg.log_path, {"event": "skip_price", "limit_price": format_float_2(limit_price)})
-                            else:
-                                limit_price_str = format_to_step(limit_price, filters["tick_size"])
-                                margin_usd, leverage_used, skip_reason = resolve_trade_sizing(
-                                    entry_price=limit_price,
-                                    atr_value=signal_atr,
-                                    sl_atr_mult=cfg.sl_atr_mult,
-                                    margin_cap=cfg.margin_usd,
-                                    max_leverage=cfg.leverage,
-                                    min_leverage=cfg.min_leverage,
-                                    target_loss_usd=cfg.target_loss_usd,
-                                    leverage_step=1.0,
-                                )
-                                if margin_usd is None or leverage_used is None:
-                                    log_event(cfg.log_path, {
-                                        "event": "skip_leverage",
-                                        "reason": skip_reason,
-                                        "margin_cap": format_float_2(cfg.margin_usd),
-                                        "max_leverage": cfg.leverage,
-                                    })
-                                    continue
-                                leverage_int = int(round(leverage_used))
-                                if state.current_leverage != leverage_int:
-                                    try:
-                                        client.change_leverage(symbol=cfg.symbol, leverage=leverage_int)
-                                        state.current_leverage = leverage_int
-                                    except ClientError:
-                                        log_event(cfg.log_path, {"event": "leverage_change_error", "leverage": leverage_int})
-                                        continue
-                                notional = margin_usd * leverage_int
-                                qty = notional / limit_price
-                                qty_str = format_to_step(qty, filters["step_size"])
-                                if float(qty_str) < filters["min_qty"]:
-                                    log_event(cfg.log_path, {"event": "skip_qty", "quantity": format_float_2(qty_str)})
-                                else:
-                                    tif = "GTX" if cfg.post_only else "GTC"
-                                    entry_order = limit_order(
-                                        cfg.symbol,
-                                        side,
-                                        qty_str,
-                                        limit_price_str,
-                                        client,
-                                        time_in_force=tif,
-                                        reduce_only=False,
-                                        client_order_id=f"ATR_E_{close_time_ms}",
-                                    )
-                                    if entry_order:
-                                        state.entry_order_id = entry_order.get("orderId")
-                                        state.entry_order_time = time.time()
-                                        state.pending_atr = signal_atr
-                                        state.pending_side = 1 if side == "BUY" else -1
-                                        state.entry_close_ms = close_time_ms
-                                        state.entry_margin_usd = margin_usd
-                                        state.entry_leverage = leverage_int
-                                        log_event(cfg.log_path, {
-                                            "event": "entry_order",
-                                            "order_id": state.entry_order_id,
-                                            "side": side,
-                                            "limit_price": format_float_2(limit_price_str),
-                                            "quantity": format_float_2(qty_str),
-                                            "signal_atr": format_float_2(signal_atr),
-                                            "margin_usd": format_float_2(margin_usd),
-                                            "leverage": leverage_int,
-                                            "spread_pct": format_float_2(spread_pct),
-                                            "offset": format_float_2(offset),
-                                        })
+            active_symbol = state.active_symbol
+            # New candle check / entry scan
+            if active_symbol:
+                process_symbol_candle(active_symbol, allow_entry=False)
+            elif not multi_position and state.entry_order_id is None and not open_symbols:
+                for symbol in symbols:
+                    if process_symbol_candle(symbol, allow_entry=True):
+                        active_symbol = symbol
+                        break
         except Exception as exc:
             logging.exception("Live loop error")
             log_event(cfg.log_path, {"event": "error", "message": str(exc)})
