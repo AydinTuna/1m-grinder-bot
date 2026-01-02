@@ -180,7 +180,7 @@ def build_signals_body_opposite(
       candle_dir = sign(close-open)
       entry_dir = -candle_dir (opposite)
       if tolerance_pct > 0:
-        thr*ATR*(1-tol) <= body <= thr*ATR*(1+tol)
+        body >= thr*ATR*(1-tol)
       else:
         body >= thr*ATR
       if body meets thr1 => signal
@@ -197,15 +197,10 @@ def build_signals_body_opposite(
     target1 = thr1 * atr
     target2 = thr2 * atr
     if tol > 0.0:
-        lower1 = target1 * (1.0 - tol)
-        upper1 = target1 * (1.0 + tol)
-        lower2 = target2 * (1.0 - tol)
-        upper2 = target2 * (1.0 + tol)
-        cond1 = (body >= lower1) & (body <= upper1)
-        cond2 = (body >= lower2) & (body <= upper2)
-    else:
-        cond1 = body >= target1
-        cond2 = body >= target2
+        target1 = target1 * (1.0 - tol)
+        target2 = target2 * (1.0 - tol)
+    cond1 = body >= target1
+    cond2 = body >= target2
 
     # 1.5x
     signal[cond1] = entry_dir[cond1]
