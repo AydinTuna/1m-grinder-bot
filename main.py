@@ -480,6 +480,9 @@ class LiveState:
     entry_time_iso: Optional[str] = None
     entry_signal_ms: Optional[int] = None
     had_position: bool = False
+    panic_exit_order_id: Optional[int] = None
+    panic_exit_client_order_id: Optional[str] = None
+    panic_exit_time: Optional[float] = None
 
 
 def _utc_now_iso() -> str:
@@ -1632,6 +1635,9 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_signal_ms = None
                 state.had_position = False
                 state.active_symbol = None
+                state.panic_exit_order_id = None
+                state.panic_exit_client_order_id = None
+                state.panic_exit_time = None
                 exit_filled = True
 
             if exit_filled:
@@ -1661,8 +1667,99 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_signal_ms = None
                 state.had_position = False
                 state.active_symbol = None
+                state.panic_exit_order_id = None
+                state.panic_exit_client_order_id = None
+                state.panic_exit_time = None
 
             if in_position and active_symbol:
+                # Stop-limit orders can trigger without filling in fast moves. If unrealized loss
+                # exceeds 1.25x the configured target_loss_usd, force a close with a limit order
+                # in the opposite direction.
+                panic_threshold_usd = None
+                if cfg.target_loss_usd is not None and cfg.target_loss_usd > 0:
+                    panic_threshold_usd = cfg.target_loss_usd * 1.25
+
+                try:
+                    unrealized_pnl = float(position.get("unRealizedProfit", 0.0)) if position else 0.0
+                except (TypeError, ValueError):
+                    unrealized_pnl = 0.0
+                position_loss_usd = -unrealized_pnl if unrealized_pnl < 0 else 0.0
+
+                panic_order = None
+                if state.panic_exit_order_id is not None:
+                    panic_order = query_limit_order(client, active_symbol, order_id=state.panic_exit_order_id)
+                    if limit_order_inactive(panic_order):
+                        state.panic_exit_order_id = None
+                        state.panic_exit_client_order_id = None
+                        state.panic_exit_time = None
+                        panic_order = None
+
+                should_panic = panic_threshold_usd is not None and position_loss_usd >= panic_threshold_usd
+
+                if should_panic and state.panic_exit_order_id is not None and state.panic_exit_time is not None:
+                    status = str((panic_order or {}).get("status") or "").upper()
+                    if status not in {"FILLED"} and (time.time() - state.panic_exit_time) >= 3.0:
+                        cancel_limit_order(client, active_symbol, order_id=state.panic_exit_order_id)
+                        state.panic_exit_order_id = None
+                        state.panic_exit_client_order_id = None
+                        state.panic_exit_time = None
+                        panic_order = None
+
+                if should_panic and state.panic_exit_order_id is None:
+                    filters = filters_by_symbol[active_symbol]
+                    close_side = "SELL" if position_amt > 0 else "BUY"
+                    close_qty = abs(position_amt)
+                    close_qty_str = format_to_step(close_qty, filters["step_size"])
+                    try:
+                        close_qty_num = float(close_qty_str)
+                    except (TypeError, ValueError):
+                        close_qty_num = 0.0
+                    if close_qty_num >= filters["min_qty"]:
+                        bid, ask = get_book_ticker(client, active_symbol)
+                        tick_size = filters["tick_size"]
+                        if close_side == "SELL":
+                            close_price = ask
+                        else:
+                            close_price = bid
+                        close_price_str = format_price_to_tick(close_price, tick_size, side=close_side, post_only=True)
+                        panic_client_id = f"ATR_PANIC_{int(time.time())}"
+                        new_panic_order = limit_order(
+                            symbol=active_symbol,
+                            side=close_side,
+                            quantity=close_qty_str,
+                            price=close_price_str,
+                            client=client,
+                            time_in_force="GTX",
+                            reduce_only=True,
+                            client_order_id=panic_client_id,
+                            tick_size=tick_size,
+                        )
+                        state.panic_exit_order_id = new_panic_order.get("orderId") if new_panic_order else None
+                        state.panic_exit_client_order_id = (
+                            (new_panic_order.get("clientOrderId") if new_panic_order else None)
+                            or (panic_client_id if new_panic_order else None)
+                        )
+                        state.panic_exit_time = time.time() if new_panic_order else None
+                        log_event(cfg.log_path, {
+                            "event": "panic_exit_order",
+                            "symbol": active_symbol,
+                            "side": close_side,
+                            "quantity": format_float_2(close_qty_num),
+                            "price": format_float_by_symbol(close_price, active_symbol),
+                            "order_id": state.panic_exit_order_id,
+                            "client_order_id": state.panic_exit_client_order_id,
+                            "unrealized_pnl": format_float_2(unrealized_pnl),
+                            "loss_usd": format_float_2(position_loss_usd),
+                            "threshold_usd": format_float_2(panic_threshold_usd),
+                        })
+                    else:
+                        log_event(cfg.log_path, {
+                            "event": "panic_exit_skip_qty",
+                            "symbol": active_symbol,
+                            "position_amt": format_float_2(position_amt),
+                            "quantity": close_qty_str,
+                        })
+
                 if state.tp_order_id:
                     tp_order = query_limit_order(
                         client,
@@ -1684,7 +1781,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_client_algo_id = None
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and active_symbol and (state.tp_order_id is None or state.sl_algo_id is None):
+            if in_position and active_symbol and state.panic_exit_order_id is None and (state.tp_order_id is None or state.sl_algo_id is None):
                 filters = filters_by_symbol[active_symbol]
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
