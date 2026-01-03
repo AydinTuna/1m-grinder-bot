@@ -469,10 +469,6 @@ class LiveState:
     sl_client_algo_id: Optional[str] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
-    sl_trigger_time: Optional[float] = None
-    sl_breach_time: Optional[float] = None
-    exit_order_id: Optional[int] = None
-    exit_reason_override: Optional[str] = None
     entry_close_ms: Optional[int] = None
     entry_price: Optional[float] = None
     entry_qty: Optional[float] = None
@@ -583,36 +579,6 @@ def reprice_post_only(price: float, side: str, bid: float, ask: float, tick_size
     if side_u == "SELL":
         return max(price, ask + tick_size)
     return price
-
-
-def format_stop_limit_price(stop_price: float, side: str, tick_size: float, offset_ticks: int) -> str:
-    side_u = str(side).upper()
-    ticks = max(0, int(offset_ticks or 0))
-    offset = float(tick_size) * ticks if tick_size and ticks else 0.0
-    if side_u == "SELL":
-        limit_price = stop_price - offset
-        rounding = ROUND_DOWN
-    else:
-        limit_price = stop_price + offset
-        rounding = ROUND_UP
-    if limit_price <= 0:
-        limit_price = stop_price
-    return format_to_step(limit_price, tick_size, rounding=rounding)
-
-
-def format_aggressive_exit_price(side: str, bid: float, ask: float, tick_size: float, offset_ticks: int) -> str:
-    side_u = str(side).upper()
-    ticks = max(0, int(offset_ticks or 0))
-    offset = float(tick_size) * ticks if tick_size and ticks else 0.0
-    if side_u == "SELL":
-        limit_price = bid - offset
-        rounding = ROUND_DOWN
-    else:
-        limit_price = ask + offset
-        rounding = ROUND_UP
-    if limit_price <= 0:
-        limit_price = bid if side_u == "SELL" else ask
-    return format_to_step(limit_price, tick_size, rounding=rounding)
 
 
 def get_um_futures_client(cfg: LiveConfig) -> UMFutures:
@@ -871,20 +837,6 @@ def limit_order_inactive(order: Optional[Dict[str, object]]) -> bool:
         return False
     status = str(order.get("status") or "").upper()
     return status in {"CANCELED", "EXPIRED", "REJECTED"}
-
-
-def order_fill_price(order: Optional[Dict[str, object]]) -> Optional[float]:
-    if not order:
-        return None
-    for key in ("avgPrice", "price"):
-        value = order.get(key)
-        try:
-            price = float(value)
-        except (TypeError, ValueError):
-            continue
-        if price > 0:
-            return price
-    return None
 
 
 def stop_limit_order(
@@ -1226,10 +1178,6 @@ def run_live(cfg: LiveConfig) -> None:
         "leverage": cfg.leverage,
         "margin_usd": format_float_2(cfg.margin_usd),
         "target_loss_usd": format_float_2(cfg.target_loss_usd),
-        "sl_stop_limit_offset_ticks": int(cfg.sl_stop_limit_offset_ticks),
-        "sl_triggered_limit_fallback_seconds": float(cfg.sl_triggered_limit_fallback_seconds),
-        "sl_fallback_limit_offset_ticks": int(cfg.sl_fallback_limit_offset_ticks),
-        "sl_fallback_time_in_force": str(cfg.sl_fallback_time_in_force),
     })
 
     def process_symbol_candle(symbol: str, allow_entry: bool) -> bool:
@@ -1492,12 +1440,6 @@ def run_live(cfg: LiveConfig) -> None:
                     sl_side = "SELL" if side == 1 else "BUY"
                     tp_client_id = f"ATR_TP_{entry_close_ms or ''}"
                     sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
-                    sl_limit_price_str = format_stop_limit_price(
-                        stop_price=sl_price,
-                        side=sl_side,
-                        tick_size=filters["tick_size"],
-                        offset_ticks=cfg.sl_stop_limit_offset_ticks,
-                    )
                     # Place TP as a resting limit to avoid taker fees when possible.
                     tp_tif = "GTX" if cfg.tp_post_only else "GTC"
                     tp_order = limit_order(
@@ -1526,7 +1468,7 @@ def run_live(cfg: LiveConfig) -> None:
                         qty_str,
                         sl_price_str,
                         client,
-                        price=sl_limit_price_str,
+                        price=sl_price_str,
                         time_in_force="GTC",
                         reduce_only=True,
                         client_algo_id=sl_client_id,
@@ -1600,11 +1542,6 @@ def run_live(cfg: LiveConfig) -> None:
                     active_symbol,
                     order_id=state.tp_order_id,
                 ) if state.tp_order_id else None
-                exit_order = query_limit_order(
-                    client,
-                    active_symbol,
-                    order_id=state.exit_order_id,
-                ) if state.exit_order_id else None
                 sl_order = query_algo_order(
                     client,
                     active_symbol,
@@ -1614,14 +1551,7 @@ def run_live(cfg: LiveConfig) -> None:
                 tp_filled = limit_order_filled(tp_order)
                 sl_triggered = algo_order_triggered(sl_order)
 
-                exit_reason = None
-                exit_price = None
-                if state.exit_reason_override and state.exit_order_id is not None:
-                    exit_reason = state.exit_reason_override
-                    exit_price = order_fill_price(exit_order)
-                    if exit_price is None and str(exit_reason).startswith("SL"):
-                        exit_price = state.sl_price
-                elif tp_filled and not sl_triggered:
+                if tp_filled and not sl_triggered:
                     exit_reason = "TP"
                     exit_price = state.tp_price
                 elif sl_triggered and not tp_filled:
@@ -1658,7 +1588,6 @@ def run_live(cfg: LiveConfig) -> None:
                     "leverage": state.entry_leverage or current_leverage_by_symbol.get(active_symbol) or cfg.leverage,
                     "tp_order_id": state.tp_order_id,
                     "sl_algo_id": state.sl_algo_id,
-                    "exit_order_id": state.exit_order_id,
                 })
 
                 append_live_trade(cfg.live_trades_csv, {
@@ -1692,10 +1621,6 @@ def run_live(cfg: LiveConfig) -> None:
                 state.sl_client_algo_id = None
                 state.tp_price = None
                 state.sl_price = None
-                state.sl_trigger_time = None
-                state.sl_breach_time = None
-                state.exit_order_id = None
-                state.exit_reason_override = None
                 state.active_atr = None
                 state.pending_atr = None
                 state.entry_price = None
@@ -1725,10 +1650,6 @@ def run_live(cfg: LiveConfig) -> None:
                 state.sl_client_algo_id = None
                 state.tp_price = None
                 state.sl_price = None
-                state.sl_trigger_time = None
-                state.sl_breach_time = None
-                state.exit_order_id = None
-                state.exit_reason_override = None
                 state.active_atr = None
                 state.pending_atr = None
                 state.entry_price = None
@@ -1742,16 +1663,6 @@ def run_live(cfg: LiveConfig) -> None:
                 state.active_symbol = None
 
             if in_position and active_symbol:
-                bid = None
-                ask = None
-                now_ts = time.time()
-
-                if state.exit_order_id:
-                    exit_order = query_limit_order(client, active_symbol, order_id=state.exit_order_id)
-                    if limit_order_inactive(exit_order):
-                        state.exit_order_id = None
-                        state.exit_reason_override = None
-
                 if state.tp_order_id:
                     tp_order = query_limit_order(
                         client,
@@ -1761,9 +1672,6 @@ def run_live(cfg: LiveConfig) -> None:
                     if limit_order_inactive(tp_order):
                         state.tp_order_id = None
                         state.tp_client_order_id = None
-
-                sl_order = None
-                sl_triggered = False
                 if state.sl_algo_id or state.sl_client_algo_id:
                     sl_order = query_algo_order(
                         client,
@@ -1774,129 +1682,9 @@ def run_live(cfg: LiveConfig) -> None:
                     if algo_order_inactive(sl_order):
                         state.sl_algo_id = None
                         state.sl_client_algo_id = None
-                        sl_order = None
-                    else:
-                        sl_triggered = algo_order_triggered(sl_order)
-
-                if sl_triggered:
-                    if state.sl_trigger_time is None:
-                        state.sl_trigger_time = now_ts
-                        log_event(cfg.log_path, {
-                            "event": "sl_triggered",
-                            "symbol": active_symbol,
-                            "sl_price": format_float_2(state.sl_price),
-                            "algo_id": state.sl_algo_id,
-                        })
-                else:
-                    state.sl_trigger_time = None
-
-                if state.sl_price is not None:
-                    try:
-                        bid, ask = get_book_ticker(client, active_symbol)
-                    except Exception:
-                        bid, ask = None, None
-                    breached = False
-                    if bid is not None and ask is not None:
-                        breached = (bid <= state.sl_price) if position_amt > 0 else (ask >= state.sl_price)
-                    if breached:
-                        if state.sl_breach_time is None:
-                            state.sl_breach_time = now_ts
-                    else:
-                        state.sl_breach_time = None
-
-                fallback_seconds = float(getattr(cfg, "sl_triggered_limit_fallback_seconds", 0.0) or 0.0)
-                should_limit_close = (
-                    state.exit_order_id is None
-                    and fallback_seconds >= 0.0
-                    and (
-                        (state.sl_trigger_time is not None and (now_ts - state.sl_trigger_time) >= fallback_seconds)
-                        or (state.sl_breach_time is not None and (now_ts - state.sl_breach_time) >= fallback_seconds)
-                    )
-                )
-
-                if should_limit_close:
-                    filters = filters_by_symbol[active_symbol]
-                    exit_side = "SELL" if position_amt > 0 else "BUY"
-                    exit_qty = abs(position_amt)
-                    exit_qty_str = format_to_step(exit_qty, filters["step_size"])
-                    try:
-                        exit_qty_val = float(exit_qty_str)
-                    except (TypeError, ValueError):
-                        exit_qty_val = 0.0
-
-                    if exit_qty_val >= float(filters["min_qty"]):
-                        if bid is None or ask is None:
-                            try:
-                                bid, ask = get_book_ticker(client, active_symbol)
-                            except Exception:
-                                bid, ask = None, None
-                        if bid is not None and ask is not None:
-                            exit_price_str = format_aggressive_exit_price(
-                                side=exit_side,
-                                bid=bid,
-                                ask=ask,
-                                tick_size=filters["tick_size"],
-                                offset_ticks=cfg.sl_fallback_limit_offset_ticks,
-                            )
-                            tif = str(getattr(cfg, "sl_fallback_time_in_force", "IOC") or "IOC").upper()
-                            if tif not in {"GTC", "IOC", "FOK"}:
-                                tif = "IOC"
-
-                            if state.tp_order_id:
-                                cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
-                            if state.sl_algo_id or state.sl_client_algo_id:
-                                cancel_algo_order(client, active_symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
-                            state.tp_order_id = None
-                            state.tp_client_order_id = None
-                            state.sl_algo_id = None
-                            state.sl_client_algo_id = None
-
-                            exit_client_id = f"ATR_SL_LIM_{int(now_ts)}"
-                            exit_order = limit_order(
-                                symbol=active_symbol,
-                                side=exit_side,
-                                quantity=exit_qty_str,
-                                price=exit_price_str,
-                                client=client,
-                                time_in_force=tif,
-                                reduce_only=True,
-                                client_order_id=exit_client_id,
-                            )
-                            if exit_order:
-                                state.exit_order_id = exit_order.get("orderId")
-                                state.exit_reason_override = "SL_LIMIT"
-                                log_event(cfg.log_path, {
-                                    "event": "sl_limit_close_submitted",
-                                    "symbol": active_symbol,
-                                    "side": exit_side,
-                                    "quantity": format_float_2(exit_qty_str),
-                                    "price": format_float_2(exit_price_str),
-                                    "order_id": state.exit_order_id,
-                                    "tif": tif,
-                                    "triggered": sl_triggered,
-                                })
-                            else:
-                                log_event(cfg.log_path, {
-                                    "event": "sl_limit_close_rejected",
-                                    "symbol": active_symbol,
-                                    "side": exit_side,
-                                    "quantity": format_float_2(exit_qty_str),
-                                    "price": format_float_2(exit_price_str),
-                                    "tif": tif,
-                                    "triggered": sl_triggered,
-                                })
-                        else:
-                            log_event(cfg.log_path, {"event": "sl_limit_close_no_book", "symbol": active_symbol})
-                    else:
-                        log_event(cfg.log_path, {
-                            "event": "sl_limit_close_skip_qty",
-                            "symbol": active_symbol,
-                            "quantity": format_float_2(exit_qty_str),
-                            "min_qty": float(filters["min_qty"]),
-                        })
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and active_symbol and state.exit_order_id is None and (state.tp_order_id is None or state.sl_algo_id is None):
+            if in_position and active_symbol and (state.tp_order_id is None or state.sl_algo_id is None):
                 filters = filters_by_symbol[active_symbol]
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
@@ -1945,12 +1733,6 @@ def run_live(cfg: LiveConfig) -> None:
                     state.tp_price = tp_price
                 if state.sl_algo_id is None:
                     sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
-                    sl_limit_price_str = format_stop_limit_price(
-                        stop_price=sl_price,
-                        side=sl_side,
-                        tick_size=filters["tick_size"],
-                        offset_ticks=cfg.sl_stop_limit_offset_ticks,
-                    )
                     sl_order = algo_order(
                         active_symbol,
                         sl_side,
@@ -1958,7 +1740,7 @@ def run_live(cfg: LiveConfig) -> None:
                         qty_str,
                         sl_price_str,
                         client,
-                        price=sl_limit_price_str,
+                        price=sl_price_str,
                         time_in_force="GTC",
                         reduce_only=True,
                         client_algo_id=sl_client_id,

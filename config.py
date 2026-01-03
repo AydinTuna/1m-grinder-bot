@@ -80,8 +80,8 @@ class LiveConfig:
 
     # Execution controls
     tp_post_only: bool = True
-    entry_delay_min_seconds: float = 3.0
-    entry_delay_max_seconds: float = 3.0
+    entry_delay_min_seconds: float = 5.0
+    entry_delay_max_seconds: float = 5.0
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 1.0
@@ -90,9 +90,3 @@ class LiveConfig:
     live_trades_csv: str = "live_trades.csv"
     post_only: bool = True
     use_testnet: bool = False
-
-    # Stop-loss execution safeguards (limit-only; never uses MARKET orders)
-    sl_stop_limit_offset_ticks: int = 5
-    sl_triggered_limit_fallback_seconds: float = 2.0
-    sl_fallback_limit_offset_ticks: int = 5
-    sl_fallback_time_in_force: str = "IOC"
