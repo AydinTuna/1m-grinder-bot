@@ -64,14 +64,14 @@ class LiveConfig:
     leverage: int = 50  # max leverage for dynamic sizing
     min_leverage: int = 20
     margin_usd: float = 50.0  # margin cap per trade if targets are set
-    target_loss_usd: Optional[float] = 0.50
+    target_loss_usd: Optional[float] = 1.00
 
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 2.0
+    tp_atr_mult: float = 2.5
     sl_atr_mult: float = 1.0
 
     # Algo order controls
