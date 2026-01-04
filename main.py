@@ -465,8 +465,8 @@ class LiveState:
     active_atr: Optional[float] = None
     tp_order_id: Optional[int] = None
     tp_client_order_id: Optional[str] = None
-    sl_algo_id: Optional[int] = None
-    sl_client_algo_id: Optional[str] = None
+    sl_order_id: Optional[int] = None
+    sl_client_order_id: Optional[str] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     entry_close_ms: Optional[int] = None
@@ -849,8 +849,11 @@ def stop_limit_order(
     stop_price: str,
     price: str,
     client: UMFutures,
+    time_in_force: str = "GTC",
     reduce_only: bool = True,
     client_order_id: Optional[str] = None,
+    working_type: Optional[str] = None,
+    price_protect: Optional[bool] = None,
 ) -> Optional[Dict[str, object]]:
     try:
         params: Dict[str, object] = {
@@ -858,7 +861,7 @@ def stop_limit_order(
             "side": side,
             "type": "STOP",
             "quantity": quantity,
-            "timeInForce": "GTC",
+            "timeInForce": time_in_force,
             "price": price,
             "stopPrice": stop_price,
         }
@@ -866,7 +869,11 @@ def stop_limit_order(
             params["reduceOnly"] = True
         if client_order_id:
             params["newClientOrderId"] = client_order_id
-        return client.new_order(**params)
+        if working_type:
+            params["workingType"] = working_type
+        if price_protect is not None:
+            params["priceProtect"] = "TRUE" if price_protect else "FALSE"
+        return client.sign_request("POST", "/fapi/v1/order", params)
     except ClientError as error:
         logging.error(
             "Stop order error. status: %s, code: %s, message: %s",
@@ -1464,24 +1471,23 @@ def run_live(cfg: LiveConfig) -> None:
                             "tp_price": format_float_2(tp_price),
                             "post_only": cfg.tp_post_only,
                         })
-                    sl_order = algo_order(
-                        active_symbol,
-                        sl_side,
-                        "STOP",
-                        qty_str,
-                        sl_price_str,
-                        client,
+                    sl_order = stop_limit_order(
+                        symbol=active_symbol,
+                        side=sl_side,
+                        quantity=qty_str,
+                        stop_price=sl_price_str,
                         price=sl_price_str,
+                        client=client,
                         time_in_force="GTC",
                         reduce_only=True,
-                        client_algo_id=sl_client_id,
+                        client_order_id=sl_client_id,
                         working_type=cfg.algo_working_type,
                         price_protect=cfg.algo_price_protect,
                     )
                     state.tp_order_id = tp_order.get("orderId") if tp_order else None
-                    state.sl_algo_id = sl_order.get("algoId") if sl_order else None
+                    state.sl_order_id = sl_order.get("orderId") if sl_order else None
                     state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
-                    state.sl_client_algo_id = (sl_order.get("clientAlgoId") if sl_order else None) or (sl_client_id if sl_order else None)
+                    state.sl_client_order_id = (sl_order.get("clientOrderId") if sl_order else None) or (sl_client_id if sl_order else None)
                     state.tp_price = tp_price
                     state.sl_price = sl_price
                     state.entry_close_ms = None
@@ -1499,7 +1505,7 @@ def run_live(cfg: LiveConfig) -> None:
                         "tp_price": format_float_2(tp_price),
                         "sl_price": format_float_2(sl_price),
                         "tp_order_id": state.tp_order_id,
-                        "sl_algo_id": state.sl_algo_id,
+                        "sl_order_id": state.sl_order_id,
                     })
                 elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
                     log_event(cfg.log_path, {
@@ -1545,19 +1551,18 @@ def run_live(cfg: LiveConfig) -> None:
                     active_symbol,
                     order_id=state.tp_order_id,
                 ) if state.tp_order_id else None
-                sl_order = query_algo_order(
+                sl_order = query_limit_order(
                     client,
                     active_symbol,
-                    algo_id=state.sl_algo_id,
-                    client_algo_id=state.sl_client_algo_id,
-                ) if (state.sl_algo_id or state.sl_client_algo_id) else None
+                    order_id=state.sl_order_id,
+                ) if state.sl_order_id else None
                 tp_filled = limit_order_filled(tp_order)
-                sl_triggered = algo_order_triggered(sl_order)
+                sl_filled = limit_order_filled(sl_order)
 
-                if tp_filled and not sl_triggered:
+                if tp_filled and not sl_filled:
                     exit_reason = "TP"
                     exit_price = state.tp_price
-                elif sl_triggered and not tp_filled:
+                elif sl_filled and not tp_filled:
                     exit_reason = "SL"
                     exit_price = state.sl_price
                 else:
@@ -1590,7 +1595,7 @@ def run_live(cfg: LiveConfig) -> None:
                     "margin_usd": format_float_2(margin_used),
                     "leverage": state.entry_leverage or current_leverage_by_symbol.get(active_symbol) or cfg.leverage,
                     "tp_order_id": state.tp_order_id,
-                    "sl_algo_id": state.sl_algo_id,
+                    "sl_order_id": state.sl_order_id,
                 })
 
                 append_live_trade(cfg.live_trades_csv, {
@@ -1615,13 +1620,13 @@ def run_live(cfg: LiveConfig) -> None:
 
                 if state.tp_order_id and not tp_filled:
                     cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
-                if state.sl_algo_id or state.sl_client_algo_id:
-                    cancel_algo_order(client, active_symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
+                if state.sl_order_id:
+                    cancel_limit_order(client, active_symbol, order_id=state.sl_order_id)
 
                 state.tp_order_id = None
-                state.sl_algo_id = None
+                state.sl_order_id = None
                 state.tp_client_order_id = None
-                state.sl_client_algo_id = None
+                state.sl_client_order_id = None
                 state.tp_price = None
                 state.sl_price = None
                 state.active_atr = None
@@ -1644,16 +1649,16 @@ def run_live(cfg: LiveConfig) -> None:
                 time.sleep(cfg.poll_interval_seconds)
                 continue
 
-            if active_symbol and not in_position and state.entry_price is None and (state.tp_order_id or state.sl_algo_id):
+            if active_symbol and not in_position and state.entry_price is None and (state.tp_order_id or state.sl_order_id):
                 if state.tp_order_id:
                     cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
-                if state.sl_algo_id or state.sl_client_algo_id:
-                    cancel_algo_order(client, active_symbol, algo_id=state.sl_algo_id, client_algo_id=state.sl_client_algo_id)
+                if state.sl_order_id:
+                    cancel_limit_order(client, active_symbol, order_id=state.sl_order_id)
                 log_event(cfg.log_path, {"event": "position_closed", "symbol": active_symbol})
                 state.tp_order_id = None
-                state.sl_algo_id = None
+                state.sl_order_id = None
                 state.tp_client_order_id = None
-                state.sl_client_algo_id = None
+                state.sl_client_order_id = None
                 state.tp_price = None
                 state.sl_price = None
                 state.active_atr = None
@@ -1769,19 +1774,18 @@ def run_live(cfg: LiveConfig) -> None:
                     if limit_order_inactive(tp_order):
                         state.tp_order_id = None
                         state.tp_client_order_id = None
-                if state.sl_algo_id or state.sl_client_algo_id:
-                    sl_order = query_algo_order(
+                if state.sl_order_id:
+                    sl_order = query_limit_order(
                         client,
                         active_symbol,
-                        algo_id=state.sl_algo_id,
-                        client_algo_id=state.sl_client_algo_id,
+                        order_id=state.sl_order_id,
                     )
-                    if algo_order_inactive(sl_order):
-                        state.sl_algo_id = None
-                        state.sl_client_algo_id = None
+                    if limit_order_inactive(sl_order):
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and active_symbol and state.panic_exit_order_id is None and (state.tp_order_id is None or state.sl_algo_id is None):
+            if in_position and active_symbol and state.panic_exit_order_id is None and (state.tp_order_id is None or state.sl_order_id is None):
                 filters = filters_by_symbol[active_symbol]
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
@@ -1828,24 +1832,23 @@ def run_live(cfg: LiveConfig) -> None:
                     state.tp_order_id = tp_order.get("orderId") if tp_order else None
                     state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
                     state.tp_price = tp_price
-                if state.sl_algo_id is None:
+                if state.sl_order_id is None:
                     sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
-                    sl_order = algo_order(
-                        active_symbol,
-                        sl_side,
-                        "STOP",
-                        qty_str,
-                        sl_price_str,
-                        client,
+                    sl_order = stop_limit_order(
+                        symbol=active_symbol,
+                        side=sl_side,
+                        quantity=qty_str,
+                        stop_price=sl_price_str,
                         price=sl_price_str,
+                        client=client,
                         time_in_force="GTC",
                         reduce_only=True,
-                        client_algo_id=sl_client_id,
+                        client_order_id=sl_client_id,
                         working_type=cfg.algo_working_type,
                         price_protect=cfg.algo_price_protect,
                     )
-                    state.sl_algo_id = sl_order.get("algoId") if sl_order else None
-                    state.sl_client_algo_id = (sl_order.get("clientAlgoId") if sl_order else None) or (sl_client_id if sl_order else None)
+                    state.sl_order_id = sl_order.get("orderId") if sl_order else None
+                    state.sl_client_order_id = (sl_order.get("clientOrderId") if sl_order else None) or (sl_client_id if sl_order else None)
                     state.sl_price = sl_price
 
             active_symbol = state.active_symbol
