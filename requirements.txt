@@ -2,4 +2,3 @@ ccxt
 pandas
 numpy
 python-dotenv
-binance-futures-connector

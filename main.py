@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -29,10 +31,13 @@ import os
 from os import getenv
 import random
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -50,15 +55,6 @@ try:
     import ccxt
 except Exception:
     ccxt = None
-
-# Optional: binance-futures-connector for live trading
-# pip install binance-futures-connector
-try:
-    from binance.um_futures import UMFutures
-    from binance.error import ClientError
-except Exception:
-    UMFutures = None
-    ClientError = Exception
 
 
 # -----------------------------
@@ -583,9 +579,148 @@ def reprice_post_only(price: float, side: str, bid: float, ask: float, tick_size
     return price
 
 
-def get_um_futures_client(cfg: LiveConfig) -> UMFutures:
-    if UMFutures is None:
-        raise RuntimeError("binance-futures-connector not installed.")
+class ClientError(Exception):
+    def __init__(
+        self,
+        status_code: Optional[int],
+        error_code: Optional[int],
+        error_message: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.status_code = status_code
+        self.error_code = error_code
+        self.error_message = error_message
+        self.headers = headers or {}
+        super().__init__(
+            f"Binance API error. status: {status_code}, code: {error_code}, message: {error_message}"
+        )
+
+
+class BinanceUMFuturesREST:
+    def __init__(
+        self,
+        key: str,
+        secret: str,
+        base_url: str = "https://fapi.binance.com",
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.key = key
+        self.secret = secret
+        self.base_url = str(base_url).rstrip("/")
+        self.timeout_seconds = float(timeout_seconds)
+
+    @staticmethod
+    def _clean_params(params: Dict[str, object]) -> Dict[str, object]:
+        return {k: v for k, v in (params or {}).items() if v is not None}
+
+    @staticmethod
+    def _encode_params(params: Dict[str, object], special: bool = False) -> str:
+        encoded = urllib.parse.urlencode(params, doseq=True)
+        if special:
+            encoded = encoded.replace("%40", "@").replace("%27", "%22")
+        else:
+            encoded = encoded.replace("%40", "@")
+        return encoded
+
+    def _sign(self, payload: str) -> str:
+        return hmac.new(
+            str(self.secret).encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _request(
+        self,
+        http_method: str,
+        url_path: str,
+        payload: Optional[Dict[str, object]] = None,
+        *,
+        signed: bool = False,
+        special: bool = False,
+    ) -> Any:
+        params = self._clean_params(payload or {})
+        query_string = self._encode_params(params, special=special) if params else ""
+        if signed:
+            params = dict(params)
+            params["timestamp"] = int(time.time() * 1000)
+            unsigned = self._encode_params(params, special=special)
+            signature = self._sign(unsigned)
+            query_string = f"{unsigned}&signature={signature}"
+
+        url = f"{self.base_url}{url_path}"
+        if query_string:
+            url = f"{url}?{query_string}"
+
+        request = urllib.request.Request(url, method=str(http_method).upper())
+        if self.key:
+            request.add_header("X-MBX-APIKEY", self.key)
+        request.add_header("Content-Type", "application/json;charset=utf-8")
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            try:
+                raw = error.read().decode("utf-8")
+            except Exception:
+                raw = str(error)
+            error_code = None
+            error_message = raw
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    error_code = parsed.get("code")
+                    error_message = parsed.get("msg") or error_message
+            except Exception:
+                pass
+            raise ClientError(
+                status_code=getattr(error, "code", None),
+                error_code=error_code,
+                error_message=str(error_message),
+                headers=dict(getattr(error, "headers", {}) or {}),
+            ) from None
+        except urllib.error.URLError as error:
+            raise ClientError(None, None, str(error)) from None
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+
+    def exchange_info(self, **kwargs: object) -> Any:
+        _ = kwargs
+        return self._request("GET", "/fapi/v1/exchangeInfo")
+
+    def klines(self, **kwargs: object) -> Any:
+        return self._request("GET", "/fapi/v1/klines", payload=dict(kwargs))
+
+    def book_ticker(self, **kwargs: object) -> Any:
+        return self._request("GET", "/fapi/v1/ticker/bookTicker", payload=dict(kwargs))
+
+    def get_position_risk(self, **kwargs: object) -> Any:
+        return self._request("GET", "/fapi/v3/positionRisk", payload=dict(kwargs), signed=True)
+
+    def change_leverage(self, **kwargs: object) -> Any:
+        return self._request("POST", "/fapi/v1/leverage", payload=dict(kwargs), signed=True)
+
+    def new_order(self, **kwargs: object) -> Any:
+        return self._request("POST", "/fapi/v1/order", payload=dict(kwargs), signed=True)
+
+    def query_order(self, **kwargs: object) -> Any:
+        return self._request("GET", "/fapi/v1/order", payload=dict(kwargs), signed=True)
+
+    def cancel_order(self, **kwargs: object) -> Any:
+        return self._request("DELETE", "/fapi/v1/order", payload=dict(kwargs), signed=True)
+
+    def get_orders(self, **kwargs: object) -> Any:
+        # GET /fapi/v1/openOrders (no orderId required)
+        return self._request("GET", "/fapi/v1/openOrders", payload=dict(kwargs), signed=True)
+
+    def cancel_open_orders(self, **kwargs: object) -> Any:
+        return self._request("DELETE", "/fapi/v1/allOpenOrders", payload=dict(kwargs), signed=True)
+
+
+def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
     if load_dotenv is not None:
         load_dotenv()
     api_key = getenv("BINANCE_API_KEY")
@@ -595,10 +730,10 @@ def get_um_futures_client(cfg: LiveConfig) -> UMFutures:
     base_url = "https://fapi.binance.com"
     if cfg.use_testnet:
         base_url = "https://testnet.binancefuture.com"
-    return UMFutures(key=api_key, secret=api_secret, base_url=base_url)
+    return BinanceUMFuturesREST(key=api_key, secret=api_secret, base_url=base_url)
 
 
-def get_symbol_filters(client: UMFutures, symbol: str) -> Dict[str, float]:
+def get_symbol_filters(client: BinanceUMFuturesREST, symbol: str) -> Dict[str, float]:
     info = client.exchange_info()
     for s in info.get("symbols", []):
         if s.get("symbol") == symbol:
@@ -621,12 +756,12 @@ def get_symbol_filters(client: UMFutures, symbol: str) -> Dict[str, float]:
     raise RuntimeError(f"Symbol not found: {symbol}")
 
 
-def get_book_ticker(client: UMFutures, symbol: str) -> Tuple[float, float]:
+def get_book_ticker(client: BinanceUMFuturesREST, symbol: str) -> Tuple[float, float]:
     book = client.book_ticker(symbol=symbol)
     return float(book["bidPrice"]), float(book["askPrice"])
 
 
-def get_position_info(client: UMFutures, symbol: str) -> Dict[str, str]:
+def get_position_info(client: BinanceUMFuturesREST, symbol: str) -> Dict[str, str]:
     info = client.get_position_risk(symbol=symbol)
     if isinstance(info, list):
         for pos in info:
@@ -641,7 +776,7 @@ def limit_order(
     side: str,
     quantity: str,
     price: str,
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     client_order_id: Optional[str] = None,
     tick_size: Optional[float] = None,
     post_only_max_reprices: int = 3,
@@ -767,7 +902,7 @@ def limit_order(
 
 
 def query_limit_order(
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     symbol: str,
     order_id: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
@@ -786,7 +921,7 @@ def query_limit_order(
 
 
 def cancel_limit_order(
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     symbol: str,
     order_id: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
@@ -808,14 +943,16 @@ def cancel_limit_order(
 
 
 def is_order_open(
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     symbol: str,
     order_id: Optional[int],
 ) -> Optional[bool]:
     if order_id is None:
         return None
+    if not symbol:
+        return None
     try:
-        open_orders = client.get_open_orders(symbol=symbol)
+        open_orders = client.get_orders(symbol=symbol)
     except ClientError as error:
         logging.error(
             "Open orders query error. status: %s, code: %s, message: %s",
@@ -834,7 +971,7 @@ def is_order_open(
 
 
 def cancel_order_safely(
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     symbol: str,
     order_id: Optional[int],
 ) -> bool:
@@ -853,12 +990,14 @@ def cancel_order_safely(
 
 
 def cancel_open_strategy_orders(
-    client: UMFutures,
+    client: BinanceUMFuturesREST,
     symbol: str,
     client_id_prefixes: Tuple[str, ...] = ("ATR_",),
 ) -> None:
+    if not symbol:
+        return
     try:
-        open_orders = client.get_open_orders(symbol=symbol)
+        open_orders = client.get_orders(symbol=symbol)
     except ClientError as error:
         logging.error(
             "Open orders query error. status: %s, code: %s, message: %s",
