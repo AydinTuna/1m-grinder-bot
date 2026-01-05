@@ -645,6 +645,7 @@ def limit_order(
     client_order_id: Optional[str] = None,
     tick_size: Optional[float] = None,
     post_only_max_reprices: int = 3,
+    reduce_only: bool = False,
 ) -> Optional[Dict[str, object]]:
     """
     Places a post-only limit order on Binance Futures.
@@ -659,6 +660,8 @@ def limit_order(
     }
     if client_order_id:
         params["newClientOrderId"] = client_order_id
+    if reduce_only:
+        params["reduceOnly"] = True
 
     post_only_reprices = 0
 
@@ -792,6 +795,9 @@ def cancel_limit_order(
     try:
         return client.cancel_order(symbol=symbol, orderId=order_id)
     except ClientError as error:
+        error_code = getattr(error, "error_code", None)
+        if error_code in {-2011, -2013}:
+            return {"status": "UNKNOWN"}
         logging.error(
             "Order cancel error. status: %s, code: %s, message: %s",
             getattr(error, "status_code", None),
@@ -799,6 +805,77 @@ def cancel_limit_order(
             getattr(error, "error_message", None),
         )
         return None
+
+
+def is_order_open(
+    client: UMFutures,
+    symbol: str,
+    order_id: Optional[int],
+) -> Optional[bool]:
+    if order_id is None:
+        return None
+    try:
+        open_orders = client.get_open_orders(symbol=symbol)
+    except ClientError as error:
+        logging.error(
+            "Open orders query error. status: %s, code: %s, message: %s",
+            getattr(error, "status_code", None),
+            getattr(error, "error_code", None),
+            getattr(error, "error_message", None),
+        )
+        return None
+    for order in open_orders or []:
+        try:
+            if int(order.get("orderId")) == int(order_id):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def cancel_order_safely(
+    client: UMFutures,
+    symbol: str,
+    order_id: Optional[int],
+) -> bool:
+    if order_id is None:
+        return True
+    cancel_resp = cancel_limit_order(client, symbol, order_id=order_id)
+    if cancel_resp is not None:
+        return True
+    order = query_limit_order(client, symbol, order_id=order_id)
+    if limit_order_filled(order) or limit_order_inactive(order):
+        return True
+    open_flag = is_order_open(client, symbol, order_id=order_id)
+    if open_flag is False:
+        return True
+    return False
+
+
+def cancel_open_strategy_orders(
+    client: UMFutures,
+    symbol: str,
+    client_id_prefixes: Tuple[str, ...] = ("ATR_",),
+) -> None:
+    try:
+        open_orders = client.get_open_orders(symbol=symbol)
+    except ClientError as error:
+        logging.error(
+            "Open orders query error. status: %s, code: %s, message: %s",
+            getattr(error, "status_code", None),
+            getattr(error, "error_code", None),
+            getattr(error, "error_message", None),
+        )
+        return
+    for order in open_orders or []:
+        client_id = str(order.get("clientOrderId") or "")
+        if client_id_prefixes and not any(client_id.startswith(p) for p in client_id_prefixes):
+            continue
+        try:
+            order_id = int(order.get("orderId"))
+        except (TypeError, ValueError):
+            continue
+        cancel_limit_order(client, symbol, order_id=order_id)
 
 
 def limit_order_filled(order: Optional[Dict[str, object]]) -> bool:
@@ -1286,6 +1363,7 @@ def run_live(cfg: LiveConfig) -> None:
                         client=client,
                         client_order_id=tp_client_id,
                         tick_size=filters["tick_size"],
+                        reduce_only=True,
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
@@ -1422,6 +1500,7 @@ def run_live(cfg: LiveConfig) -> None:
                     "sl_order_id": state.sl_order_id,
                 })
 
+                cancel_open_strategy_orders(client, active_symbol)
                 append_live_trade(cfg.live_trades_csv, {
                     "entry_time": state.entry_time_iso,
                     "exit_time": _utc_now_iso(),
@@ -1443,9 +1522,9 @@ def run_live(cfg: LiveConfig) -> None:
                 })
 
                 if state.tp_order_id and not tp_filled:
-                    cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
+                    cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
                 if state.sl_order_id:
-                    cancel_limit_order(client, active_symbol, order_id=state.sl_order_id)
+                    cancel_order_safely(client, active_symbol, order_id=state.sl_order_id)
 
                 state.tp_order_id = None
                 state.sl_order_id = None
@@ -1473,10 +1552,7 @@ def run_live(cfg: LiveConfig) -> None:
                 continue
 
             if active_symbol and not in_position and state.entry_price is None and (state.tp_order_id or state.sl_order_id):
-                if state.tp_order_id:
-                    cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
-                if state.sl_order_id:
-                    cancel_limit_order(client, active_symbol, order_id=state.sl_order_id)
+                cancel_open_strategy_orders(client, active_symbol)
                 log_event(cfg.log_path, {"event": "position_closed", "symbol": active_symbol})
                 state.tp_order_id = None
                 state.sl_order_id = None
@@ -1540,16 +1616,16 @@ def run_live(cfg: LiveConfig) -> None:
                 if state.sl_triggered:
                     # Ensure TP is canceled so we don't have two opposing LIMITs without reduceOnly.
                     if state.tp_order_id:
-                        cancel_limit_order(client, active_symbol, order_id=state.tp_order_id)
+                        cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
 
                     if state.sl_order_id is not None and state.sl_order_time is not None:
                         status = str((sl_order or {}).get("status") or "").upper()
                         if status != "FILLED" and (time.time() - state.sl_order_time) >= 3.0:
-                            cancel_limit_order(client, active_symbol, order_id=state.sl_order_id)
-                            state.sl_order_id = None
-                            state.sl_client_order_id = None
-                            state.sl_order_time = None
-                            sl_order = None
+                            if cancel_order_safely(client, active_symbol, order_id=state.sl_order_id):
+                                state.sl_order_id = None
+                                state.sl_client_order_id = None
+                                state.sl_order_time = None
+                                sl_order = None
 
                     if state.sl_order_id is None:
                         close_side = "SELL" if position_amt > 0 else "BUY"
@@ -1571,6 +1647,7 @@ def run_live(cfg: LiveConfig) -> None:
                                 client=client,
                                 client_order_id=sl_client_id,
                                 tick_size=tick_size,
+                                reduce_only=True,
                             )
                             state.sl_order_id = new_sl_order.get("orderId") if new_sl_order else None
                             state.sl_client_order_id = (
@@ -1629,6 +1706,7 @@ def run_live(cfg: LiveConfig) -> None:
                         client=client,
                         client_order_id=tp_client_id,
                         tick_size=filters["tick_size"],
+                        reduce_only=True,
                     )
                     if tp_order is None:
                         log_event(cfg.log_path, {
