@@ -72,7 +72,7 @@ class LiveConfig:
 
     # Risk/exit controls
     tp_atr_mult: float = 2.5
-    sl_atr_mult: float = 1.0
+    sl_atr_mult: float = 0.9
 
     # Algo order controls
     algo_working_type: str = "CONTRACT_PRICE"

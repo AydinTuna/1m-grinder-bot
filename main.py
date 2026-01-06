@@ -603,11 +603,19 @@ class BinanceUMFuturesREST:
         secret: str,
         base_url: str = "https://fapi.binance.com",
         timeout_seconds: float = 10.0,
+        *,
+        recv_window_ms: int = 60_000,
+        time_sync_interval_seconds: float = 30.0 * 60.0,
     ) -> None:
         self.key = key
         self.secret = secret
         self.base_url = str(base_url).rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
+        self.recv_window_ms = int(recv_window_ms)
+        self.time_sync_interval_seconds = float(time_sync_interval_seconds)
+        self.time_offset_ms = 0
+        self._last_time_sync_monotonic: Optional[float] = None
+        self._last_time_sync_attempt_monotonic: Optional[float] = None
 
     @staticmethod
     def _clean_params(params: Dict[str, object]) -> Dict[str, object]:
@@ -629,6 +637,49 @@ class BinanceUMFuturesREST:
             hashlib.sha256,
         ).hexdigest()
 
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _signed_timestamp_ms(self) -> int:
+        return self._now_ms() + int(self.time_offset_ms)
+
+    def get_server_time(self) -> Any:
+        return self._request("GET", "/fapi/v1/time")
+
+    def sync_time(self) -> None:
+        """
+        Fetch Binance server time and compute a local offset used for signed requests.
+        """
+        start_ms = self._now_ms()
+        server = self.get_server_time()
+        end_ms = self._now_ms()
+        try:
+            server_ms = int(server["serverTime"])
+        except Exception as exc:
+            raise RuntimeError(f"Unexpected server time response: {server!r}") from exc
+        local_mid_ms = (start_ms + end_ms) // 2
+        self.time_offset_ms = server_ms - local_mid_ms
+        self._last_time_sync_monotonic = time.monotonic()
+
+    def _maybe_sync_time(self) -> None:
+        if self.time_sync_interval_seconds <= 0:
+            return
+        now = time.monotonic()
+        if self._last_time_sync_monotonic is None:
+            # Avoid spamming retries if the network is down.
+            if (
+                self._last_time_sync_attempt_monotonic is not None
+                and now - self._last_time_sync_attempt_monotonic < 5.0
+            ):
+                return
+            self._last_time_sync_attempt_monotonic = now
+            self.sync_time()
+            return
+        if now - self._last_time_sync_monotonic >= self.time_sync_interval_seconds:
+            self._last_time_sync_attempt_monotonic = now
+            self.sync_time()
+
     def _request(
         self,
         http_method: str,
@@ -638,54 +689,86 @@ class BinanceUMFuturesREST:
         signed: bool = False,
         special: bool = False,
     ) -> Any:
-        params = self._clean_params(payload or {})
-        query_string = self._encode_params(params, special=special) if params else ""
-        if signed:
-            params = dict(params)
-            params["timestamp"] = int(time.time() * 1000)
-            unsigned = self._encode_params(params, special=special)
-            signature = self._sign(unsigned)
-            query_string = f"{unsigned}&signature={signature}"
+        def do_call(url: str) -> str:
+            request = urllib.request.Request(url, method=str(http_method).upper())
+            if self.key:
+                request.add_header("X-MBX-APIKEY", self.key)
+            request.add_header("Content-Type", "application/json;charset=utf-8")
 
-        url = f"{self.base_url}{url_path}"
-        if query_string:
-            url = f"{url}?{query_string}"
-
-        request = urllib.request.Request(url, method=str(http_method).upper())
-        if self.key:
-            request.add_header("X-MBX-APIKEY", self.key)
-        request.add_header("Content-Type", "application/json;charset=utf-8")
-
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as error:
             try:
-                raw = error.read().decode("utf-8")
-            except Exception:
-                raw = str(error)
-            error_code = None
-            error_message = raw
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    error_code = parsed.get("code")
-                    error_message = parsed.get("msg") or error_message
-            except Exception:
-                pass
-            raise ClientError(
-                status_code=getattr(error, "code", None),
-                error_code=error_code,
-                error_message=str(error_message),
-                headers=dict(getattr(error, "headers", {}) or {}),
-            ) from None
-        except urllib.error.URLError as error:
-            raise ClientError(None, None, str(error)) from None
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as error:
+                try:
+                    raw_error = error.read().decode("utf-8")
+                except Exception:
+                    raw_error = str(error)
+                error_code = None
+                error_message = raw_error
+                try:
+                    parsed = json.loads(raw_error)
+                    if isinstance(parsed, dict):
+                        error_code = parsed.get("code")
+                        error_message = parsed.get("msg") or error_message
+                except Exception:
+                    pass
+                raise ClientError(
+                    status_code=getattr(error, "code", None),
+                    error_code=error_code,
+                    error_message=str(error_message),
+                    headers=dict(getattr(error, "headers", {}) or {}),
+                ) from None
+            except urllib.error.URLError as error:
+                raise ClientError(None, None, str(error)) from None
 
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return raw
+        max_attempts = 2 if signed else 1
+        last_error: Optional[ClientError] = None
+
+        for attempt in range(1, max_attempts + 1):
+            params = self._clean_params(payload or {})
+            query_string = self._encode_params(params, special=special) if params else ""
+            if signed:
+                try:
+                    self._maybe_sync_time()
+                except Exception:
+                    # Continue without a time offset; we'll retry on -1021 if needed.
+                    pass
+
+                params = dict(params)
+                if "recvWindow" not in params and self.recv_window_ms > 0:
+                    params["recvWindow"] = max(1, min(int(self.recv_window_ms), 60_000))
+                params["timestamp"] = self._signed_timestamp_ms()
+                unsigned = self._encode_params(params, special=special)
+                signature = self._sign(unsigned)
+                query_string = f"{unsigned}&signature={signature}"
+
+            url = f"{self.base_url}{url_path}"
+            if query_string:
+                url = f"{url}?{query_string}"
+
+            try:
+                raw = do_call(url)
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    return raw
+            except ClientError as error:
+                last_error = error
+                if (
+                    signed
+                    and attempt < max_attempts
+                    and getattr(error, "error_code", None) == -1021
+                ):
+                    try:
+                        self.sync_time()
+                    except Exception:
+                        pass
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Unexpected request failure without an error.")
 
     def exchange_info(self, **kwargs: object) -> Any:
         _ = kwargs
@@ -730,7 +813,35 @@ def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
     base_url = "https://fapi.binance.com"
     if cfg.use_testnet:
         base_url = "https://testnet.binancefuture.com"
-    return BinanceUMFuturesREST(key=api_key, secret=api_secret, base_url=base_url)
+    recv_window_ms = getenv("BINANCE_RECV_WINDOW_MS")
+    time_sync_interval_seconds = getenv("BINANCE_TIME_SYNC_INTERVAL_SECONDS")
+    recv_window_value = 60_000
+    if recv_window_ms:
+        try:
+            recv_window_value = int(recv_window_ms)
+        except ValueError:
+            logging.warning("Invalid BINANCE_RECV_WINDOW_MS=%r; using default.", recv_window_ms)
+    time_sync_interval_value = 30.0 * 60.0
+    if time_sync_interval_seconds:
+        try:
+            time_sync_interval_value = float(time_sync_interval_seconds)
+        except ValueError:
+            logging.warning(
+                "Invalid BINANCE_TIME_SYNC_INTERVAL_SECONDS=%r; using default.",
+                time_sync_interval_seconds,
+            )
+    client = BinanceUMFuturesREST(
+        key=api_key,
+        secret=api_secret,
+        base_url=base_url,
+        recv_window_ms=recv_window_value,
+        time_sync_interval_seconds=time_sync_interval_value,
+    )
+    try:
+        client.sync_time()
+    except Exception as exc:
+        logging.warning("Binance time sync failed; signed requests may fail (-1021). error=%s", exc)
+    return client
 
 
 def get_symbol_filters(client: BinanceUMFuturesREST, symbol: str) -> Dict[str, float]:
