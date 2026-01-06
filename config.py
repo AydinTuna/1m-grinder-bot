@@ -71,7 +71,7 @@ class LiveConfig:
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 2.5
+    tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
 
     # Algo order controls
