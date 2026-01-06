@@ -75,6 +75,7 @@ class LiveConfig:
     sl_atr_mult: float = 1.0
 
     # Algo order controls
+    algo_type: str = "CONDITIONAL"
     algo_working_type: str = "CONTRACT_PRICE"
     algo_price_protect: bool = False
 
