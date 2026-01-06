@@ -24,12 +24,15 @@ import argparse
 import csv
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import math
 import os
 from os import getenv
 import random
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -720,8 +723,32 @@ class BinanceUMFuturesREST:
                 ) from None
             except urllib.error.URLError as error:
                 raise ClientError(None, None, str(error)) from None
+            except http.client.IncompleteRead as error:
+                partial_len = 0
+                try:
+                    partial_len = len(error.partial or b"")
+                except Exception:
+                    partial_len = 0
+                expected = getattr(error, "expected", None)
+                raise ClientError(
+                    None,
+                    None,
+                    f"Incomplete response read (partial={partial_len} expected={expected})",
+                ) from None
+            except (socket.timeout, TimeoutError) as error:
+                raise ClientError(None, None, f"Request timeout: {error}") from None
+            except ssl.SSLError as error:
+                raise ClientError(None, None, f"SSL read error: {error}") from None
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as error:
+                raise ClientError(None, None, f"Connection dropped: {error}") from None
+            except OSError as error:
+                raise ClientError(None, None, f"Network error: {type(error).__name__}: {error}") from None
 
+        http_method_upper = str(http_method).upper()
+        retryable_method = http_method_upper in {"GET", "HEAD"}
         max_attempts = 2 if signed else 1
+        if retryable_method:
+            max_attempts = max(max_attempts, 3)
         last_error: Optional[ClientError] = None
 
         for attempt in range(1, max_attempts + 1):
@@ -764,6 +791,28 @@ class BinanceUMFuturesREST:
                     except Exception:
                         pass
                     continue
+                if retryable_method and attempt < max_attempts:
+                    status_code = getattr(error, "status_code", None)
+                    error_code = getattr(error, "error_code", None)
+                    retryable_status = status_code is None or status_code in {418, 429, 500, 502, 503, 504}
+                    retryable_code = error_code in {-1001, -1003, -1015}
+                    if retryable_status or retryable_code:
+                        base_backoff = 0.25
+                        sleep_seconds = min(2.0, base_backoff * (2 ** (attempt - 1)))
+                        retry_after = None
+                        if status_code in {418, 429}:
+                            retry_after_value = (error.headers or {}).get("Retry-After") or (error.headers or {}).get(
+                                "retry-after"
+                            )
+                            if retry_after_value is not None:
+                                try:
+                                    retry_after = float(retry_after_value)
+                                except (TypeError, ValueError):
+                                    retry_after = None
+                        if retry_after is not None:
+                            sleep_seconds = max(sleep_seconds, min(60.0, retry_after))
+                        time.sleep(sleep_seconds + random.uniform(0.0, 0.15))
+                        continue
                 raise
 
         if last_error is not None:
@@ -1332,7 +1381,21 @@ def run_live(cfg: LiveConfig) -> None:
         history = max(cfg.atr_history_bars, cfg.atr_len + 2)
         if history > 1000:
             history = 1000
-        klines = client.klines(symbol=symbol, interval=cfg.interval, limit=history)
+        try:
+            klines = client.klines(symbol=symbol, interval=cfg.interval, limit=history)
+        except ClientError as exc:
+            log_event(
+                cfg.log_path,
+                {
+                    "event": "klines_error",
+                    "symbol": symbol,
+                    "status_code": getattr(exc, "status_code", None),
+                    "error_code": getattr(exc, "error_code", None),
+                    "message": str(getattr(exc, "error_message", str(exc))),
+                },
+            )
+            logging.warning("Klines fetch failed. symbol=%s error=%s", symbol, exc)
+            return False
         if len(klines) < 2:
             return False
         closed_klines = klines[:-1]
@@ -1369,7 +1432,21 @@ def run_live(cfg: LiveConfig) -> None:
             delay = random.uniform(cfg.entry_delay_min_seconds, cfg.entry_delay_max_seconds)
         time.sleep(delay)
 
-        bid, ask = get_book_ticker(client, symbol)
+        try:
+            bid, ask = get_book_ticker(client, symbol)
+        except ClientError as exc:
+            log_event(
+                cfg.log_path,
+                {
+                    "event": "book_ticker_error",
+                    "symbol": symbol,
+                    "status_code": getattr(exc, "status_code", None),
+                    "error_code": getattr(exc, "error_code", None),
+                    "message": str(getattr(exc, "error_message", str(exc))),
+                },
+            )
+            logging.warning("Book ticker fetch failed. symbol=%s error=%s", symbol, exc)
+            return False
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid if mid else 1.0
         if spread_pct > cfg.spread_max_pct:
@@ -1977,6 +2054,33 @@ def run_live(cfg: LiveConfig) -> None:
                     if process_symbol_candle(symbol, allow_entry=True):
                         active_symbol = symbol
                         break
+        except ClientError as exc:
+            status_code = getattr(exc, "status_code", None)
+            error_code = getattr(exc, "error_code", None)
+            error_message = getattr(exc, "error_message", str(exc))
+            if status_code is None or status_code in {418, 429} or (isinstance(status_code, int) and status_code >= 500):
+                logging.warning(
+                    "Live loop Binance transient error. status=%s code=%s message=%s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+            else:
+                logging.error(
+                    "Live loop Binance client error. status=%s code=%s message=%s",
+                    status_code,
+                    error_code,
+                    error_message,
+                )
+            log_event(
+                cfg.log_path,
+                {
+                    "event": "client_error",
+                    "status_code": status_code,
+                    "error_code": error_code,
+                    "message": str(error_message),
+                },
+            )
         except Exception as exc:
             logging.exception("Live loop error")
             log_event(cfg.log_path, {"event": "error", "message": str(exc)})
