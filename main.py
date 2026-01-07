@@ -1,16 +1,19 @@
 """
-ATR-based 1-minute grinder (body trigger, ATR-based TP/SL)
+ATR-based 1-minute strategy (swing context + large body trigger, ATR-based TP/SL)
 
 Rules:
 - Compute ATR (EMA) on 1m candles.
-- If candle body >= thr1*ATR: enter opposite direction at next candle open.
-- If candle body >= thr2*ATR: enter opposite direction at next candle open.
+- Compute swing highs/lows (default: 15m resample, fractal/pivot left/right).
+- If candle body >= thr2*ATR and price is near a swing high/low:
+  - Swing high: red => SHORT; green close below => SHORT; green close above => LONG (limit at mid-body)
+  - Swing low: green => LONG; red close above => LONG; red close below => SHORT (limit at mid-body)
+- If candle body >= thr2*ATR and price is not near swing levels: enter in the same direction as the candle.
 - Take profit when price moves tp_atr_mult * ATR from entry.
 - Stop loss when price moves sl_atr_mult * ATR from entry.
 
 Implementation details:
 - Body = abs(close - open)
-- Entry at next candle open (prevents lookahead bias)
+- Market entries are at next candle open; mid-body signals use a limit order (midpoint of signal candle body).
 - TP/SL are evaluated within each candle using high/low.
 - TP/SL ATR uses the signal candle's ATR.
 - Fees and slippage are modeled.
@@ -46,6 +49,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig, LiveConfig, LIVE_TRADE_FIELDS
+from swing_levels import build_swing_atr_signals, compute_confirmed_swing_levels
 
 try:
     from dotenv import load_dotenv
@@ -233,9 +237,24 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
 
     df["atr"] = atr_ema(df, cfg.atr_len)
 
-    df["signal"], df["signal_atr"] = build_signals_body_opposite(
-        df, df["atr"],
-        thr1=cfg.thr1, thr2=cfg.thr2, tolerance_pct=cfg.signal_atr_tolerance_pct,
+    swing_high, swing_low = compute_confirmed_swing_levels(
+        df,
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    df["swing_high_level"] = swing_high
+    df["swing_low_level"] = swing_low
+
+    df["signal"], df["signal_atr"], df["signal_entry_price"] = build_swing_atr_signals(
+        df,
+        df["atr"],
+        df["swing_high_level"],
+        df["swing_low_level"],
+        body_atr_mult=cfg.thr2,
+        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        tolerance_pct=cfg.signal_atr_tolerance_pct,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -243,6 +262,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         warmup_idx = df.index[:warmup_bars]
         df.loc[warmup_idx, "signal"] = 0
         df.loc[warmup_idx, "signal_atr"] = np.nan
+        df.loc[warmup_idx, "signal_entry_price"] = np.nan
 
     # Equity curve (USD)
     equity = cfg.initial_capital
@@ -260,6 +280,10 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     entry_time = None
     entry_index = None
     used_signal_atr = None
+    pending_side = 0  # +1 long limit, -1 short limit, 0 none
+    pending_limit_price = None
+    pending_signal_atr = None
+    pending_created_index = None
 
     trades: List[Dict] = []
 
@@ -293,6 +317,21 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         gross_roi = underlying_ret * leverage
         fee_cost = 2.0 * cfg.fee_rate * leverage
         return gross_roi - fee_cost
+
+    def maybe_fill_limit(side: int, limit_price: float, o_: float, h_: float, l_: float) -> Optional[float]:
+        if side == 1:
+            if o_ <= limit_price:
+                return o_
+            if l_ <= limit_price <= h_:
+                return limit_price
+        elif side == -1:
+            if o_ >= limit_price:
+                return o_
+            if l_ <= limit_price <= h_:
+                return limit_price
+        return None
+
+    limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
 
     for i in range(1, len(df)):
         t = idx[i]
@@ -362,44 +401,150 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 active_leverage = cfg.leverage
                 active_notional = active_margin * active_leverage
 
-        # --- ENTRY logic (signal on prev candle, enter at this open) ---
+        # --- ENTRY logic (signal on prev candle; optional mid-body limit) ---
         if position == 0:
-            prev_signal = int(df.at[prev_t, "signal"])
-            prev_signal_atr = df.at[prev_t, "signal_atr"]
+            # Cancel expired pending limit order before attempting fills.
+            if pending_side != 0 and pending_created_index is not None:
+                if (i - pending_created_index) >= limit_timeout_bars:
+                    pending_side = 0
+                    pending_limit_price = None
+                    pending_signal_atr = None
+                    pending_created_index = None
 
-            if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
-                side = prev_signal
-                signal_atr_value = float(prev_signal_atr)
+            # Try to fill an existing pending limit order first.
+            if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
+                fill_raw = maybe_fill_limit(int(pending_side), float(pending_limit_price), o, h, l)
+                if fill_raw is not None:
+                    side = int(pending_side)
+                    signal_atr_value = float(pending_signal_atr)
+                    entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
 
-                entry_price = apply_slippage(o, side, is_entry=True)
+                    trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                        entry_price=entry_price,
+                        atr_value=signal_atr_value,
+                        sl_atr_mult=cfg.sl_atr_mult,
+                        margin_cap=cfg.initial_capital,
+                        max_leverage=cfg.leverage,
+                        min_leverage=cfg.min_leverage,
+                        target_loss_usd=cfg.target_loss_usd,
+                    )
+                    if trade_margin is None or trade_leverage is None:
+                        pending_side = 0
+                        pending_limit_price = None
+                        pending_signal_atr = None
+                        pending_created_index = None
+                    else:
+                        target_price, stop_price = compute_tp_sl_prices(
+                            entry_price,
+                            side,
+                            signal_atr_value,
+                            cfg.tp_atr_mult,
+                            cfg.sl_atr_mult,
+                        )
 
-                trade_margin, trade_leverage, _ = resolve_trade_sizing(
-                    entry_price=entry_price,
-                    atr_value=signal_atr_value,
-                    sl_atr_mult=cfg.sl_atr_mult,
-                    margin_cap=cfg.initial_capital,
-                    max_leverage=cfg.leverage,
-                    min_leverage=cfg.min_leverage,
-                    target_loss_usd=cfg.target_loss_usd,
-                )
-                if trade_margin is None or trade_leverage is None:
-                    continue
+                        position = side
+                        entry_time = t
+                        entry_index = i
+                        used_signal_atr = signal_atr_value
+                        active_margin = trade_margin
+                        active_leverage = trade_leverage
+                        active_notional = active_margin * active_leverage
 
-                target_price, stop_price = compute_tp_sl_prices(
-                    entry_price,
-                    side,
-                    signal_atr_value,
-                    cfg.tp_atr_mult,
-                    cfg.sl_atr_mult,
-                )
+                        pending_side = 0
+                        pending_limit_price = None
+                        pending_signal_atr = None
+                        pending_created_index = None
 
-                position = side
-                entry_time = t
-                entry_index = i
-                used_signal_atr = signal_atr_value
-                active_margin = trade_margin
-                active_leverage = trade_leverage
-                active_notional = active_margin * active_leverage
+            # No pending order (or not filled yet): check the previous candle signal.
+            if position == 0 and pending_side == 0:
+                prev_signal = int(df.at[prev_t, "signal"])
+                prev_signal_atr = df.at[prev_t, "signal_atr"]
+                prev_entry_price = df.at[prev_t, "signal_entry_price"]
+
+                if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
+                    side = prev_signal
+                    signal_atr_value = float(prev_signal_atr)
+
+                    if prev_entry_price is not None and not (
+                        isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)
+                    ):
+                        pending_side = side
+                        pending_limit_price = float(prev_entry_price)
+                        pending_signal_atr = signal_atr_value
+                        pending_created_index = i
+
+                        fill_raw = maybe_fill_limit(side, float(prev_entry_price), o, h, l)
+                        if fill_raw is None:
+                            pass
+                        else:
+                            entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
+
+                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                entry_price=entry_price,
+                                atr_value=signal_atr_value,
+                                sl_atr_mult=cfg.sl_atr_mult,
+                                margin_cap=cfg.initial_capital,
+                                max_leverage=cfg.leverage,
+                                min_leverage=cfg.min_leverage,
+                                target_loss_usd=cfg.target_loss_usd,
+                            )
+                            if trade_margin is None or trade_leverage is None:
+                                pending_side = 0
+                                pending_limit_price = None
+                                pending_signal_atr = None
+                                pending_created_index = None
+                            else:
+                                target_price, stop_price = compute_tp_sl_prices(
+                                    entry_price,
+                                    side,
+                                    signal_atr_value,
+                                    cfg.tp_atr_mult,
+                                    cfg.sl_atr_mult,
+                                )
+
+                                position = side
+                                entry_time = t
+                                entry_index = i
+                                used_signal_atr = signal_atr_value
+                                active_margin = trade_margin
+                                active_leverage = trade_leverage
+                                active_notional = active_margin * active_leverage
+
+                                pending_side = 0
+                                pending_limit_price = None
+                                pending_signal_atr = None
+                                pending_created_index = None
+
+                    else:
+                        entry_price = apply_slippage(o, side, is_entry=True)
+
+                        trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                            entry_price=entry_price,
+                            atr_value=signal_atr_value,
+                            sl_atr_mult=cfg.sl_atr_mult,
+                            margin_cap=cfg.initial_capital,
+                            max_leverage=cfg.leverage,
+                            min_leverage=cfg.min_leverage,
+                            target_loss_usd=cfg.target_loss_usd,
+                        )
+                        if trade_margin is None or trade_leverage is None:
+                            continue
+
+                        target_price, stop_price = compute_tp_sl_prices(
+                            entry_price,
+                            side,
+                            signal_atr_value,
+                            cfg.tp_atr_mult,
+                            cfg.sl_atr_mult,
+                        )
+
+                        position = side
+                        entry_time = t
+                        entry_index = i
+                        used_signal_atr = signal_atr_value
+                        active_margin = trade_margin
+                        active_leverage = trade_leverage
+                        active_notional = active_margin * active_leverage
 
         equity_series.at[t] = equity
 
@@ -980,6 +1125,8 @@ def limit_order(
         params["reduceOnly"] = True
 
     post_only_reprices = 0
+    reduce_only_retries = 0
+    reduce_only_max_retries = 8
 
     while True:
         try:
@@ -988,6 +1135,90 @@ def limit_order(
             error_code = getattr(error, "error_code", None)
             status_code = getattr(error, "status_code", None)
             error_message = getattr(error, "error_message", None)
+
+            if reduce_only and error_code == -2022:
+                reduce_only_retries += 1
+                if reduce_only_retries > reduce_only_max_retries:
+                    logging.error(
+                        "Reduce-only order rejected (max retries). status: %s, code: %s, message: %s",
+                        status_code,
+                        error_code,
+                        error_message,
+                    )
+                    return None
+
+                try:
+                    refreshed_position = get_position_info(client, symbol)
+                except ClientError as pos_error:
+                    logging.error(
+                        "Reduce-only order rejected and position refresh failed. status: %s, code: %s, message: %s",
+                        getattr(pos_error, "status_code", None),
+                        getattr(pos_error, "error_code", None),
+                        getattr(pos_error, "error_message", None),
+                    )
+                    return None
+
+                try:
+                    position_amt = float((refreshed_position or {}).get("positionAmt", 0.0))
+                except (TypeError, ValueError):
+                    position_amt = 0.0
+
+                if position_amt == 0.0:
+                    time.sleep(0.2)
+                    continue
+
+                expected_side = "SELL" if position_amt > 0 else "BUY"
+                if str(side).upper() != expected_side:
+                    logging.error(
+                        "Reduce-only order rejected; side would not reduce position. symbol=%s order_side=%s position_amt=%s",
+                        symbol,
+                        side,
+                        position_amt,
+                    )
+                    return None
+
+                try:
+                    requested_qty = float(params.get("quantity") or 0.0)
+                except (TypeError, ValueError):
+                    requested_qty = 0.0
+                max_qty = abs(position_amt)
+
+                if requested_qty > max_qty:
+                    try:
+                        filters = get_symbol_filters(client, symbol)
+                        step_size = float(filters["step_size"])
+                        min_qty = float(filters["min_qty"])
+                    except Exception:
+                        step_size = 0.0
+                        min_qty = 0.0
+                    if step_size > 0:
+                        new_qty_str = format_to_step(max_qty, step_size, rounding=ROUND_DOWN)
+                    else:
+                        new_qty_str = str(max_qty)
+                    try:
+                        new_qty_num = float(new_qty_str)
+                    except (TypeError, ValueError):
+                        new_qty_num = 0.0
+                    if min_qty > 0 and new_qty_num < min_qty:
+                        logging.info(
+                            "Reduce-only order rejected; position below min qty. symbol=%s position_amt=%s min_qty=%s",
+                            symbol,
+                            position_amt,
+                            min_qty,
+                        )
+                        return None
+                    if new_qty_str != params.get("quantity"):
+                        logging.info(
+                            "Reduce-only order rejected; clamping quantity and retrying. symbol=%s qty=%s -> %s position_amt=%s",
+                            symbol,
+                            params.get("quantity"),
+                            new_qty_str,
+                            position_amt,
+                        )
+                        params["quantity"] = new_qty_str
+
+                time.sleep(0.2)
+                continue
 
             if error_code != -5022:
                 logging.error(
@@ -1233,8 +1464,102 @@ def algo_stop_limit_order(
         for client_key in ("newClientAlgoOrderId", "newClientOrderId"):
             params = dict(base_params)
             params[client_key] = client_order_id
+            reduce_only_retries = 0
+            reduce_only_max_retries = 8
             try:
-                return client.new_algo_order(**params)
+                while True:
+                    try:
+                        return client.new_algo_order(**params)
+                    except ClientError as error:
+                        last_error = error
+                        error_code = getattr(error, "error_code", None)
+                        if error_code == -1104:
+                            raise
+                        if reduce_only and error_code == -2022:
+                            reduce_only_retries += 1
+                            if reduce_only_retries > reduce_only_max_retries:
+                                logging.error(
+                                    "Algo STOP reduce-only order rejected (max retries). status: %s, code: %s, message: %s",
+                                    getattr(error, "status_code", None),
+                                    error_code,
+                                    getattr(error, "error_message", None),
+                                )
+                                return None
+
+                            try:
+                                refreshed_position = get_position_info(client, symbol)
+                            except ClientError as pos_error:
+                                logging.error(
+                                    "Algo STOP reduce-only rejected and position refresh failed. status: %s, code: %s, message: %s",
+                                    getattr(pos_error, "status_code", None),
+                                    getattr(pos_error, "error_code", None),
+                                    getattr(pos_error, "error_message", None),
+                                )
+                                return None
+
+                            try:
+                                position_amt = float((refreshed_position or {}).get("positionAmt", 0.0))
+                            except (TypeError, ValueError):
+                                position_amt = 0.0
+
+                            if position_amt == 0.0:
+                                time.sleep(0.2)
+                                continue
+
+                            expected_side = "SELL" if position_amt > 0 else "BUY"
+                            if str(side).upper() != expected_side:
+                                logging.error(
+                                    "Algo STOP reduce-only rejected; side would not reduce position. symbol=%s order_side=%s position_amt=%s",
+                                    symbol,
+                                    side,
+                                    position_amt,
+                                )
+                                return None
+
+                            try:
+                                requested_qty = float(params.get("quantity") or 0.0)
+                            except (TypeError, ValueError):
+                                requested_qty = 0.0
+                            max_qty = abs(position_amt)
+
+                            if requested_qty > max_qty:
+                                try:
+                                    filters = get_symbol_filters(client, symbol)
+                                    step_size = float(filters["step_size"])
+                                    min_qty = float(filters["min_qty"])
+                                except Exception:
+                                    step_size = 0.0
+                                    min_qty = 0.0
+                                if step_size > 0:
+                                    new_qty_str = format_to_step(max_qty, step_size, rounding=ROUND_DOWN)
+                                else:
+                                    new_qty_str = str(max_qty)
+                                try:
+                                    new_qty_num = float(new_qty_str)
+                                except (TypeError, ValueError):
+                                    new_qty_num = 0.0
+                                if min_qty > 0 and new_qty_num < min_qty:
+                                    logging.info(
+                                        "Algo STOP reduce-only rejected; position below min qty. symbol=%s position_amt=%s min_qty=%s",
+                                        symbol,
+                                        position_amt,
+                                        min_qty,
+                                    )
+                                    return None
+                                if new_qty_str != params.get("quantity"):
+                                    logging.info(
+                                        "Algo STOP reduce-only rejected; clamping quantity and retrying. symbol=%s qty=%s -> %s position_amt=%s",
+                                        symbol,
+                                        params.get("quantity"),
+                                        new_qty_str,
+                                        position_amt,
+                                    )
+                                    params["quantity"] = new_qty_str
+
+                            time.sleep(0.2)
+                            continue
+
+                        raise
             except ClientError as error:
                 last_error = error
                 if getattr(error, "error_code", None) == -1104:
@@ -1248,7 +1573,92 @@ def algo_stop_limit_order(
                 return None
 
     try:
-        return client.new_algo_order(**base_params)
+        reduce_only_retries = 0
+        reduce_only_max_retries = 8
+        while True:
+            try:
+                return client.new_algo_order(**base_params)
+            except ClientError as error:
+                last_error = error
+                if reduce_only and getattr(error, "error_code", None) == -2022:
+                    reduce_only_retries += 1
+                    if reduce_only_retries > reduce_only_max_retries:
+                        break
+
+                    try:
+                        refreshed_position = get_position_info(client, symbol)
+                    except ClientError as pos_error:
+                        logging.error(
+                            "Algo STOP reduce-only rejected and position refresh failed. status: %s, code: %s, message: %s",
+                            getattr(pos_error, "status_code", None),
+                            getattr(pos_error, "error_code", None),
+                            getattr(pos_error, "error_message", None),
+                        )
+                        return None
+
+                    try:
+                        position_amt = float((refreshed_position or {}).get("positionAmt", 0.0))
+                    except (TypeError, ValueError):
+                        position_amt = 0.0
+
+                    if position_amt == 0.0:
+                        time.sleep(0.2)
+                        continue
+
+                    expected_side = "SELL" if position_amt > 0 else "BUY"
+                    if str(side).upper() != expected_side:
+                        logging.error(
+                            "Algo STOP reduce-only rejected; side would not reduce position. symbol=%s order_side=%s position_amt=%s",
+                            symbol,
+                            side,
+                            position_amt,
+                        )
+                        return None
+
+                    try:
+                        requested_qty = float(base_params.get("quantity") or 0.0)
+                    except (TypeError, ValueError):
+                        requested_qty = 0.0
+                    max_qty = abs(position_amt)
+
+                    if requested_qty > max_qty:
+                        try:
+                            filters = get_symbol_filters(client, symbol)
+                            step_size = float(filters["step_size"])
+                            min_qty = float(filters["min_qty"])
+                        except Exception:
+                            step_size = 0.0
+                            min_qty = 0.0
+                        if step_size > 0:
+                            new_qty_str = format_to_step(max_qty, step_size, rounding=ROUND_DOWN)
+                        else:
+                            new_qty_str = str(max_qty)
+                        try:
+                            new_qty_num = float(new_qty_str)
+                        except (TypeError, ValueError):
+                            new_qty_num = 0.0
+                        if min_qty > 0 and new_qty_num < min_qty:
+                            logging.info(
+                                "Algo STOP reduce-only rejected; position below min qty. symbol=%s position_amt=%s min_qty=%s",
+                                symbol,
+                                position_amt,
+                                min_qty,
+                            )
+                            return None
+                        if new_qty_str != base_params.get("quantity"):
+                            logging.info(
+                                "Algo STOP reduce-only rejected; clamping quantity and retrying. symbol=%s qty=%s -> %s position_amt=%s",
+                                symbol,
+                                base_params.get("quantity"),
+                                new_qty_str,
+                                position_amt,
+                            )
+                            base_params["quantity"] = new_qty_str
+
+                    time.sleep(0.2)
+                    continue
+
+                raise
     except ClientError as error:
         last_error = error
 
@@ -1463,26 +1873,41 @@ def klines_to_df(klines: List[List[object]]) -> pd.DataFrame:
     return df
 
 
-def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float]]:
+def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float], Optional[float]]:
     warmup = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
     if len(df) <= warmup:
-        return 0, None, None
+        return 0, None, None, None
 
     atr = atr_ema(df, cfg.atr_len)
-    signal, signal_atr = build_signals_body_opposite(
+    swing_high, swing_low = compute_confirmed_swing_levels(
+        df,
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    signal, signal_atr, signal_entry_price = build_swing_atr_signals(
         df,
         atr,
-        thr1=cfg.thr1,
-        thr2=cfg.thr2,
+        swing_high,
+        swing_low,
+        body_atr_mult=cfg.thr2,
+        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
     )
 
     signal_val = int(signal.iloc[-1])
     atr_val = float(atr.iloc[-1])
     signal_atr_val = signal_atr.iloc[-1]
+    entry_price_val = signal_entry_price.iloc[-1]
     if signal_val == 0 or pd.isna(signal_atr_val) or math.isnan(atr_val):
-        return 0, None, atr_val if not math.isnan(atr_val) else None
-    return signal_val, float(signal_atr_val), atr_val
+        return 0, None, atr_val if not math.isnan(atr_val) else None, None
+    entry_price: Optional[float]
+    if entry_price_val is not None and not pd.isna(entry_price_val):
+        entry_price = float(entry_price_val)
+    else:
+        entry_price = None
+    return signal_val, float(signal_atr_val), atr_val, entry_price
 
 
 def compute_tp_sl_prices(
@@ -1645,7 +2070,7 @@ def run_live(cfg: LiveConfig) -> None:
             return False
         last_close_ms_by_symbol[symbol] = close_time_ms
         df = klines_to_df(closed_klines)
-        signal, signal_atr, atr_value = compute_live_signal(df, cfg)
+        signal, signal_atr, atr_value, signal_entry_price = compute_live_signal(df, cfg)
         last_atr_by_symbol[symbol] = atr_value
         candle = df.iloc[-1]
         body = abs(float(candle["close"]) - float(candle["open"]))
@@ -1661,6 +2086,7 @@ def run_live(cfg: LiveConfig) -> None:
             "atr": format_float_by_symbol(atr_value, symbol),
             "signal": signal,
             "signal_atr": format_float_by_symbol(signal_atr, symbol),
+            "signal_entry_price": format_float_by_symbol(signal_entry_price, symbol),
         })
 
         if not allow_entry:
@@ -1694,13 +2120,16 @@ def run_live(cfg: LiveConfig) -> None:
             log_event(cfg.log_path, {"event": "skip_spread", "symbol": symbol, "spread_pct": format_float_2(spread_pct)})
             return False
 
-        offset = atr_value * cfg.atr_offset_mult
-        if signal == 1:
-            limit_price = bid - offset
-            side = "BUY"
+        side = "BUY" if signal == 1 else "SELL"
+        offset: Optional[float] = None
+        if signal_entry_price is not None:
+            limit_price = float(signal_entry_price)
         else:
-            limit_price = ask + offset
-            side = "SELL"
+            offset = atr_value * cfg.atr_offset_mult
+            if signal == 1:
+                limit_price = bid - offset
+            else:
+                limit_price = ask + offset
 
         tick = filters["tick_size"]
         if tick > 0:
@@ -2424,8 +2853,8 @@ def run_backtest() -> None:
     df = fetch_ohlcv_binance(
         symbol="BTC/USDT",
         timeframe="1m",
-        start_utc="2025-06-30 00:00:00",
-        end_utc="2025-12-30 00:00:00",
+        start_utc="2025-12-01 00:00:00",
+        end_utc="2026-01-08 00:00:00",
     )
     #
     # Option B: Load your own CSV (must contain datetime + OHLCV)
@@ -2438,7 +2867,7 @@ def run_backtest() -> None:
     # 2) Run backtest
     cfg = BacktestConfig(
         atr_len=14,
-        leverage=50.0,
+        leverage=75.0,
         initial_capital=100.0,
         fee_rate=0.0000,
         slippage=0.0000,

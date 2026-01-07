@@ -21,7 +21,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -203,6 +203,163 @@ def detect_swings(
 
     swings.sort(key=lambda s: (s.pivot_ts, 0 if s.kind == "swing_low" else 1))
     return swings
+
+
+def compute_confirmed_swing_levels(
+    df_1m: pd.DataFrame,
+    *,
+    swing_timeframe: str = "15m",
+    left: int = 2,
+    right: int = 2,
+    resample_rule: str = "15min",
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Build the latest confirmed swing high/low levels *as-of each bar* in df_1m.
+
+    Notes:
+      - Swings are detected on the requested timeframe (default: 15m resample),
+        but returned as 1m-aligned series (forward-filled from confirm time).
+      - Values are NaN until a swing of that kind is confirmed.
+    """
+    if df_1m.empty:
+        empty = pd.Series(np.nan, index=df_1m.index, dtype=float)
+        return empty, empty
+
+    if swing_timeframe == "1m":
+        df_tf = df_1m
+        tf = "1m"
+    else:
+        df_tf = resample_ohlcv(df_1m, rule=resample_rule)
+        tf = swing_timeframe
+
+    swings = detect_swings(df_tf, timeframe=tf, left=left, right=right)
+
+    def levels_for(kind: SwingKind) -> pd.Series:
+        pts = [s for s in swings if s.kind == kind]
+        if not pts:
+            return pd.Series(np.nan, index=df_1m.index, dtype=float)
+        confirm_ts = pd.to_datetime([p.confirm_ts for p in pts], utc=True)
+        levels = [float(p.level) for p in pts]
+        series = pd.Series(levels, index=confirm_ts, dtype=float).sort_index()
+        series = series[~series.index.duplicated(keep="last")]
+        return series.reindex(df_1m.index, method="ffill")
+
+    return levels_for("swing_high"), levels_for("swing_low")
+
+
+def build_swing_atr_signals(
+    df: pd.DataFrame,
+    atr: pd.Series,
+    swing_high_level: pd.Series,
+    swing_low_level: pd.Series,
+    *,
+    body_atr_mult: float = 2.0,
+    swing_proximity_atr_mult: float = 0.25,
+    tolerance_pct: float = 0.0,
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Strategy rules (signal generated on candle close, entry after close):
+
+    If price is at/near swing high:
+      1) Red candle body >= body_atr_mult*ATR => SHORT
+      2) Green candle body >= body_atr_mult*ATR and close < swing high => SHORT
+      3) Green candle body >= body_atr_mult*ATR and close >= swing high => LONG (limit at mid-body)
+
+    If price is at/near swing low:
+      1) Green candle body >= body_atr_mult*ATR => LONG
+      2) Red candle body >= body_atr_mult*ATR and close > swing low => LONG
+      3) Red candle body >= body_atr_mult*ATR and close <= swing low => SHORT (limit at mid-body)
+
+    Otherwise:
+      - If candle body >= body_atr_mult*ATR => enter in same direction as candle
+
+    Returns:
+      signal_dir: +1 long, -1 short, 0 none
+      signal_atr: ATR on the signal candle (NaN if none)
+      entry_price: NaN for market-on-next-bar, otherwise limit entry price
+    """
+    if df.empty:
+        empty_i = pd.Series(0, index=df.index, dtype=int)
+        empty_f = pd.Series(np.nan, index=df.index, dtype=float)
+        return empty_i, empty_f, empty_f
+
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"DataFrame missing required columns: {missing}")
+
+    body = (df["close"] - df["open"]).abs()
+    delta = df["close"] - df["open"]
+    candle_dir = np.sign(delta).astype(int)  # -1,0,+1
+    is_green = candle_dir == 1
+    is_red = candle_dir == -1
+
+    tol = max(0.0, float(tolerance_pct or 0.0))
+    target = float(body_atr_mult) * atr
+    if tol > 0.0:
+        target = target * (1.0 - tol)
+    big_body = body >= target
+
+    proximity = atr * float(swing_proximity_atr_mult)
+    has_prox = proximity.notna()
+
+    near_high = (
+        big_body
+        & has_prox
+        & swing_high_level.notna()
+        & (df["high"] >= (swing_high_level - proximity))
+        & (df["low"] <= (swing_high_level + proximity))
+    )
+    near_low = (
+        big_body
+        & has_prox
+        & swing_low_level.notna()
+        & (df["low"] <= (swing_low_level + proximity))
+        & (df["high"] >= (swing_low_level - proximity))
+    )
+
+    both = near_high & near_low
+    if bool(both.any()):
+        dist_high = (df["close"] - swing_high_level).abs()
+        dist_low = (df["close"] - swing_low_level).abs()
+        pick_high = dist_high <= dist_low
+        near_high = near_high & (~both | pick_high)
+        near_low = near_low & (~both | ~pick_high)
+
+    signal = pd.Series(0, index=df.index, dtype=int)
+    signal_atr = pd.Series(np.nan, index=df.index, dtype=float)
+    entry_price = pd.Series(np.nan, index=df.index, dtype=float)
+
+    mid_body = (df["open"] + df["close"]) / 2.0
+
+    # Neither swing high nor swing low => same direction as candle (if big body)
+    other = big_body & ~(near_high | near_low)
+    signal[other] = candle_dir[other]
+
+    # Near swing high rules
+    cond_high = near_high
+    short_red = cond_high & is_red
+    short_failed = cond_high & is_green & (df["close"] < swing_high_level)
+    long_break = cond_high & is_green & (df["close"] >= swing_high_level)
+
+    signal[short_red | short_failed] = -1
+    signal[long_break] = 1
+    entry_price[long_break] = mid_body[long_break]
+
+    # Near swing low rules
+    cond_low = near_low
+    long_green = cond_low & is_green
+    long_failed = cond_low & is_red & (df["close"] > swing_low_level)
+    short_break = cond_low & is_red & (df["close"] <= swing_low_level)
+
+    signal[long_green | long_failed] = 1
+    signal[short_break] = -1
+    entry_price[short_break] = mid_body[short_break]
+
+    active = signal != 0
+    signal_atr[active] = atr[active]
+
+    return signal, signal_atr, entry_price
 
 
 def build_log_payload(
