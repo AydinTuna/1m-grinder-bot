@@ -38,12 +38,12 @@ class BacktestConfig:
     swing_resample_rule: str = "15min"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 75.0  # max leverage for dynamic sizing
+    leverage: float = 100.0  # max leverage for dynamic sizing
     min_leverage: float = 20.0
-    initial_capital: float = 100.0  # starting equity (margin cap per trade)
+    initial_capital: float = 50.0  # starting equity (margin cap per trade)
 
     # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 1.00
+    target_loss_usd: Optional[float] = 0.25
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -54,7 +54,7 @@ class BacktestConfig:
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 2.5
+    tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
     use_trailing_stop: bool = True
     trail_gap_r: float = 1.5
@@ -76,10 +76,10 @@ class LiveConfig:
     swing_resample_rule: str = "15min"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
-    leverage: int = 75  # max leverage for dynamic sizing
+    leverage: int = 100  # max leverage for dynamic sizing
     min_leverage: int = 20
-    margin_usd: float = 40.0  # margin cap per trade if targets are set
-    target_loss_usd: Optional[float] = 1.00
+    margin_usd: float = 50.0  # margin cap per trade if targets are set
+    target_loss_usd: Optional[float] = 0.25
 
     # Strategy thresholds
     thr1: float = 2.0

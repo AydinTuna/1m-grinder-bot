@@ -294,6 +294,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     pending_created_index = None
 
     trades: List[Dict] = []
+    trailing_stop_updates: List[Dict] = []
 
     idx = df.index.to_list()
 
@@ -435,17 +436,67 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             c = float(df.at[t, "close"])
             close_r = compute_close_r(entry_price, c, position, trail_r_value)
             if close_r is not None:
+                side_str = "LONG" if position == 1 else "SHORT"
+                prev_best_r = trail_best_close_r
+                prev_stop_r = trail_stop_r
+                prev_stop_price = stop_price
+                
                 trail_best_close_r = max(trail_best_close_r, close_r)
                 next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+                
+                # Log trailing stop evaluation
                 if next_stop_r > trail_stop_r:
-                    trail_stop_r = next_stop_r
-                    stop_price = compute_trailing_sl_price(
+                    # Stop is moving - calculate new price
+                    new_stop_price = compute_trailing_sl_price(
                         entry_price,
                         position,
                         trail_r_value,
-                        trail_stop_r,
+                        next_stop_r,
                         cfg.trail_buffer_r,
                     )
+                    
+                    # Log to CSV
+                    trailing_stop_updates.append({
+                        "timestamp": t,
+                        "entry_time": entry_time,
+                        "side": side_str,
+                        "entry_price": entry_price,
+                        "close_price": c,
+                        "close_r": close_r,
+                        "prev_best_r": prev_best_r,
+                        "new_best_r": trail_best_close_r,
+                        "prev_stop_r": prev_stop_r,
+                        "new_stop_r": next_stop_r,
+                        "prev_stop_price": prev_stop_price,
+                        "new_stop_price": new_stop_price,
+                        "r_value": trail_r_value,
+                        "trail_gap_r": cfg.trail_gap_r,
+                        "trail_buffer_r": cfg.trail_buffer_r,
+                        "stop_moved": True,
+                    })
+                    
+                    trail_stop_r = next_stop_r
+                    stop_price = new_stop_price
+                else:
+                    # Log to CSV
+                    trailing_stop_updates.append({
+                        "timestamp": t,
+                        "entry_time": entry_time,
+                        "side": side_str,
+                        "entry_price": entry_price,
+                        "close_price": c,
+                        "close_r": close_r,
+                        "prev_best_r": trail_best_close_r,
+                        "new_best_r": trail_best_close_r,
+                        "prev_stop_r": trail_stop_r,
+                        "new_stop_r": trail_stop_r,
+                        "prev_stop_price": stop_price,
+                        "new_stop_price": stop_price,
+                        "r_value": trail_r_value,
+                        "trail_gap_r": cfg.trail_gap_r,
+                        "trail_buffer_r": cfg.trail_buffer_r,
+                        "stop_moved": False,
+                    })
 
         # --- ENTRY logic (signal on prev candle; optional mid-body limit) ---
         if position == 0:
@@ -636,14 +687,17 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     df["equity"] = equity_series.ffill()
 
     trades_df = pd.DataFrame(trades)
-    stats = compute_stats(trades_df, df)
+    trailing_df = pd.DataFrame(trailing_stop_updates)
+    stats = compute_stats(trades_df, df, cfg)
 
-    return trades_df, df, stats
+    return trades_df, df, stats, trailing_df
 
 
-def compute_stats(trades_df: pd.DataFrame, df_bt: pd.DataFrame) -> Dict[str, float]:
+def compute_stats(trades_df: pd.DataFrame, df_bt: pd.DataFrame, cfg: BacktestConfig) -> Dict[str, float]:
     if trades_df.empty:
         return {
+            "initial_capital": float(cfg.initial_capital),
+            "target_loss_usd": float(cfg.target_loss_usd) if cfg.target_loss_usd is not None else 0.0,
             "trades": 0,
             "final_equity": float(df_bt["equity"].iloc[-1]),
             "win_rate": 0.0,
@@ -658,6 +712,8 @@ def compute_stats(trades_df: pd.DataFrame, df_bt: pd.DataFrame) -> Dict[str, flo
     trades = len(trades_df)
 
     return {
+        "initial_capital": float(cfg.initial_capital),
+        "target_loss_usd": float(cfg.target_loss_usd) if cfg.target_loss_usd is not None else 0.0,
         "trades": trades,
         "final_equity": float(trades_df["equity_after"].iloc[-1]),
         "win_rate": float(wins / trades),
@@ -3351,8 +3407,8 @@ def run_backtest() -> None:
     df = fetch_ohlcv_binance(
         symbol="BTC/USDT",
         timeframe="1m",
-        start_utc="2025-06-01 00:00:00",
-        end_utc="2026-01-09 00:00:00",
+        start_utc="2025-05-01 00:00:00",
+        end_utc="2025-06-01 00:00:00",
     )
     #
     # Option B: Load your own CSV (must contain datetime + OHLCV)
@@ -3365,20 +3421,22 @@ def run_backtest() -> None:
     # 2) Run backtest
     cfg = BacktestConfig()
 
-    trades, df_bt, stats = backtest_atr_grinder(df, cfg)
+    trades, df_bt, stats, trailing_df = backtest_atr_grinder(df, cfg)
 
     # 3) Output
     print("\n=== STATS ===")
     for k, v in stats.items():
         print(f"{k}: {v}")
 
-    print("\n=== LAST 10 TRADES ===")
-    print(trades.tail(10).to_string(index=False))
-
     # Save results
     trades.to_csv("trades.csv", index=False)
     df_bt.to_csv("backtest_series.csv")
-    print("\nSaved: trades.csv, backtest_series.csv")
+    
+    if not trailing_df.empty:
+        trailing_df.to_csv("trailing_stops.csv", index=False)
+        print(f"\nSaved: trades.csv, backtest_series.csv, trailing_stops.csv ({len(trailing_df)} trailing stop updates)")
+    else:
+        print("\nSaved: trades.csv, backtest_series.csv")
 
 
 def main() -> None:
