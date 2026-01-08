@@ -1,5 +1,5 @@
 """
-ATR-based 1-minute strategy (swing context + large body trigger, ATR-based TP/SL)
+ATR-based 1-minute strategy (swing context + large body trigger, ATR-based SL + optional trailing stop)
 
 Rules:
 - Compute ATR (EMA) on 1m candles.
@@ -8,14 +8,19 @@ Rules:
   - Swing high: red => SHORT; green close below => SHORT; green close above => LONG (limit at mid-body)
   - Swing low: green => LONG; red close above => LONG; red close below => SHORT (limit at mid-body)
 - If candle body >= thr2*ATR and price is not near swing levels: enter in the same direction as the candle.
-- Take profit when price moves tp_atr_mult * ATR from entry.
-- Stop loss when price moves sl_atr_mult * ATR from entry.
+- If use_trailing_stop is False:
+  - Take profit when price moves tp_atr_mult * ATR from entry.
+  - Stop loss when price moves sl_atr_mult * ATR from entry.
+- If use_trailing_stop is True:
+  - No take profit.
+  - Initial stop is 1R where R = sl_atr_mult * ATR_at_entry.
+  - Trailing stop is a ladder based on candle close in R units (gap = trail_gap_r, buffer = trail_buffer_r).
 
 Implementation details:
 - Body = abs(close - open)
 - Market entries are at next candle open; mid-body signals use a limit order (midpoint of signal candle body).
-- TP/SL are evaluated within each candle using high/low.
-- TP/SL ATR uses the signal candle's ATR.
+- Stops are evaluated within each candle using high/low; trailing stop updates occur on candle close.
+- ATR uses the signal candle's ATR (frozen at entry for R-based trailing).
 - Fees and slippage are modeled.
 - Signals are ignored for the first atr_warmup_bars (defaults to atr_len).
 - Margin per trade is capped by initial_capital/margin_usd; leverage may be adjusted from target loss to keep TP/SL $ consistency.
@@ -277,6 +282,9 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     entry_price = None
     target_price = None
     stop_price = None
+    trail_r_value: Optional[float] = None
+    trail_best_close_r: Optional[float] = None
+    trail_stop_r: Optional[int] = None
     entry_time = None
     entry_index = None
     used_signal_atr = None
@@ -341,28 +349,38 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         h = float(df.at[t, "high"])
         l = float(df.at[t, "low"])
 
-        # --- EXIT logic (TP/SL) ---
-        if position != 0 and entry_price is not None and target_price is not None and stop_price is not None:
-            tp_hit = (h >= target_price) if position == 1 else (l <= target_price)
+        # --- EXIT logic ---
+        if position != 0 and entry_price is not None and stop_price is not None:
             sl_hit = (l <= stop_price) if position == 1 else (h >= stop_price)
 
             exited = False
             exit_reason = None
             exit_price = None
 
-            if sl_hit and tp_hit:
-                # Conservative assumption when both hit in the same candle.
-                exit_reason = "SL"
-                exit_price = apply_slippage(stop_price, position, is_entry=False)
-                exited = True
-            elif tp_hit:
-                exit_reason = "TP"
-                exit_price = apply_slippage(target_price, position, is_entry=False)
-                exited = True
-            elif sl_hit:
-                exit_reason = "SL"
-                exit_price = apply_slippage(stop_price, position, is_entry=False)
-                exited = True
+            if cfg.use_trailing_stop:
+                if sl_hit:
+                    exit_reason = "SL"
+                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exited = True
+            else:
+                if target_price is not None:
+                    tp_hit = (h >= target_price) if position == 1 else (l <= target_price)
+                else:
+                    tp_hit = False
+
+                if sl_hit and tp_hit:
+                    # Conservative assumption when both hit in the same candle.
+                    exit_reason = "SL"
+                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exited = True
+                elif tp_hit:
+                    exit_reason = "TP"
+                    exit_price = apply_slippage(target_price, position, is_entry=False)
+                    exited = True
+                elif sl_hit:
+                    exit_reason = "SL"
+                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exited = True
 
             if exited:
                 roi_net = net_roi_from_prices(entry_price, exit_price, position, active_leverage)
@@ -394,12 +412,40 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 entry_price = None
                 target_price = None
                 stop_price = None
+                trail_r_value = None
+                trail_best_close_r = None
+                trail_stop_r = None
                 entry_time = None
                 entry_index = None
                 used_signal_atr = None
                 active_margin = cfg.initial_capital
                 active_leverage = cfg.leverage
                 active_notional = active_margin * active_leverage
+
+        # --- Trailing stop update (candle close) ---
+        if (
+            cfg.use_trailing_stop
+            and position != 0
+            and entry_price is not None
+            and stop_price is not None
+            and trail_r_value is not None
+            and trail_best_close_r is not None
+            and trail_stop_r is not None
+        ):
+            c = float(df.at[t, "close"])
+            close_r = compute_close_r(entry_price, c, position, trail_r_value)
+            if close_r is not None:
+                trail_best_close_r = max(trail_best_close_r, close_r)
+                next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+                if next_stop_r > trail_stop_r:
+                    trail_stop_r = next_stop_r
+                    stop_price = compute_trailing_sl_price(
+                        entry_price,
+                        position,
+                        trail_r_value,
+                        trail_stop_r,
+                        cfg.trail_buffer_r,
+                    )
 
         # --- ENTRY logic (signal on prev candle; optional mid-body limit) ---
         if position == 0:
@@ -434,13 +480,26 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         pending_signal_atr = None
                         pending_created_index = None
                     else:
-                        target_price, stop_price = compute_tp_sl_prices(
-                            entry_price,
-                            side,
-                            signal_atr_value,
-                            cfg.tp_atr_mult,
-                            cfg.sl_atr_mult,
-                        )
+                        if cfg.use_trailing_stop:
+                            target_price = None
+                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                            trail_best_close_r = 0.0
+                            trail_stop_r = -1
+                            stop_price = compute_trailing_sl_price(
+                                entry_price,
+                                side,
+                                trail_r_value,
+                                trail_stop_r,
+                                cfg.trail_buffer_r,
+                            )
+                        else:
+                            target_price, stop_price = compute_tp_sl_prices(
+                                entry_price,
+                                side,
+                                signal_atr_value,
+                                cfg.tp_atr_mult,
+                                cfg.sl_atr_mult,
+                            )
 
                         position = side
                         entry_time = t
@@ -494,13 +553,26 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                                 pending_signal_atr = None
                                 pending_created_index = None
                             else:
-                                target_price, stop_price = compute_tp_sl_prices(
-                                    entry_price,
-                                    side,
-                                    signal_atr_value,
-                                    cfg.tp_atr_mult,
-                                    cfg.sl_atr_mult,
-                                )
+                                if cfg.use_trailing_stop:
+                                    target_price = None
+                                    trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                    trail_best_close_r = 0.0
+                                    trail_stop_r = -1
+                                    stop_price = compute_trailing_sl_price(
+                                        entry_price,
+                                        side,
+                                        trail_r_value,
+                                        trail_stop_r,
+                                        cfg.trail_buffer_r,
+                                    )
+                                else:
+                                    target_price, stop_price = compute_tp_sl_prices(
+                                        entry_price,
+                                        side,
+                                        signal_atr_value,
+                                        cfg.tp_atr_mult,
+                                        cfg.sl_atr_mult,
+                                    )
 
                                 position = side
                                 entry_time = t
@@ -530,13 +602,26 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         if trade_margin is None or trade_leverage is None:
                             continue
 
-                        target_price, stop_price = compute_tp_sl_prices(
-                            entry_price,
-                            side,
-                            signal_atr_value,
-                            cfg.tp_atr_mult,
-                            cfg.sl_atr_mult,
-                        )
+                        if cfg.use_trailing_stop:
+                            target_price = None
+                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                            trail_best_close_r = 0.0
+                            trail_stop_r = -1
+                            stop_price = compute_trailing_sl_price(
+                                entry_price,
+                                side,
+                                trail_r_value,
+                                trail_stop_r,
+                                cfg.trail_buffer_r,
+                            )
+                        else:
+                            target_price, stop_price = compute_tp_sl_prices(
+                                entry_price,
+                                side,
+                                signal_atr_value,
+                                cfg.tp_atr_mult,
+                                cfg.sl_atr_mult,
+                            )
 
                         position = side
                         entry_time = t
@@ -615,6 +700,9 @@ class LiveState:
     sl_algo_client_order_id: Optional[str] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
+    trail_r_value: Optional[float] = None
+    trail_best_close_r: Optional[float] = None
+    trail_stop_r: Optional[int] = None
     entry_close_ms: Optional[int] = None
     entry_price: Optional[float] = None
     entry_qty: Optional[float] = None
@@ -1095,6 +1183,16 @@ def get_position_info(client: BinanceUMFuturesREST, symbol: str) -> Dict[str, st
                 return pos
         return info[0] if info else {}
     return info
+
+
+def has_open_position(client: BinanceUMFuturesREST, symbol: str) -> bool:
+    """Check if there's an open position for the symbol."""
+    try:
+        pos = get_position_info(client, symbol)
+        amt = float((pos or {}).get("positionAmt", 0.0))
+        return amt != 0.0
+    except Exception:
+        return False
 
 
 def limit_order(
@@ -1928,6 +2026,50 @@ def compute_tp_sl_prices(
     return target_price, stop_price
 
 
+def compute_sl_price(entry_price: float, side: int, atr_value: float, sl_atr_mult: float) -> float:
+    move_sl = atr_value * sl_atr_mult
+    if side == 1:
+        return entry_price - move_sl
+    return entry_price + move_sl
+
+
+def compute_close_r(entry_price: float, close_price: float, side: int, r_value: float) -> Optional[float]:
+    if r_value <= 0:
+        return None
+    if side == 1:
+        return (close_price - entry_price) / r_value
+    return (entry_price - close_price) / r_value
+
+
+def compute_trailing_stop_r(best_close_r: float, current_stop_r: int, gap_r: float) -> int:
+    candidate = int(math.floor(best_close_r - gap_r))
+    return max(current_stop_r, candidate)
+
+
+def compute_trailing_sl_price(entry_price: float, side: int, r_value: float, stop_r: int, buffer_r: float) -> float:
+    price = entry_price + (stop_r * r_value) if side == 1 else entry_price - (stop_r * r_value)
+    if stop_r >= 0 and buffer_r:
+        buffer_price = r_value * float(buffer_r)
+        price = price + buffer_price if side == 1 else price - buffer_price
+    return price
+
+
+def compute_sl_limit_price(trigger_price: float, side: int, atr_value: float, offset_mult: float) -> float:
+    """
+    Compute limit price for stop loss order with offset to ensure maker execution.
+    
+    For SELL (closing LONG, side=1): price is HIGHER than trigger to sit on ask side.
+    For BUY (closing SHORT, side=-1): price is LOWER than trigger to sit on bid side.
+    """
+    offset = atr_value * offset_mult
+    if side == 1:
+        # Closing LONG with SELL: limit price above trigger
+        return trigger_price + offset
+    else:
+        # Closing SHORT with BUY: limit price below trigger
+        return trigger_price - offset
+
+
 def compute_margin_from_targets(
     entry_price: float,
     atr_value: float,
@@ -2088,6 +2230,125 @@ def run_live(cfg: LiveConfig) -> None:
             "signal_atr": format_float_by_symbol(signal_atr, symbol),
             "signal_entry_price": format_float_by_symbol(signal_entry_price, symbol),
         })
+
+        if (
+            cfg.use_trailing_stop
+            and state.active_symbol == symbol
+            and state.entry_price is not None
+            and state.entry_side is not None
+            and not state.sl_triggered
+        ):
+            pos = positions.get(symbol) or {}
+            try:
+                position_amt = float(pos.get("positionAmt", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                position_amt = 0.0
+            if position_amt != 0.0:
+                try:
+                    entry_price = float(state.entry_price or 0.0)
+                except (TypeError, ValueError):
+                    entry_price = 0.0
+                side_sign = int(state.entry_side or (1 if position_amt > 0 else -1))
+                r_value = state.trail_r_value
+                if r_value is None and state.active_atr is not None:
+                    r_value = state.active_atr * cfg.sl_atr_mult
+                    state.trail_r_value = r_value
+                if entry_price > 0 and r_value is not None and r_value > 0:
+                    close_r = compute_close_r(entry_price, float(candle["close"]), side_sign, r_value)
+                    if close_r is not None:
+                        if state.trail_best_close_r is None:
+                            state.trail_best_close_r = 0.0
+                        state.trail_best_close_r = max(state.trail_best_close_r, close_r)
+                        if state.trail_stop_r is None:
+                            state.trail_stop_r = -1
+                        candidate_stop_r = compute_trailing_stop_r(
+                            state.trail_best_close_r,
+                            state.trail_stop_r,
+                            cfg.trail_gap_r,
+                        )
+                        if candidate_stop_r > state.trail_stop_r:
+                            next_sl_price = compute_trailing_sl_price(
+                                entry_price,
+                                side_sign,
+                                r_value,
+                                candidate_stop_r,
+                                cfg.trail_buffer_r,
+                            )
+                            next_sl_price_str = format_to_step(next_sl_price, filters["tick_size"])
+                            try:
+                                next_sl_price_rounded = float(next_sl_price_str)
+                            except (TypeError, ValueError):
+                                next_sl_price_rounded = 0.0
+
+                            improves = True
+                            if state.sl_price is not None:
+                                try:
+                                    current_sl_price = float(state.sl_price)
+                                except (TypeError, ValueError):
+                                    current_sl_price = None
+                                if current_sl_price is not None:
+                                    improves = next_sl_price_rounded > current_sl_price if side_sign == 1 else next_sl_price_rounded < current_sl_price
+
+                            qty = abs(position_amt)
+                            qty_str = format_to_step(qty, filters["step_size"])
+                            try:
+                                qty_num = float(qty_str)
+                            except (TypeError, ValueError):
+                                qty_num = 0.0
+                            if improves and next_sl_price_rounded > 0 and qty_num >= filters["min_qty"]:
+                                if state.sl_algo_id:
+                                    cancel_algo_order_safely(client, symbol, algo_id=state.sl_algo_id)
+                                state.sl_algo_id = None
+                                state.sl_algo_client_order_id = None
+                                sl_side = "SELL" if side_sign == 1 else "BUY"
+                                sl_client_id = f"ATR_SL_T_{close_time_ms}"
+                                # Compute limit price with offset for maker execution
+                                sl_limit_price = compute_sl_limit_price(
+                                    next_sl_price_rounded,
+                                    side_sign,
+                                    state.active_atr or r_value,
+                                    cfg.sl_maker_offset_atr_mult,
+                                )
+                                sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                                sl_algo_order = algo_stop_limit_order(
+                                    symbol=symbol,
+                                    side=sl_side,
+                                    quantity=qty_str,
+                                    trigger_price=next_sl_price_str,
+                                    price=sl_limit_price_str,
+                                    client=client,
+                                    client_order_id=sl_client_id,
+                                    algo_type=cfg.algo_type,
+                                    working_type=cfg.algo_working_type,
+                                    price_protect=cfg.algo_price_protect,
+                                    reduce_only=True,
+                                )
+                                if sl_algo_order is None:
+                                    log_event(cfg.log_path, {
+                                        "event": "sl_trail_rejected",
+                                        "symbol": symbol,
+                                        "side": "LONG" if side_sign == 1 else "SHORT",
+                                        "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
+                                        "stop_r": candidate_stop_r,
+                                        "best_close_r": format_float_2(state.trail_best_close_r),
+                                    })
+                                else:
+                                    state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                                    state.sl_algo_client_order_id = (
+                                        _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                                        or sl_client_id
+                                    )
+                                    state.sl_price = next_sl_price_rounded
+                                    state.trail_stop_r = candidate_stop_r
+                                    log_event(cfg.log_path, {
+                                        "event": "sl_trail_update",
+                                        "symbol": symbol,
+                                        "side": "LONG" if side_sign == 1 else "SHORT",
+                                        "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
+                                        "stop_r": candidate_stop_r,
+                                        "best_close_r": format_float_2(state.trail_best_close_r),
+                                        "algo_id": state.sl_algo_id,
+                                    })
 
         if not allow_entry:
             return False
@@ -2284,6 +2545,9 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_side = None
                     state.entry_time_iso = None
                     state.entry_signal_ms = None
+                    state.trail_r_value = None
+                    state.trail_best_close_r = None
+                    state.trail_stop_r = None
                     if not in_position:
                         state.active_symbol = None
                     order = None
@@ -2345,82 +2609,176 @@ def run_live(cfg: LiveConfig) -> None:
                         log_event(cfg.log_path, {"event": "missing_atr", "stage": "entry_filled", "symbol": active_symbol})
                         entry_atr = 0.0
                     state.active_atr = entry_atr
-                    tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
-                    tp_price_str = format_to_step(tp_price, filters["tick_size"])
-                    sl_price_str = format_to_step(sl_price, filters["tick_size"])
                     qty_str = format_to_step(qty, filters["step_size"])
 
-                    tp_side = "SELL" if side == 1 else "BUY"
-                    tp_client_id = f"ATR_TP_{entry_close_ms or ''}"
-                    # Place TP as a resting limit to avoid taker fees when possible.
-                    tp_order = limit_order(
-                        symbol=active_symbol,
-                        side=tp_side,
-                        quantity=qty_str,
-                        price=tp_price_str,
-                        client=client,
-                        client_order_id=tp_client_id,
-                        tick_size=filters["tick_size"],
-                        reduce_only=True,
-                    )
-                    if tp_order is None:
-                        log_event(cfg.log_path, {
-                            "event": "tp_order_rejected",
-                            "symbol": active_symbol,
-                            "tp_price": format_float_2(tp_price),
-                        })
-                    state.tp_order_id = tp_order.get("orderId") if tp_order else None
-                    state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
-                    state.tp_price = tp_price
-                    state.sl_price = sl_price
+                    if cfg.use_trailing_stop:
+                        state.tp_order_id = None
+                        state.tp_client_order_id = None
+                        state.tp_price = None
 
-                    sl_side = "SELL" if side == 1 else "BUY"
-                    sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
-                    sl_algo_order = algo_stop_limit_order(
-                        symbol=active_symbol,
-                        side=sl_side,
-                        quantity=qty_str,
-                        trigger_price=sl_price_str,
-                        price=sl_price_str,
-                        client=client,
-                        client_order_id=sl_client_id,
-                        algo_type=cfg.algo_type,
-                        working_type=cfg.algo_working_type,
-                        price_protect=cfg.algo_price_protect,
-                        reduce_only=True,
-                    )
-                    if sl_algo_order is None:
+                        state.trail_r_value = entry_atr * cfg.sl_atr_mult
+                        state.trail_best_close_r = 0.0
+                        state.trail_stop_r = -1
+
+                        sl_price = compute_trailing_sl_price(
+                            entry_price,
+                            side,
+                            state.trail_r_value,
+                            state.trail_stop_r,
+                            cfg.trail_buffer_r,
+                        )
+                        sl_price_str = format_to_step(sl_price, filters["tick_size"])
+                        state.sl_price = sl_price
+
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
+                        # Compute limit price with offset for maker execution
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        sl_algo_order = algo_stop_limit_order(
+                            symbol=active_symbol,
+                            side=sl_side,
+                            quantity=qty_str,
+                            trigger_price=sl_price_str,
+                            price=sl_limit_price_str,
+                            client=client,
+                            client_order_id=sl_client_id,
+                            algo_type=cfg.algo_type,
+                            working_type=cfg.algo_working_type,
+                            price_protect=cfg.algo_price_protect,
+                            reduce_only=True,
+                        )
+                        if sl_algo_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "sl_algo_order_rejected",
+                                "symbol": active_symbol,
+                                "sl_price": format_float_2(sl_price),
+                            })
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
+                        state.sl_triggered = False
+                        state.sl_order_time = None
+                        state.entry_close_ms = None
+
                         log_event(cfg.log_path, {
-                            "event": "sl_algo_order_rejected",
+                            "event": "entry_filled",
                             "symbol": active_symbol,
+                            "order_id": order.get("orderId"),
+                            "side": "LONG" if side == 1 else "SHORT",
+                            "entry_price": format_float_2(entry_price),
+                            "quantity": format_float_2(qty),
+                            "entry_atr": format_float_2(state.active_atr),
+                            "margin_usd": format_float_2(state.entry_margin_usd),
+                            "leverage": state.entry_leverage,
                             "sl_price": format_float_2(sl_price),
+                            "sl_algo_id": state.sl_algo_id,
+                            "trail_gap_r": cfg.trail_gap_r,
+                            "trail_buffer_r": cfg.trail_buffer_r,
                         })
-                    state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                    state.sl_algo_client_order_id = (
-                        _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                        or (sl_client_id if sl_algo_order else None)
-                    )
-                    state.sl_order_id = None
-                    state.sl_client_order_id = None
-                    state.sl_triggered = False
-                    state.sl_order_time = None
-                    state.entry_close_ms = None
+                    else:
+                        tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
+                        tp_price_str = format_to_step(tp_price, filters["tick_size"])
+                        sl_price_str = format_to_step(sl_price, filters["tick_size"])
 
-                    log_event(cfg.log_path, {
-                        "event": "entry_filled",
-                        "symbol": active_symbol,
-                        "order_id": order.get("orderId"),
-                        "side": "LONG" if side == 1 else "SHORT",
-                        "entry_price": format_float_2(entry_price),
-                        "quantity": format_float_2(qty),
-                        "entry_atr": format_float_2(state.active_atr),
-                        "margin_usd": format_float_2(state.entry_margin_usd),
-                        "leverage": state.entry_leverage,
-                        "tp_price": format_float_2(tp_price),
-                        "sl_price": format_float_2(sl_price),
-                        "tp_order_id": state.tp_order_id,
-                        "sl_algo_id": state.sl_algo_id,
-                    })
+                        tp_side = "SELL" if side == 1 else "BUY"
+                        tp_client_id = f"ATR_TP_{entry_close_ms or ''}"
+                        # Place TP as a resting limit to avoid taker fees when possible.
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            tp_order = limit_order(
+                                symbol=active_symbol,
+                                side=tp_side,
+                                quantity=qty_str,
+                                price=tp_price_str,
+                                client=client,
+                                client_order_id=tp_client_id,
+                                tick_size=filters["tick_size"],
+                                reduce_only=True,
+                            )
+                        else:
+                            tp_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "entry_fill_tp"})
+                        if tp_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "tp_order_rejected",
+                                "symbol": active_symbol,
+                                "tp_price": format_float_2(tp_price),
+                            })
+                        state.tp_order_id = tp_order.get("orderId") if tp_order else None
+                        state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
+                        state.tp_price = tp_price
+                        state.sl_price = sl_price
+
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
+                        # Compute limit price with offset for maker execution
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            sl_algo_order = algo_stop_limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                trigger_price=sl_price_str,
+                                price=sl_limit_price_str,
+                                client=client,
+                                client_order_id=sl_client_id,
+                                algo_type=cfg.algo_type,
+                                working_type=cfg.algo_working_type,
+                                price_protect=cfg.algo_price_protect,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_algo_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "entry_fill_sl"})
+                        if sl_algo_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "sl_algo_order_rejected",
+                                "symbol": active_symbol,
+                                "sl_price": format_float_2(sl_price),
+                            })
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
+                        state.sl_triggered = False
+                        state.sl_order_time = None
+                        state.entry_close_ms = None
+
+                        log_event(cfg.log_path, {
+                            "event": "entry_filled",
+                            "symbol": active_symbol,
+                            "order_id": order.get("orderId"),
+                            "side": "LONG" if side == 1 else "SHORT",
+                            "entry_price": format_float_2(entry_price),
+                            "quantity": format_float_2(qty),
+                            "entry_atr": format_float_2(state.active_atr),
+                            "margin_usd": format_float_2(state.entry_margin_usd),
+                            "leverage": state.entry_leverage,
+                            "tp_price": format_float_2(tp_price),
+                            "sl_price": format_float_2(sl_price),
+                            "tp_order_id": state.tp_order_id,
+                            "sl_algo_id": state.sl_algo_id,
+                        })
                 elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
                     log_event(cfg.log_path, {
                         "event": "entry_order_closed",
@@ -2437,6 +2795,9 @@ def run_live(cfg: LiveConfig) -> None:
                     state.entry_leverage = None
                     state.sl_algo_id = None
                     state.sl_algo_client_order_id = None
+                    state.trail_r_value = None
+                    state.trail_best_close_r = None
+                    state.trail_stop_r = None
                     state.active_symbol = None
                 else:
                     if state.entry_order_time and (time.time() - state.entry_order_time) > cfg.entry_order_timeout_seconds:
@@ -2461,62 +2822,105 @@ def run_live(cfg: LiveConfig) -> None:
                         state.entry_signal_ms = None
                         state.sl_algo_id = None
                         state.sl_algo_client_order_id = None
+                        state.trail_r_value = None
+                        state.trail_best_close_r = None
+                        state.trail_stop_r = None
                         state.active_symbol = None
 
+            tp_filled = False
             if active_symbol and not in_position and state.had_position:
-                tp_order = query_limit_order(
-                    client,
-                    active_symbol,
-                    order_id=state.tp_order_id,
-                ) if state.tp_order_id else None
-                sl_algo_order = query_algo_order(
-                    client,
-                    active_symbol,
-                    algo_id=state.sl_algo_id,
-                ) if state.sl_algo_id else None
-                sl_order = query_limit_order(
-                    client,
-                    active_symbol,
-                    order_id=state.sl_order_id,
-                ) if state.sl_order_id else None
-                tp_filled = limit_order_filled(tp_order)
-                sl_algo_executed = algo_order_executed(sl_algo_order)
-                sl_filled = limit_order_filled(sl_order)
-                sl_hit = sl_algo_executed or sl_filled
+                if cfg.use_trailing_stop:
+                    sl_algo_order = query_algo_order(
+                        client,
+                        active_symbol,
+                        algo_id=state.sl_algo_id,
+                    ) if state.sl_algo_id else None
+                    sl_order = query_limit_order(
+                        client,
+                        active_symbol,
+                        order_id=state.sl_order_id,
+                    ) if state.sl_order_id else None
+                    sl_algo_executed = algo_order_executed(sl_algo_order)
+                    sl_filled = limit_order_filled(sl_order)
+                    sl_hit = sl_algo_executed or sl_filled
 
-                if tp_filled and not sl_hit:
-                    exit_reason = "TP"
-                    exit_price = None
-                    if tp_order:
-                        try:
-                            exit_price = float(tp_order.get("avgPrice") or tp_order.get("price") or 0.0)
-                        except (TypeError, ValueError):
-                            exit_price = None
-                    if not exit_price:
-                        exit_price = state.tp_price
-                elif sl_hit and not tp_filled:
-                    exit_reason = "SL"
-                    exit_price = None
-                    if sl_filled and sl_order:
-                        try:
-                            exit_price = float(sl_order.get("avgPrice") or sl_order.get("price") or 0.0)
-                        except (TypeError, ValueError):
-                            exit_price = None
-                    if not exit_price and sl_algo_executed and sl_algo_order:
-                        try:
-                            exit_price = float(
-                                sl_algo_order.get("avgPrice")
-                                or sl_algo_order.get("price")
-                                or sl_algo_order.get("triggerPrice")
-                                or 0.0
-                            )
-                        except (TypeError, ValueError):
-                            exit_price = None
-                    if not exit_price:
-                        exit_price = state.sl_price
+                    if sl_hit:
+                        exit_reason = "SL"
+                        exit_price = None
+                        if sl_filled and sl_order:
+                            try:
+                                exit_price = float(sl_order.get("avgPrice") or sl_order.get("price") or 0.0)
+                            except (TypeError, ValueError):
+                                exit_price = None
+                        if not exit_price and sl_algo_executed and sl_algo_order:
+                            try:
+                                exit_price = float(
+                                    sl_algo_order.get("avgPrice")
+                                    or sl_algo_order.get("price")
+                                    or sl_algo_order.get("triggerPrice")
+                                    or 0.0
+                                )
+                            except (TypeError, ValueError):
+                                exit_price = None
+                        if not exit_price:
+                            exit_price = state.sl_price
+                    else:
+                        exit_reason = "EXIT"
+                        exit_price = None
                 else:
-                    exit_reason = "EXIT"
-                    exit_price = None
+                    tp_order = query_limit_order(
+                        client,
+                        active_symbol,
+                        order_id=state.tp_order_id,
+                    ) if state.tp_order_id else None
+                    sl_algo_order = query_algo_order(
+                        client,
+                        active_symbol,
+                        algo_id=state.sl_algo_id,
+                    ) if state.sl_algo_id else None
+                    sl_order = query_limit_order(
+                        client,
+                        active_symbol,
+                        order_id=state.sl_order_id,
+                    ) if state.sl_order_id else None
+                    tp_filled = limit_order_filled(tp_order)
+                    sl_algo_executed = algo_order_executed(sl_algo_order)
+                    sl_filled = limit_order_filled(sl_order)
+                    sl_hit = sl_algo_executed or sl_filled
+
+                    if tp_filled and not sl_hit:
+                        exit_reason = "TP"
+                        exit_price = None
+                        if tp_order:
+                            try:
+                                exit_price = float(tp_order.get("avgPrice") or tp_order.get("price") or 0.0)
+                            except (TypeError, ValueError):
+                                exit_price = None
+                        if not exit_price:
+                            exit_price = state.tp_price
+                    elif sl_hit and not tp_filled:
+                        exit_reason = "SL"
+                        exit_price = None
+                        if sl_filled and sl_order:
+                            try:
+                                exit_price = float(sl_order.get("avgPrice") or sl_order.get("price") or 0.0)
+                            except (TypeError, ValueError):
+                                exit_price = None
+                        if not exit_price and sl_algo_executed and sl_algo_order:
+                            try:
+                                exit_price = float(
+                                    sl_algo_order.get("avgPrice")
+                                    or sl_algo_order.get("price")
+                                    or sl_algo_order.get("triggerPrice")
+                                    or 0.0
+                                )
+                            except (TypeError, ValueError):
+                                exit_price = None
+                        if not exit_price:
+                            exit_price = state.sl_price
+                    else:
+                        exit_reason = "EXIT"
+                        exit_price = None
 
                 side_sign = state.entry_side or 0
                 pnl_net = None
@@ -2584,6 +2988,9 @@ def run_live(cfg: LiveConfig) -> None:
                 state.sl_algo_client_order_id = None
                 state.tp_price = None
                 state.sl_price = None
+                state.trail_r_value = None
+                state.trail_best_close_r = None
+                state.trail_stop_r = None
                 state.active_atr = None
                 state.pending_atr = None
                 state.entry_price = None
@@ -2614,6 +3021,9 @@ def run_live(cfg: LiveConfig) -> None:
                 state.sl_algo_client_order_id = None
                 state.tp_price = None
                 state.sl_price = None
+                state.trail_r_value = None
+                state.trail_best_close_r = None
+                state.trail_stop_r = None
                 state.active_atr = None
                 state.pending_atr = None
                 state.entry_price = None
@@ -2694,16 +3104,21 @@ def run_live(cfg: LiveConfig) -> None:
                                 close_price = ask if close_side == "SELL" else bid
                                 close_price_str = format_price_to_tick(close_price, tick_size, side=close_side, post_only=True)
                                 sl_client_id = f"ATR_SL_EXIT_{int(time.time())}"
-                                new_sl_order = limit_order(
-                                    symbol=active_symbol,
-                                    side=close_side,
-                                    quantity=close_qty_str,
-                                    price=close_price_str,
-                                    client=client,
-                                    client_order_id=sl_client_id,
-                                    tick_size=tick_size,
-                                    reduce_only=True,
-                                )
+                                # Verify position still exists before placing reduce-only order
+                                if has_open_position(client, active_symbol):
+                                    new_sl_order = limit_order(
+                                        symbol=active_symbol,
+                                        side=close_side,
+                                        quantity=close_qty_str,
+                                        price=close_price_str,
+                                        client=client,
+                                        client_order_id=sl_client_id,
+                                        tick_size=tick_size,
+                                        reduce_only=True,
+                                    )
+                                else:
+                                    new_sl_order = None
+                                    log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_exit"})
                                 state.sl_order_id = new_sl_order.get("orderId") if new_sl_order else None
                                 state.sl_client_order_id = (
                                     (new_sl_order.get("clientOrderId") if new_sl_order else None)
@@ -2728,7 +3143,10 @@ def run_live(cfg: LiveConfig) -> None:
                                 })
 
             # If in position and no exits placed, place them using current entryPrice
-            if in_position and active_symbol and (state.tp_order_id is None or state.sl_algo_id is None or state.sl_price is None):
+            if in_position and active_symbol and (
+                (cfg.use_trailing_stop and (state.sl_algo_id is None or state.sl_price is None))
+                or (not cfg.use_trailing_stop and (state.tp_order_id is None or state.sl_algo_id is None or state.sl_price is None))
+            ):
                 filters = filters_by_symbol[active_symbol]
                 side = 1 if position_amt > 0 else -1
                 entry_price = float(position.get("entryPrice", 0.0))
@@ -2743,64 +3161,144 @@ def run_live(cfg: LiveConfig) -> None:
                 state.entry_price = entry_price
                 state.entry_qty = qty
 
-                tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
-                tp_price_str = format_to_step(tp_price, filters["tick_size"])
-                sl_price_str = format_to_step(sl_price, filters["tick_size"])
                 qty_str = format_to_step(qty, filters["step_size"])
-                tp_side = "SELL" if side == 1 else "BUY"
 
-                if state.sl_price is None:
-                    state.sl_price = sl_price
+                if cfg.use_trailing_stop:
+                    state.tp_order_id = None
+                    state.tp_client_order_id = None
+                    state.tp_price = None
+                    if state.trail_r_value is None:
+                        state.trail_r_value = entry_atr * cfg.sl_atr_mult
+                    if state.trail_best_close_r is None:
+                        state.trail_best_close_r = 0.0
+                    if state.trail_stop_r is None:
+                        state.trail_stop_r = -1
+                    sl_price = compute_trailing_sl_price(
+                        entry_price,
+                        side,
+                        state.trail_r_value,
+                        state.trail_stop_r,
+                        cfg.trail_buffer_r,
+                    )
+                    sl_price_str = format_to_step(sl_price, filters["tick_size"])
+                    if state.sl_price is None:
+                        state.sl_price = sl_price
+                    if state.sl_algo_id is None and not state.sl_triggered:
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
+                        # Compute limit price with offset for maker execution
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            sl_algo_order = algo_stop_limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                trigger_price=sl_price_str,
+                                price=sl_limit_price_str,
+                                client=client,
+                                client_order_id=sl_client_id,
+                                algo_type=cfg.algo_type,
+                                working_type=cfg.algo_working_type,
+                                price_protect=cfg.algo_price_protect,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_algo_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_algo_recover_trailing"})
+                        if sl_algo_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "sl_algo_recover_rejected",
+                                "symbol": active_symbol,
+                                "sl_price": format_float_2(sl_price),
+                            })
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
+                else:
+                    tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
+                    tp_price_str = format_to_step(tp_price, filters["tick_size"])
+                    sl_price_str = format_to_step(sl_price, filters["tick_size"])
+                    tp_side = "SELL" if side == 1 else "BUY"
 
-                if state.sl_algo_id is None and not state.sl_triggered:
-                    sl_side = "SELL" if side == 1 else "BUY"
-                    sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
-                    sl_algo_order = algo_stop_limit_order(
-                        symbol=active_symbol,
-                        side=sl_side,
-                        quantity=qty_str,
-                        trigger_price=sl_price_str,
-                        price=sl_price_str,
-                        client=client,
-                        client_order_id=sl_client_id,
-                        algo_type=cfg.algo_type,
-                        working_type=cfg.algo_working_type,
-                        price_protect=cfg.algo_price_protect,
-                        reduce_only=True,
-                    )
-                    if sl_algo_order is None:
-                        log_event(cfg.log_path, {
-                            "event": "sl_algo_recover_rejected",
-                            "symbol": active_symbol,
-                            "sl_price": format_float_2(sl_price),
-                        })
-                    state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                    state.sl_algo_client_order_id = (
-                        _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                        or (sl_client_id if sl_algo_order else None)
-                    )
+                    if state.sl_price is None:
+                        state.sl_price = sl_price
 
-                if state.tp_order_id is None and not state.sl_triggered:
-                    tp_client_id = f"ATR_TP_RECOVER_{int(time.time())}"
-                    tp_order = limit_order(
-                        symbol=active_symbol,
-                        side=tp_side,
-                        quantity=qty_str,
-                        price=tp_price_str,
-                        client=client,
-                        client_order_id=tp_client_id,
-                        tick_size=filters["tick_size"],
-                        reduce_only=True,
-                    )
-                    if tp_order is None:
-                        log_event(cfg.log_path, {
-                            "event": "tp_order_rejected",
-                            "symbol": active_symbol,
-                            "tp_price": format_float_2(tp_price),
-                        })
-                    state.tp_order_id = tp_order.get("orderId") if tp_order else None
-                    state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
-                    state.tp_price = tp_price
+                    if state.sl_algo_id is None and not state.sl_triggered:
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
+                        # Compute limit price with offset for maker execution
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            sl_algo_order = algo_stop_limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                trigger_price=sl_price_str,
+                                price=sl_limit_price_str,
+                                client=client,
+                                client_order_id=sl_client_id,
+                                algo_type=cfg.algo_type,
+                                working_type=cfg.algo_working_type,
+                                price_protect=cfg.algo_price_protect,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_algo_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_algo_recover"})
+                        if sl_algo_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "sl_algo_recover_rejected",
+                                "symbol": active_symbol,
+                                "sl_price": format_float_2(sl_price),
+                            })
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
+
+                    if state.tp_order_id is None and not state.sl_triggered:
+                        tp_client_id = f"ATR_TP_RECOVER_{int(time.time())}"
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            tp_order = limit_order(
+                                symbol=active_symbol,
+                                side=tp_side,
+                                quantity=qty_str,
+                                price=tp_price_str,
+                                client=client,
+                                client_order_id=tp_client_id,
+                                tick_size=filters["tick_size"],
+                                reduce_only=True,
+                            )
+                        else:
+                            tp_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "tp_recover"})
+                        if tp_order is None:
+                            log_event(cfg.log_path, {
+                                "event": "tp_order_rejected",
+                                "symbol": active_symbol,
+                                "tp_price": format_float_2(tp_price),
+                            })
+                        state.tp_order_id = tp_order.get("orderId") if tp_order else None
+                        state.tp_client_order_id = (tp_order.get("clientOrderId") if tp_order else None) or (tp_client_id if tp_order else None)
+                        state.tp_price = tp_price
 
             active_symbol = state.active_symbol
             # New candle check / entry scan
@@ -2853,8 +3351,8 @@ def run_backtest() -> None:
     df = fetch_ohlcv_binance(
         symbol="BTC/USDT",
         timeframe="1m",
-        start_utc="2025-12-01 00:00:00",
-        end_utc="2026-01-08 00:00:00",
+        start_utc="2025-06-01 00:00:00",
+        end_utc="2026-01-09 00:00:00",
     )
     #
     # Option B: Load your own CSV (must contain datetime + OHLCV)
@@ -2865,17 +3363,7 @@ def run_backtest() -> None:
     # raise SystemExit("Uncomment a data source (ccxt fetch or CSV load) and run again.")
 
     # 2) Run backtest
-    cfg = BacktestConfig(
-        atr_len=14,
-        leverage=75.0,
-        initial_capital=100.0,
-        fee_rate=0.0000,
-        slippage=0.0000,
-        sl_atr_mult=1.00,
-        thr1=2.0,
-        thr2=2.0,
-        tp_atr_mult=2.00,
-    )
+    cfg = BacktestConfig()
 
     trades, df_bt, stats = backtest_atr_grinder(df, cfg)
 

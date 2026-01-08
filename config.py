@@ -38,12 +38,12 @@ class BacktestConfig:
     swing_resample_rule: str = "15min"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 10.0  # max leverage for dynamic sizing
-    min_leverage: float = 1.0
-    initial_capital: float = 400.0  # starting equity (margin cap per trade)
+    leverage: float = 75.0  # max leverage for dynamic sizing
+    min_leverage: float = 20.0
+    initial_capital: float = 100.0  # starting equity (margin cap per trade)
 
     # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 0.50
+    target_loss_usd: Optional[float] = 1.00
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -54,8 +54,12 @@ class BacktestConfig:
     thr2: float = 2.0
 
     # Risk/exit controls
-    tp_atr_mult: float = 2.0
+    tp_atr_mult: float = 2.5
     sl_atr_mult: float = 1.0
+    use_trailing_stop: bool = True
+    trail_gap_r: float = 1.5
+    trail_buffer_r: float = 0.05
+    sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
 
 
 @dataclass
@@ -84,6 +88,10 @@ class LiveConfig:
     # Risk/exit controls
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
+    use_trailing_stop: bool = True
+    trail_gap_r: float = 1.5
+    trail_buffer_r: float = 0.05
+    sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
