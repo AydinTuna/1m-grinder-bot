@@ -1,8 +1,11 @@
 """
-ATR-based 1-minute strategy (swing context + large body trigger, ATR-based SL + optional trailing stop)
+ATR-based strategy (swing context + large body trigger, ATR-based SL + optional trailing stop)
+
+Signal timeframe is configurable via signal_interval (default "1m", can be "15m", "1h", etc.)
+Execution uses 1s candles for precise entry/exit simulation in backtest.
 
 Rules:
-- Compute ATR (EMA) on 1m candles.
+- Compute ATR (EMA) on signal_interval candles.
 - Compute swing highs/lows (default: 15m resample, fractal/pivot left/right).
 - If candle body >= thr2*ATR and price is near a swing high/low:
   - Swing high: red => SHORT; green close below => SHORT; green close above => LONG (limit at mid-body)
@@ -2261,6 +2264,133 @@ def fetch_klines_spot(
     return df
 
 
+def fetch_klines_spot_parallel(
+    symbol: str,
+    interval: str,
+    start_utc: str,
+    end_utc: str,
+    *,
+    limit_per_call: int = 1000,
+    base_url: str = "https://api.binance.com",
+    max_workers: int = 15,
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles from Binance Spot in PARALLEL for much faster downloads.
+
+    For 1s data:
+    - Sequential: ~70 seconds per day
+    - Parallel (10 workers): ~7 seconds per day (~10x faster)
+
+    Args:
+        symbol: e.g. "BTCUSDC"
+        interval: e.g. "1s", "1m"
+        start_utc/end_utc: UTC strings, e.g. "2026-01-01 00:00:00"
+        max_workers: Number of parallel threads (default 10, safe for Binance rate limits)
+
+    Returns:
+        DataFrame indexed by UTC datetime with columns: open, high, low, close, volume, close_time_ms
+    """
+    import concurrent.futures
+    import urllib.request
+    import json
+
+    ca_bundle_path = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
+    ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
+    ssl_verify = ssl_verify_env not in {"0", "false", "no", "off"}
+
+    def build_ssl_context() -> ssl.SSLContext:
+        if not ssl_verify:
+            return ssl._create_unverified_context()
+        if ca_bundle_path:
+            return ssl.create_default_context(cafile=ca_bundle_path)
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    ssl_ctx = build_ssl_context()
+
+    start_ms = int(pd.Timestamp(start_utc, tz="UTC").timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end_utc, tz="UTC").timestamp() * 1000)
+
+    if end_ms < start_ms:
+        raise ValueError(f"end_utc must be >= start_utc. start_utc={start_utc!r} end_utc={end_utc!r}")
+
+    # Determine interval in milliseconds
+    interval_ms_map = {
+        "1s": 1000,
+        "1m": 60_000,
+        "3m": 180_000,
+        "5m": 300_000,
+        "15m": 900_000,
+        "30m": 1_800_000,
+        "1h": 3_600_000,
+        "4h": 14_400_000,
+        "1d": 86_400_000,
+    }
+    interval_ms = interval_ms_map.get(interval, 1000)
+    chunk_duration_ms = limit_per_call * interval_ms
+
+    # Create time chunks
+    chunks: List[Tuple[int, int]] = []
+    current_start = start_ms
+    while current_start < end_ms:
+        chunk_end = min(current_start + chunk_duration_ms - interval_ms, end_ms)
+        chunks.append((current_start, chunk_end))
+        current_start = chunk_end + interval_ms
+
+    logging.info(f"Fetching {interval} candles in parallel: {len(chunks)} chunks with {max_workers} workers")
+
+    def fetch_chunk(chunk_range: Tuple[int, int]) -> List[List[object]]:
+        chunk_start, chunk_end = chunk_range
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": chunk_start,
+            "endTime": chunk_end,
+            "limit": limit_per_call,
+        }
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{base_url}/api/v3/klines?{query}"
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))  # Backoff
+                else:
+                    logging.warning(f"Failed to fetch chunk {chunk_start}-{chunk_end}: {e}")
+                    return []
+
+    all_rows: List[List[object]] = []
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {executor.submit(fetch_chunk, chunk): chunk for chunk in chunks}
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            result = future.result()
+            if result:
+                all_rows.extend(result)
+            completed += 1
+            if completed % 50 == 0 or completed == len(chunks):
+                logging.info(f"Progress: {completed}/{len(chunks)} chunks ({len(all_rows):,} candles)")
+
+    if not all_rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "close_time_ms"])
+
+    df = klines_to_df(all_rows)
+    df = df[df.index <= pd.Timestamp(end_utc, tz="UTC")]
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+
+    logging.info(f"Fetched {len(df):,} {interval} candles from Spot API (parallel)")
+    return df
+
+
 def get_1s_candles_for_minute(
     df_1s: pd.DataFrame,
     minute_timestamp: pd.Timestamp,
@@ -2286,11 +2416,11 @@ def backtest_atr_grinder_lib(
     cfg: BacktestConfig,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], pd.DataFrame]:
     """
-    Look-Inside-Bar (LIB) Backtest using 1m candles for signals and 1s candles for execution.
+    Look-Inside-Bar (LIB) Backtest using signal_interval candles for signals and 1s candles for execution.
 
     This provides more realistic backtesting by:
     - Checking SL/TP hits in chronological order using 1s data
-    - Updating trailing stops on each 1s close (not just 1m close)
+    - Updating trailing stops on each 1s close (not just signal candle close)
     - Better determining limit order fills
 
     Returns:
@@ -3072,12 +3202,13 @@ def run_live(cfg: LiveConfig) -> None:
             current_leverage_by_symbol[sym] = None
 
     state = LiveState()
-    interval_ms = interval_to_ms(cfg.interval)
+    interval_ms = interval_to_ms(cfg.signal_interval)
     last_close_ms_by_symbol: Dict[str, Optional[int]] = {sym: None for sym in symbols}
     last_atr_by_symbol: Dict[str, Optional[float]] = {sym: None for sym in symbols}
     log_event(cfg.log_path, {
         "event": "startup",
         "symbols": symbols,
+        "signal_interval": cfg.signal_interval,
         "leverage": cfg.leverage,
         "margin_usd": format_float_2(cfg.margin_usd),
         "target_loss_usd": format_float_2(cfg.target_loss_usd),
@@ -3089,7 +3220,7 @@ def run_live(cfg: LiveConfig) -> None:
         if history > 1000:
             history = 1000
         try:
-            klines = client.klines(symbol=symbol, interval=cfg.interval, limit=history)
+            klines = client.klines(symbol=symbol, interval=cfg.signal_interval, limit=history)
         except ClientError as exc:
             log_event(
                 cfg.log_path,
@@ -4244,49 +4375,62 @@ def run_live(cfg: LiveConfig) -> None:
 # -----------------------------
 # Example usage
 # -----------------------------
-def run_backtest(use_lib: bool = True) -> None:
+def run_backtest(use_lib: bool = True, parallel_workers: int = 15) -> None:
     """
     Run backtest with optional Look-Inside-Bar (LIB) mode.
     
     Args:
         use_lib: If True, use 1s candles from Spot API for more realistic execution simulation.
                  If False, use original 1m-only backtest.
+        parallel_workers: Number of parallel threads for fetching 1s data (default 10).
+                         Use 1 for sequential fetching.
     """
     import time as time_module
     
     total_start = time_module.perf_counter()
     
     # Configuration
+    cfg = BacktestConfig()
     symbol_futures = "BTCUSDC"
     symbol_spot = "BTCUSDC"
-    start_utc = "2026-01-07 00:00:00"
-    end_utc = "2026-01-08 00:00:00"
+    start_utc = "2026-01-06 00:00:00"
+    end_utc = "2026-01-10 00:00:00"
     
-    # 1) Fetch 1m data from Futures (for signals)
-    print(f"Fetching 1m klines from Futures API...")
-    fetch_1m_start = time_module.perf_counter()
-    df_1m = fetch_klines_um_futures(
+    # 1) Fetch signal candles from Futures (for signals)
+    signal_interval = cfg.signal_interval
+    print(f"Fetching {signal_interval} klines from Futures API...")
+    fetch_signal_start = time_module.perf_counter()
+    df_signal = fetch_klines_um_futures(
         symbol=symbol_futures,
-        interval="1m",
+        interval=signal_interval,
         start_utc=start_utc,
         end_utc=end_utc,
     )
-    fetch_1m_time = time_module.perf_counter() - fetch_1m_start
-    print(f"Loaded {len(df_1m):,} 1m candles from Futures ({fetch_1m_time:.2f}s)")
-    
-    cfg = BacktestConfig()
+    fetch_signal_time = time_module.perf_counter() - fetch_signal_start
+    print(f"Loaded {len(df_signal):,} {signal_interval} candles from Futures ({fetch_signal_time:.2f}s)")
     
     fetch_1s_time = 0.0
     if use_lib:
         # 2) Fetch 1s data from Spot (for Look-Inside-Bar execution)
-        print(f"\nFetching 1s klines from Spot API (this may take a while)...")
-        fetch_1s_start = time_module.perf_counter()
-        df_1s = fetch_klines_spot(
-            symbol=symbol_spot,
-            interval="1s",
-            start_utc=start_utc,
-            end_utc=end_utc,
-        )
+        if parallel_workers > 1:
+            print(f"\nFetching 1s klines from Spot API (parallel with {parallel_workers} workers)...")
+            fetch_1s_start = time_module.perf_counter()
+            df_1s = fetch_klines_spot_parallel(
+                symbol=symbol_spot,
+                interval="1s",
+                start_utc=start_utc,
+                end_utc=end_utc,
+                max_workers=parallel_workers,
+            )
+        else:
+            print(f"\nFetching 1s klines from Spot API (sequential)...")
+            fetch_1s_start = time_module.perf_counter()
+            df_1s = fetch_klines_spot(
+                symbol=symbol_spot,
+                interval="1s",
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
         fetch_1s_time = time_module.perf_counter() - fetch_1s_start
         print(f"Loaded {len(df_1s):,} 1s candles from Spot ({fetch_1s_time:.2f}s)")
         
@@ -4296,13 +4440,13 @@ def run_backtest(use_lib: bool = True) -> None:
         # 3) Run LIB backtest
         print(f"\nRunning Look-Inside-Bar backtest...")
         backtest_start = time_module.perf_counter()
-        trades, df_bt, stats, trailing_df = backtest_atr_grinder_lib(df_1m, df_1s, cfg)
+        trades, df_bt, stats, trailing_df = backtest_atr_grinder_lib(df_signal, df_1s, cfg)
         backtest_time = time_module.perf_counter() - backtest_start
     else:
         # Original backtest (1m only)
-        print(f"\nRunning standard 1m backtest...")
+        print(f"\nRunning standard {signal_interval} backtest...")
         backtest_start = time_module.perf_counter()
-        trades, df_bt, stats, trailing_df = backtest_atr_grinder(df_1m, cfg)
+        trades, df_bt, stats, trailing_df = backtest_atr_grinder(df_signal, cfg)
         backtest_time = time_module.perf_counter() - backtest_start
 
     total_time = time_module.perf_counter() - total_start
@@ -4331,7 +4475,7 @@ def run_backtest(use_lib: bool = True) -> None:
     
     # Timing summary
     print(f"\n=== TIMING ===")
-    print(f"Fetch 1m data:  {fetch_1m_time:>8.2f}s")
+    print(f"Fetch {signal_interval} data: {fetch_signal_time:>8.2f}s")
     if use_lib:
         print(f"Fetch 1s data:  {fetch_1s_time:>8.2f}s")
     print(f"Backtest:       {backtest_time:>8.2f}s")
@@ -4346,13 +4490,19 @@ def main() -> None:
         action="store_true",
         help="Disable Look-Inside-Bar mode (use 1m-only backtest instead of 1s resolution)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=15,
+        help="Number of parallel workers for fetching 1s data (default: 15, use 1 for sequential)",
+    )
     args = parser.parse_args()
 
     if args.mode == "live":
         live_cfg = LiveConfig()
         run_live(live_cfg)
     else:
-        run_backtest(use_lib=not args.no_lib)
+        run_backtest(use_lib=not args.no_lib, parallel_workers=args.workers)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,10 @@ LIVE_TRADE_FIELDS: List[str] = [
 
 @dataclass
 class BacktestConfig:
+    # Timeframe for signal generation (ATR calculation, entry signals)
+    # Use "1m", "5m", "15m", "1h", etc. Execution still uses 1s candles.
+    signal_interval: str = "1m"
+    
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
@@ -40,10 +44,10 @@ class BacktestConfig:
     entry_limit_timeout_bars: int = 1
     leverage: float = 100.0  # max leverage for dynamic sizing
     min_leverage: float = 20.0
-    initial_capital: float = 50.0  # starting equity (margin cap per trade)
+    initial_capital: float = 200.0  # starting equity (margin cap per trade)
 
     # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 0.25
+    target_loss_usd: Optional[float] = 1.5
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -66,7 +70,9 @@ class BacktestConfig:
 class LiveConfig:
     symbol: str = "BTCUSDC"
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDC"])
-    interval: str = "1m"
+    # Timeframe for signal generation (ATR calculation, entry signals)
+    # Use "1m", "5m", "15m", "1h", etc. Price tracking uses poll_interval_seconds.
+    signal_interval: str = "1m"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
