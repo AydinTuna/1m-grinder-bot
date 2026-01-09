@@ -47,7 +47,7 @@ class BacktestConfig:
     initial_capital: float = 200.0  # starting equity (margin cap per trade)
 
     # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 1.5
+    target_loss_usd: Optional[float] = 1.25
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -84,8 +84,8 @@ class LiveConfig:
     atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
     leverage: int = 100  # max leverage for dynamic sizing
     min_leverage: int = 20
-    margin_usd: float = 50.0  # margin cap per trade if targets are set
-    target_loss_usd: Optional[float] = 0.25
+    margin_usd: float = 200.0  # margin cap per trade if targets are set
+    target_loss_usd: Optional[float] = 1.25
 
     # Strategy thresholds
     thr1: float = 2.0
@@ -95,7 +95,7 @@ class LiveConfig:
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
     use_trailing_stop: bool = True
-    trail_gap_r: float = 1.5
+    trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.05
     sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
 
