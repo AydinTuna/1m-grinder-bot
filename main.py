@@ -386,6 +386,10 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             if exited:
                 roi_net = net_roi_from_prices(entry_price, exit_price, position, active_leverage)
                 pnl_net = roi_net * active_margin
+                # Cap SL loss at target_loss_usd to match live exchange behavior
+                if exit_reason == "SL" and cfg.target_loss_usd is not None and pnl_net < -cfg.target_loss_usd:
+                    pnl_net = -cfg.target_loss_usd
+                    roi_net = pnl_net / active_margin if active_margin else roi_net
                 equity += pnl_net
 
                 trades.append({
@@ -900,6 +904,8 @@ class BinanceUMFuturesREST:
         *,
         recv_window_ms: int = 60_000,
         time_sync_interval_seconds: float = 30.0 * 60.0,
+        ssl_verify: bool = True,
+        ca_bundle_path: Optional[str] = None,
     ) -> None:
         self.key = key
         self.secret = secret
@@ -907,9 +913,34 @@ class BinanceUMFuturesREST:
         self.timeout_seconds = float(timeout_seconds)
         self.recv_window_ms = int(recv_window_ms)
         self.time_sync_interval_seconds = float(time_sync_interval_seconds)
+        self.ssl_verify = bool(ssl_verify)
+        self.ca_bundle_path = str(ca_bundle_path) if ca_bundle_path else None
         self.time_offset_ms = 0
         self._last_time_sync_monotonic: Optional[float] = None
         self._last_time_sync_attempt_monotonic: Optional[float] = None
+
+    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """
+        Build an SSL context for HTTPS requests.
+
+        Why: some environments (notably macOS + certain Python builds, or corporate proxies)
+        can fail certificate verification unless a CA bundle is explicitly provided.
+        """
+        if not self.ssl_verify:
+            return ssl._create_unverified_context()
+
+        # Explicit CA bundle wins.
+        if self.ca_bundle_path:
+            return ssl.create_default_context(cafile=self.ca_bundle_path)
+
+        # Otherwise, try certifi if installed.
+        try:
+            import certifi  # type: ignore
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            # Fall back to system defaults.
+            return ssl.create_default_context()
 
     @staticmethod
     def _clean_params(params: Dict[str, object]) -> Dict[str, object]:
@@ -990,7 +1021,8 @@ class BinanceUMFuturesREST:
             request.add_header("Content-Type", "application/json;charset=utf-8")
 
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                ctx = self._build_ssl_context()
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds, context=ctx) as response:
                     return response.read().decode("utf-8")
             except urllib.error.HTTPError as error:
                 try:
@@ -1172,6 +1204,11 @@ def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
     base_url = "https://fapi.binance.com"
     if cfg.use_testnet:
         base_url = "https://testnet.binancefuture.com"
+    ca_bundle_path = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
+    ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
+    ssl_verify = True
+    if ssl_verify_env in {"0", "false", "no", "off"}:
+        ssl_verify = False
     recv_window_ms = getenv("BINANCE_RECV_WINDOW_MS")
     time_sync_interval_seconds = getenv("BINANCE_TIME_SYNC_INTERVAL_SECONDS")
     recv_window_value = 60_000
@@ -1195,11 +1232,30 @@ def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
         base_url=base_url,
         recv_window_ms=recv_window_value,
         time_sync_interval_seconds=time_sync_interval_value,
+        ssl_verify=ssl_verify,
+        ca_bundle_path=ca_bundle_path,
     )
     try:
         client.sync_time()
     except Exception as exc:
         logging.warning("Binance time sync failed; signed requests may fail (-1021). error=%s", exc)
+    return client
+
+
+def get_um_futures_public_client(base_url: str = "https://fapi.binance.com") -> BinanceUMFuturesREST:
+    """
+    Return an unauthenticated UM Futures REST client for public endpoints (e.g. /fapi/v1/klines).
+
+    This intentionally does NOT require API keys, because public market data endpoints do not
+    need signed requests. Signed endpoints (orders/positions/etc) must still use
+    `get_um_futures_client()` in live trading.
+    """
+    ca_bundle_path = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
+    ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
+    ssl_verify = True
+    if ssl_verify_env in {"0", "false", "no", "off"}:
+        ssl_verify = False
+    client = BinanceUMFuturesREST(key="", secret="", base_url=base_url, ssl_verify=ssl_verify, ca_bundle_path=ca_bundle_path)
     return client
 
 
@@ -2025,6 +2081,793 @@ def klines_to_df(klines: List[List[object]]) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows).set_index("dt")
     return df
+
+
+def fetch_klines_um_futures(
+    symbol: str,
+    interval: str,
+    start_utc: Optional[str] = None,
+    end_utc: Optional[str] = None,
+    *,
+    limit_per_call: int = 1500,
+    base_url: str = "https://fapi.binance.com",
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles from Binance UM Futures public klines endpoint (/fapi/v1/klines).
+
+    - `symbol` example: "BTCUSDC"
+    - `interval` example: "1m"
+    - `start_utc`/`end_utc` are UTC strings, e.g. "2026-01-09 06:30:00"
+
+    Returns a DataFrame indexed by UTC datetime with columns:
+      open, high, low, close, volume, close_time_ms
+    """
+    client = get_um_futures_public_client(base_url=base_url)
+
+    if start_utc is None and end_utc is None:
+        klines = client.klines(symbol=symbol, interval=interval, limit=int(limit_per_call))
+        df = klines_to_df(klines)
+        return df[~df.index.duplicated(keep="first")].sort_index()
+
+    start_ms = int(pd.Timestamp(start_utc, tz="UTC").timestamp() * 1000) if start_utc else None
+    end_ms = int(pd.Timestamp(end_utc, tz="UTC").timestamp() * 1000) if end_utc else None
+
+    if start_ms is not None and end_ms is not None and end_ms < start_ms:
+        raise ValueError(f"end_utc must be >= start_utc. start_utc={start_utc!r} end_utc={end_utc!r}")
+
+    all_rows: List[List[object]] = []
+    since = start_ms
+    max_iters = 20000  # guardrail for unexpected pagination issues
+    iters = 0
+
+    while True:
+        iters += 1
+        if iters > max_iters:
+            raise RuntimeError("Exceeded max_iters while fetching UM futures klines; aborting to prevent infinite loop.")
+
+        payload: Dict[str, object] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": int(limit_per_call),
+        }
+        if since is not None:
+            payload["startTime"] = int(since)
+        if end_ms is not None:
+            payload["endTime"] = int(end_ms)
+
+        chunk = client.klines(**payload)
+        if not chunk:
+            break
+
+        all_rows.extend(chunk)
+        last_open_time_ms = int(chunk[-1][0])
+        since = last_open_time_ms + 1  # avoid repeating the last candle
+
+        if end_ms is not None and last_open_time_ms >= end_ms:
+            break
+
+        # If fewer than requested, we're likely at the end of available data for the query.
+        if len(chunk) < int(limit_per_call):
+            break
+
+    df = klines_to_df(all_rows)
+
+    # Trim strictly to end_utc if provided (by dt index).
+    if end_utc is not None:
+        df = df[df.index <= pd.Timestamp(end_utc, tz="UTC")]
+
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    return df
+
+
+def fetch_klines_spot(
+    symbol: str,
+    interval: str,
+    start_utc: Optional[str] = None,
+    end_utc: Optional[str] = None,
+    *,
+    limit_per_call: int = 1000,  # Spot API max is 1000
+    base_url: str = "https://api.binance.com",
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles from Binance Spot public klines endpoint (GET /api/v3/klines).
+
+    Supports 1s interval which is NOT available on Futures!
+
+    - `symbol` example: "BTCUSDC"
+    - `interval` example: "1s", "1m", "15m"
+    - `start_utc`/`end_utc` are UTC strings, e.g. "2026-01-09 06:30:00"
+
+    Returns a DataFrame indexed by UTC datetime with columns:
+      open, high, low, close, volume, close_time_ms
+    """
+    import urllib.request
+    import json
+
+    ca_bundle_path = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
+    ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
+    ssl_verify = ssl_verify_env not in {"0", "false", "no", "off"}
+
+    def build_ssl_context() -> ssl.SSLContext:
+        if not ssl_verify:
+            return ssl._create_unverified_context()
+        if ca_bundle_path:
+            return ssl.create_default_context(cafile=ca_bundle_path)
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    ssl_ctx = build_ssl_context()
+
+    def fetch_chunk(params: Dict[str, object]) -> List[List[object]]:
+        query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        url = f"{base_url}/api/v3/klines?{query}"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    start_ms = int(pd.Timestamp(start_utc, tz="UTC").timestamp() * 1000) if start_utc else None
+    end_ms = int(pd.Timestamp(end_utc, tz="UTC").timestamp() * 1000) if end_utc else None
+
+    if start_ms is not None and end_ms is not None and end_ms < start_ms:
+        raise ValueError(f"end_utc must be >= start_utc. start_utc={start_utc!r} end_utc={end_utc!r}")
+
+    all_rows: List[List[object]] = []
+    since = start_ms
+    max_iters = 500000  # 1s data can have many iterations
+    iters = 0
+
+    while True:
+        iters += 1
+        if iters > max_iters:
+            raise RuntimeError("Exceeded max_iters while fetching Spot klines; aborting.")
+
+        params: Dict[str, object] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": int(limit_per_call),
+        }
+        if since is not None:
+            params["startTime"] = int(since)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+
+        chunk = fetch_chunk(params)
+        if not chunk:
+            break
+
+        all_rows.extend(chunk)
+        last_open_time_ms = int(chunk[-1][0])
+        since = last_open_time_ms + 1
+
+        if end_ms is not None and last_open_time_ms >= end_ms:
+            break
+        if len(chunk) < int(limit_per_call):
+            break
+
+        # Progress logging for large fetches
+        if iters % 100 == 0:
+            logging.info(f"Fetching {interval} klines from Spot... {len(all_rows):,} candles so far")
+
+    df = klines_to_df(all_rows)
+
+    if end_utc is not None:
+        df = df[df.index <= pd.Timestamp(end_utc, tz="UTC")]
+
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    logging.info(f"Fetched {len(df):,} {interval} candles from Spot API")
+    return df
+
+
+def get_1s_candles_for_minute(
+    df_1s: pd.DataFrame,
+    minute_timestamp: pd.Timestamp,
+) -> pd.DataFrame:
+    """
+    Get the ~60 1s candles that fall within a 1-minute bar.
+
+    Args:
+        df_1s: DataFrame with 1s candles indexed by open time (UTC)
+        minute_timestamp: The open time of the 1m candle
+
+    Returns:
+        DataFrame slice with 1s candles for that minute
+    """
+    minute_end = minute_timestamp + pd.Timedelta(seconds=59, milliseconds=999)
+    mask = (df_1s.index >= minute_timestamp) & (df_1s.index <= minute_end)
+    return df_1s.loc[mask]
+
+
+def backtest_atr_grinder_lib(
+    df: pd.DataFrame,
+    df_1s: pd.DataFrame,
+    cfg: BacktestConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], pd.DataFrame]:
+    """
+    Look-Inside-Bar (LIB) Backtest using 1m candles for signals and 1s candles for execution.
+
+    This provides more realistic backtesting by:
+    - Checking SL/TP hits in chronological order using 1s data
+    - Updating trailing stops on each 1s close (not just 1m close)
+    - Better determining limit order fills
+
+    Returns:
+      trades_df: executed trades
+      df_bt: dataframe with indicators/signals/equity
+      stats: summary dict
+      trailing_df: trailing stop updates
+    """
+    df = df.copy().sort_index()
+    for col in ["open", "high", "low", "close"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    df["atr"] = atr_ema(df, cfg.atr_len)
+
+    swing_high, swing_low = compute_confirmed_swing_levels(
+        df,
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    df["swing_high_level"] = swing_high
+    df["swing_low_level"] = swing_low
+
+    df["signal"], df["signal_atr"], df["signal_entry_price"] = build_swing_atr_signals(
+        df,
+        df["atr"],
+        df["swing_high_level"],
+        df["swing_low_level"],
+        body_atr_mult=cfg.thr2,
+        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        tolerance_pct=cfg.signal_atr_tolerance_pct,
+    )
+
+    warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
+    if warmup_bars > 0:
+        warmup_idx = df.index[:warmup_bars]
+        df.loc[warmup_idx, "signal"] = 0
+        df.loc[warmup_idx, "signal_atr"] = np.nan
+        df.loc[warmup_idx, "signal_entry_price"] = np.nan
+
+    # Equity curve (USD)
+    equity = cfg.initial_capital
+    equity_series = pd.Series(np.nan, index=df.index, dtype=float)
+    equity_series.iloc[0] = equity
+
+    active_margin = cfg.initial_capital
+    active_leverage = cfg.leverage
+    active_notional = active_margin * active_leverage
+
+    position = 0  # +1 long, -1 short, 0 flat
+    entry_price = None
+    target_price = None
+    stop_price = None
+    trail_r_value: Optional[float] = None
+    trail_best_close_r: Optional[float] = None
+    trail_stop_r: Optional[int] = None
+    entry_time = None
+    entry_index = None
+    used_signal_atr = None
+    pending_side = 0  # +1 long limit, -1 short limit, 0 none
+    pending_limit_price = None
+    pending_signal_atr = None
+    pending_created_index = None
+
+    trades: List[Dict] = []
+    trailing_stop_updates: List[Dict] = []
+
+    idx = df.index.to_list()
+
+    def apply_slippage(price: float, side: int, is_entry: bool) -> float:
+        slip = cfg.slippage
+        if is_entry:
+            return price * (1 + slip) if side == 1 else price * (1 - slip)
+        else:
+            return price * (1 - slip) if side == 1 else price * (1 + slip)
+
+    def net_roi_from_prices(entry_p: float, exit_p: float, side: int, leverage: float) -> float:
+        underlying_ret = side * ((exit_p - entry_p) / entry_p)
+        gross_roi = underlying_ret * leverage
+        fee_cost = 2.0 * cfg.fee_rate * leverage
+        return gross_roi - fee_cost
+
+    def maybe_fill_limit_1s(side: int, limit_price: float, df_1s_chunk: pd.DataFrame) -> Tuple[Optional[float], Optional[pd.Timestamp]]:
+        """Check limit fill using 1s candles, returns (fill_price, fill_time)."""
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            o_ = float(candle_1s["open"])
+            h_ = float(candle_1s["high"])
+            l_ = float(candle_1s["low"])
+            if side == 1:
+                if o_ <= limit_price:
+                    return o_, t_1s
+                if l_ <= limit_price <= h_:
+                    return limit_price, t_1s
+            elif side == -1:
+                if o_ >= limit_price:
+                    return o_, t_1s
+                if l_ <= limit_price <= h_:
+                    return limit_price, t_1s
+        return None, None
+
+    def check_exit_lib(
+        pos: int,
+        sl_price: float,
+        tp_price: Optional[float],
+        df_1s_chunk: pd.DataFrame,
+        use_trailing: bool,
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp]]:
+        """Check for exit using 1s candles in chronological order."""
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            o = float(candle_1s["open"])
+            h = float(candle_1s["high"])
+            l = float(candle_1s["low"])
+
+            if pos == 1:  # LONG
+                # Gap down through stop
+                if o <= sl_price:
+                    exit_price = apply_slippage(o, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
+
+                sl_hit = l <= sl_price
+                tp_hit = (not use_trailing) and tp_price is not None and h >= tp_price
+
+                if sl_hit and tp_hit:
+                    # Both could be hit - use proximity to open
+                    dist_to_sl = o - sl_price
+                    dist_to_tp = tp_price - o
+                    if dist_to_sl <= dist_to_tp:
+                        exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    else:
+                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s
+                elif sl_hit:
+                    exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
+                elif tp_hit:
+                    exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    return True, "TP", exit_price, t_1s
+
+            else:  # SHORT
+                # Gap up through stop
+                if o >= sl_price:
+                    exit_price = apply_slippage(o, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
+
+                sl_hit = h >= sl_price
+                tp_hit = (not use_trailing) and tp_price is not None and l <= tp_price
+
+                if sl_hit and tp_hit:
+                    dist_to_sl = sl_price - o
+                    dist_to_tp = o - tp_price
+                    if dist_to_sl <= dist_to_tp:
+                        exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    else:
+                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s
+                elif sl_hit:
+                    exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
+                elif tp_hit:
+                    exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    return True, "TP", exit_price, t_1s
+
+        return False, None, None, None
+
+    def update_trailing_stop_lib(
+        pos: int,
+        entry_p: float,
+        r_value: float,
+        best_close_r: float,
+        stop_r: int,
+        sl_price: float,
+        df_1s_chunk: pd.DataFrame,
+        entry_t: pd.Timestamp,
+        side_str: str,
+    ) -> Tuple[float, float, int]:
+        """Update trailing stop using 1s closes."""
+        nonlocal trailing_stop_updates
+        current_best_r = best_close_r
+        current_stop_r = stop_r
+        current_sl_price = sl_price
+
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            c = float(candle_1s["close"])
+            close_r = compute_close_r(entry_p, c, pos, r_value)
+
+            if close_r is not None and close_r > current_best_r:
+                prev_best_r = current_best_r
+                prev_stop_r = current_stop_r
+                prev_sl_price = current_sl_price
+
+                current_best_r = close_r
+                next_stop_r = compute_trailing_stop_r(current_best_r, current_stop_r, cfg.trail_gap_r)
+
+                if next_stop_r > current_stop_r:
+                    new_sl_price = compute_trailing_sl_price(
+                        entry_p, pos, r_value, next_stop_r, cfg.trail_buffer_r
+                    )
+                    trailing_stop_updates.append({
+                        "timestamp": t_1s,
+                        "entry_time": entry_t,
+                        "side": side_str,
+                        "entry_price": entry_p,
+                        "close_price": c,
+                        "close_r": close_r,
+                        "prev_best_r": prev_best_r,
+                        "new_best_r": current_best_r,
+                        "prev_stop_r": prev_stop_r,
+                        "new_stop_r": next_stop_r,
+                        "prev_stop_price": prev_sl_price,
+                        "new_stop_price": new_sl_price,
+                        "r_value": r_value,
+                        "trail_gap_r": cfg.trail_gap_r,
+                        "trail_buffer_r": cfg.trail_buffer_r,
+                        "stop_moved": True,
+                        "lib_mode": True,
+                    })
+                    current_stop_r = next_stop_r
+                    current_sl_price = new_sl_price
+
+        return current_sl_price, current_best_r, current_stop_r
+
+    limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
+
+    for i in range(1, len(df)):
+        t = idx[i]
+        prev_t = idx[i - 1]
+
+        # Get 1s candles for this minute
+        df_1s_minute = get_1s_candles_for_minute(df_1s, t)
+        has_1s_data = len(df_1s_minute) > 0
+
+        # Fallback OHLC from 1m if no 1s data
+        o = float(df.at[t, "open"])
+        h = float(df.at[t, "high"])
+        l = float(df.at[t, "low"])
+
+        # --- EXIT logic using 1s data ---
+        if position != 0 and entry_price is not None and stop_price is not None:
+            exited = False
+            exit_reason = None
+            exit_price = None
+            exit_time = t
+
+            if has_1s_data:
+                # Update trailing stop using 1s closes FIRST
+                if cfg.use_trailing_stop and trail_r_value is not None and trail_best_close_r is not None and trail_stop_r is not None:
+                    side_str = "LONG" if position == 1 else "SHORT"
+                    stop_price, trail_best_close_r, trail_stop_r = update_trailing_stop_lib(
+                        position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
+                        stop_price, df_1s_minute, entry_time, side_str
+                    )
+
+                # Check exit using 1s candles
+                exited, exit_reason, exit_price, exit_time = check_exit_lib(
+                    position, stop_price, target_price, df_1s_minute, cfg.use_trailing_stop
+                )
+            else:
+                # Fallback to 1m OHLC (original logic)
+                sl_hit = (l <= stop_price) if position == 1 else (h >= stop_price)
+
+                if cfg.use_trailing_stop:
+                    if sl_hit:
+                        exit_reason = "SL"
+                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exited = True
+                else:
+                    if target_price is not None:
+                        tp_hit = (h >= target_price) if position == 1 else (l <= target_price)
+                    else:
+                        tp_hit = False
+
+                    if sl_hit and tp_hit:
+                        exit_reason = "SL"
+                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exited = True
+                    elif tp_hit:
+                        exit_reason = "TP"
+                        exit_price = apply_slippage(target_price, position, is_entry=False)
+                        exited = True
+                    elif sl_hit:
+                        exit_reason = "SL"
+                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exited = True
+
+            if exited:
+                roi_net = net_roi_from_prices(entry_price, exit_price, position, active_leverage)
+                pnl_net = roi_net * active_margin
+                # Cap SL loss at target_loss_usd to match live exchange behavior
+                if exit_reason == "SL" and cfg.target_loss_usd is not None and pnl_net < -cfg.target_loss_usd:
+                    pnl_net = -cfg.target_loss_usd
+                    roi_net = pnl_net / active_margin if active_margin else roi_net
+                equity += pnl_net
+
+                trades.append({
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "side": "LONG" if position == 1 else "SHORT",
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "signal_atr": used_signal_atr,
+                    "tp_atr_mult": cfg.tp_atr_mult,
+                    "sl_atr_mult": cfg.sl_atr_mult,
+                    "target_price": target_price,
+                    "stop_price": stop_price,
+                    "exit_reason": exit_reason,
+                    "roi_net": roi_net,
+                    "pnl_net": pnl_net,
+                    "margin_used": active_margin,
+                    "notional": active_notional,
+                    "equity_after": equity,
+                    "bars_held": i - (entry_index if entry_index is not None else i),
+                    "lib_mode": has_1s_data,
+                })
+
+                position = 0
+                entry_price = None
+                target_price = None
+                stop_price = None
+                trail_r_value = None
+                trail_best_close_r = None
+                trail_stop_r = None
+                entry_time = None
+                entry_index = None
+                used_signal_atr = None
+                active_margin = cfg.initial_capital
+                active_leverage = cfg.leverage
+                active_notional = active_margin * active_leverage
+
+        # --- Trailing stop update for 1m close (if no 1s data or using 1m fallback) ---
+        if (
+            not has_1s_data
+            and cfg.use_trailing_stop
+            and position != 0
+            and entry_price is not None
+            and stop_price is not None
+            and trail_r_value is not None
+            and trail_best_close_r is not None
+            and trail_stop_r is not None
+        ):
+            c = float(df.at[t, "close"])
+            close_r = compute_close_r(entry_price, c, position, trail_r_value)
+            if close_r is not None:
+                side_str = "LONG" if position == 1 else "SHORT"
+                prev_best_r = trail_best_close_r
+                prev_stop_r = trail_stop_r
+                prev_stop_price = stop_price
+
+                trail_best_close_r = max(trail_best_close_r, close_r)
+                next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+
+                if next_stop_r > trail_stop_r:
+                    new_stop_price = compute_trailing_sl_price(
+                        entry_price, position, trail_r_value, next_stop_r, cfg.trail_buffer_r
+                    )
+                    trailing_stop_updates.append({
+                        "timestamp": t,
+                        "entry_time": entry_time,
+                        "side": side_str,
+                        "entry_price": entry_price,
+                        "close_price": c,
+                        "close_r": close_r,
+                        "prev_best_r": prev_best_r,
+                        "new_best_r": trail_best_close_r,
+                        "prev_stop_r": prev_stop_r,
+                        "new_stop_r": next_stop_r,
+                        "prev_stop_price": prev_stop_price,
+                        "new_stop_price": new_stop_price,
+                        "r_value": trail_r_value,
+                        "trail_gap_r": cfg.trail_gap_r,
+                        "trail_buffer_r": cfg.trail_buffer_r,
+                        "stop_moved": True,
+                        "lib_mode": False,
+                    })
+                    trail_stop_r = next_stop_r
+                    stop_price = new_stop_price
+
+        # --- ENTRY logic ---
+        if position == 0:
+            if pending_side != 0 and pending_created_index is not None:
+                if (i - pending_created_index) >= limit_timeout_bars:
+                    pending_side = 0
+                    pending_limit_price = None
+                    pending_signal_atr = None
+                    pending_created_index = None
+
+            # Try to fill pending limit order using 1s data
+            if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
+                fill_raw = None
+                fill_time = t
+
+                if has_1s_data:
+                    fill_raw, fill_time = maybe_fill_limit_1s(int(pending_side), float(pending_limit_price), df_1s_minute)
+                else:
+                    # Fallback to 1m OHLC
+                    side = int(pending_side)
+                    if side == 1:
+                        if o <= pending_limit_price:
+                            fill_raw = o
+                        elif l <= pending_limit_price <= h:
+                            fill_raw = pending_limit_price
+                    elif side == -1:
+                        if o >= pending_limit_price:
+                            fill_raw = o
+                        elif l <= pending_limit_price <= h:
+                            fill_raw = pending_limit_price
+
+                if fill_raw is not None:
+                    side = int(pending_side)
+                    signal_atr_value = float(pending_signal_atr)
+                    entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
+
+                    trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                        entry_price=entry_price,
+                        atr_value=signal_atr_value,
+                        sl_atr_mult=cfg.sl_atr_mult,
+                        margin_cap=cfg.initial_capital,
+                        max_leverage=cfg.leverage,
+                        min_leverage=cfg.min_leverage,
+                        target_loss_usd=cfg.target_loss_usd,
+                    )
+                    if trade_margin is None or trade_leverage is None:
+                        pending_side = 0
+                        pending_limit_price = None
+                        pending_signal_atr = None
+                        pending_created_index = None
+                    else:
+                        if cfg.use_trailing_stop:
+                            target_price = None
+                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                            trail_best_close_r = 0.0
+                            trail_stop_r = -1
+                            stop_price = compute_trailing_sl_price(
+                                entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                            )
+                        else:
+                            target_price, stop_price = compute_tp_sl_prices(
+                                entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                            )
+
+                        position = side
+                        entry_time = fill_time if has_1s_data else t
+                        entry_index = i
+                        used_signal_atr = signal_atr_value
+                        active_margin = trade_margin
+                        active_leverage = trade_leverage
+                        active_notional = active_margin * active_leverage
+
+                        pending_side = 0
+                        pending_limit_price = None
+                        pending_signal_atr = None
+                        pending_created_index = None
+
+            # Check for new signal
+            if position == 0 and pending_side == 0:
+                prev_signal = int(df.at[prev_t, "signal"])
+                prev_signal_atr = df.at[prev_t, "signal_atr"]
+                prev_entry_price = df.at[prev_t, "signal_entry_price"]
+
+                if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
+                    side = prev_signal
+                    signal_atr_value = float(prev_signal_atr)
+
+                    if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)):
+                        pending_side = side
+                        pending_limit_price = float(prev_entry_price)
+                        pending_signal_atr = signal_atr_value
+                        pending_created_index = i
+
+                        fill_raw = None
+                        fill_time = t
+
+                        if has_1s_data:
+                            fill_raw, fill_time = maybe_fill_limit_1s(side, float(prev_entry_price), df_1s_minute)
+                        else:
+                            if side == 1:
+                                if o <= prev_entry_price:
+                                    fill_raw = o
+                                elif l <= prev_entry_price <= h:
+                                    fill_raw = prev_entry_price
+                            elif side == -1:
+                                if o >= prev_entry_price:
+                                    fill_raw = o
+                                elif l <= prev_entry_price <= h:
+                                    fill_raw = prev_entry_price
+
+                        if fill_raw is not None:
+                            entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
+
+                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                entry_price=entry_price,
+                                atr_value=signal_atr_value,
+                                sl_atr_mult=cfg.sl_atr_mult,
+                                margin_cap=cfg.initial_capital,
+                                max_leverage=cfg.leverage,
+                                min_leverage=cfg.min_leverage,
+                                target_loss_usd=cfg.target_loss_usd,
+                            )
+                            if trade_margin is None or trade_leverage is None:
+                                pending_side = 0
+                                pending_limit_price = None
+                                pending_signal_atr = None
+                                pending_created_index = None
+                            else:
+                                if cfg.use_trailing_stop:
+                                    target_price = None
+                                    trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                    trail_best_close_r = 0.0
+                                    trail_stop_r = -1
+                                    stop_price = compute_trailing_sl_price(
+                                        entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                                    )
+                                else:
+                                    target_price, stop_price = compute_tp_sl_prices(
+                                        entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                                    )
+
+                                position = side
+                                entry_time = fill_time if has_1s_data else t
+                                entry_index = i
+                                used_signal_atr = signal_atr_value
+                                active_margin = trade_margin
+                                active_leverage = trade_leverage
+                                active_notional = active_margin * active_leverage
+
+                                pending_side = 0
+                                pending_limit_price = None
+                                pending_signal_atr = None
+                                pending_created_index = None
+                    else:
+                        entry_price = apply_slippage(o, side, is_entry=True)
+
+                        trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                            entry_price=entry_price,
+                            atr_value=signal_atr_value,
+                            sl_atr_mult=cfg.sl_atr_mult,
+                            margin_cap=cfg.initial_capital,
+                            max_leverage=cfg.leverage,
+                            min_leverage=cfg.min_leverage,
+                            target_loss_usd=cfg.target_loss_usd,
+                        )
+                        if trade_margin is None or trade_leverage is None:
+                            continue
+
+                        if cfg.use_trailing_stop:
+                            target_price = None
+                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                            trail_best_close_r = 0.0
+                            trail_stop_r = -1
+                            stop_price = compute_trailing_sl_price(
+                                entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                            )
+                        else:
+                            target_price, stop_price = compute_tp_sl_prices(
+                                entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                            )
+
+                        position = side
+                        entry_time = t
+                        entry_index = i
+                        used_signal_atr = signal_atr_value
+                        active_margin = trade_margin
+                        active_leverage = trade_leverage
+                        active_notional = active_margin * active_leverage
+
+        equity_series.at[t] = equity
+
+    df["equity"] = equity_series.ffill()
+
+    trades_df = pd.DataFrame(trades)
+    trailing_df = pd.DataFrame(trailing_stop_updates)
+    stats = compute_stats(trades_df, df, cfg)
+
+    return trades_df, df, stats, trailing_df
 
 
 def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float], Optional[float]]:
@@ -3401,29 +4244,70 @@ def run_live(cfg: LiveConfig) -> None:
 # -----------------------------
 # Example usage
 # -----------------------------
-def run_backtest() -> None:
-    # 1) Get data
-    # Option A: Use Binance via ccxt (recommended)
-    df = fetch_ohlcv_binance(
-        symbol="BTC/USDT",
-        timeframe="1m",
-        start_utc="2025-05-01 00:00:00",
-        end_utc="2025-06-01 00:00:00",
+def run_backtest(use_lib: bool = True) -> None:
+    """
+    Run backtest with optional Look-Inside-Bar (LIB) mode.
+    
+    Args:
+        use_lib: If True, use 1s candles from Spot API for more realistic execution simulation.
+                 If False, use original 1m-only backtest.
+    """
+    import time as time_module
+    
+    total_start = time_module.perf_counter()
+    
+    # Configuration
+    symbol_futures = "BTCUSDC"
+    symbol_spot = "BTCUSDC"
+    start_utc = "2026-01-07 00:00:00"
+    end_utc = "2026-01-08 00:00:00"
+    
+    # 1) Fetch 1m data from Futures (for signals)
+    print(f"Fetching 1m klines from Futures API...")
+    fetch_1m_start = time_module.perf_counter()
+    df_1m = fetch_klines_um_futures(
+        symbol=symbol_futures,
+        interval="1m",
+        start_utc=start_utc,
+        end_utc=end_utc,
     )
-    #
-    # Option B: Load your own CSV (must contain datetime + OHLCV)
-    # df = pd.read_csv("btc_1m.csv", parse_dates=["dt"])
-    # df = df.set_index(pd.DatetimeIndex(df["dt"], tz="UTC")).drop(columns=["dt"])
-
-    # For demo without fetching, you must uncomment one option above.
-    # raise SystemExit("Uncomment a data source (ccxt fetch or CSV load) and run again.")
-
-    # 2) Run backtest
+    fetch_1m_time = time_module.perf_counter() - fetch_1m_start
+    print(f"Loaded {len(df_1m):,} 1m candles from Futures ({fetch_1m_time:.2f}s)")
+    
     cfg = BacktestConfig()
+    
+    fetch_1s_time = 0.0
+    if use_lib:
+        # 2) Fetch 1s data from Spot (for Look-Inside-Bar execution)
+        print(f"\nFetching 1s klines from Spot API (this may take a while)...")
+        fetch_1s_start = time_module.perf_counter()
+        df_1s = fetch_klines_spot(
+            symbol=symbol_spot,
+            interval="1s",
+            start_utc=start_utc,
+            end_utc=end_utc,
+        )
+        fetch_1s_time = time_module.perf_counter() - fetch_1s_start
+        print(f"Loaded {len(df_1s):,} 1s candles from Spot ({fetch_1s_time:.2f}s)")
+        
+        # Optional: Save 1s data to parquet for faster re-runs
+        # df_1s.to_parquet("btcusdc_1s_cache.parquet")
+        
+        # 3) Run LIB backtest
+        print(f"\nRunning Look-Inside-Bar backtest...")
+        backtest_start = time_module.perf_counter()
+        trades, df_bt, stats, trailing_df = backtest_atr_grinder_lib(df_1m, df_1s, cfg)
+        backtest_time = time_module.perf_counter() - backtest_start
+    else:
+        # Original backtest (1m only)
+        print(f"\nRunning standard 1m backtest...")
+        backtest_start = time_module.perf_counter()
+        trades, df_bt, stats, trailing_df = backtest_atr_grinder(df_1m, cfg)
+        backtest_time = time_module.perf_counter() - backtest_start
 
-    trades, df_bt, stats, trailing_df = backtest_atr_grinder(df, cfg)
+    total_time = time_module.perf_counter() - total_start
 
-    # 3) Output
+    # 4) Output
     print("\n=== STATS ===")
     for k, v in stats.items():
         print(f"{k}: {v}")
@@ -3437,18 +4321,38 @@ def run_backtest() -> None:
         print(f"\nSaved: trades.csv, backtest_series.csv, trailing_stops.csv ({len(trailing_df)} trailing stop updates)")
     else:
         print("\nSaved: trades.csv, backtest_series.csv")
+    
+    if use_lib:
+        # Show LIB-specific stats
+        if not trades.empty and "lib_mode" in trades.columns:
+            lib_trades = trades["lib_mode"].sum()
+            total_trades = len(trades)
+            print(f"\nLIB mode: {lib_trades}/{total_trades} trades executed with 1s resolution")
+    
+    # Timing summary
+    print(f"\n=== TIMING ===")
+    print(f"Fetch 1m data:  {fetch_1m_time:>8.2f}s")
+    if use_lib:
+        print(f"Fetch 1s data:  {fetch_1s_time:>8.2f}s")
+    print(f"Backtest:       {backtest_time:>8.2f}s")
+    print(f"Total:          {total_time:>8.2f}s")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ATR 1m strategy")
     parser.add_argument("--mode", choices=["backtest", "live"], default="backtest")
+    parser.add_argument(
+        "--no-lib",
+        action="store_true",
+        help="Disable Look-Inside-Bar mode (use 1m-only backtest instead of 1s resolution)",
+    )
     args = parser.parse_args()
 
     if args.mode == "live":
         live_cfg = LiveConfig()
         run_live(live_cfg)
     else:
-        run_backtest()
+        run_backtest(use_lib=not args.no_lib)
 
 
 if __name__ == "__main__":

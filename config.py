@@ -57,7 +57,7 @@ class BacktestConfig:
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
     use_trailing_stop: bool = True
-    trail_gap_r: float = 1.5
+    trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.05
     sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
 
