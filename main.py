@@ -1669,7 +1669,7 @@ def algo_stop_limit_order(
         "quantity": quantity,
         "triggerPrice": trigger_price,
         "price": price,
-        "timeInForce": "GTC",
+        "timeInForce": "GTX",  # Post-only: reject if would execute as taker (0 fees on USDC pairs)
         "workingType": working_type,
         "priceProtect": _bool_to_binance_flag(price_protect),
     }
@@ -3861,13 +3861,33 @@ def run_live(cfg: LiveConfig) -> None:
                                 state.sl_algo_id = None
                                 state.sl_algo_client_order_id = None
                                 
-                                # Software SL: only update sl_price for local monitoring (GTX maker orders)
-                                # Exchange algo SL: place conditional stop order (may execute as taker)
-                                if cfg.use_software_sl:
-                                    state.sl_price = next_sl_price_rounded
-                                    state.trail_stop_r = candidate_stop_r
+                                # Place GTX conditional stop order (maker-only, 0 fees on USDC)
+                                # If GTX is rejected when triggered, software SL chase will kick in
+                                sl_side = "SELL" if side_sign == 1 else "BUY"
+                                sl_client_id = f"ATR_SL_T_{close_time_ms}"
+                                sl_limit_price = compute_sl_limit_price(
+                                    next_sl_price_rounded,
+                                    side_sign,
+                                    state.active_atr or r_value,
+                                    cfg.sl_maker_offset_atr_mult,
+                                )
+                                sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                                sl_algo_order = algo_stop_limit_order(
+                                    symbol=symbol,
+                                    side=sl_side,
+                                    quantity=qty_str,
+                                    trigger_price=next_sl_price_str,
+                                    price=sl_limit_price_str,
+                                    client=client,
+                                    client_order_id=sl_client_id,
+                                    algo_type=cfg.algo_type,
+                                    working_type=cfg.algo_working_type,
+                                    price_protect=cfg.algo_price_protect,
+                                    reduce_only=True,
+                                )
+                                if sl_algo_order is None:
                                     log_event(cfg.log_path, {
-                                        "event": "sl_trail_update_software",
+                                        "event": "sl_trail_rejected",
                                         "symbol": symbol,
                                         "side": "LONG" if side_sign == 1 else "SHORT",
                                         "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
@@ -3875,55 +3895,22 @@ def run_live(cfg: LiveConfig) -> None:
                                         "best_close_r": format_float_2(state.trail_best_close_r),
                                     })
                                 else:
-                                    sl_side = "SELL" if side_sign == 1 else "BUY"
-                                    sl_client_id = f"ATR_SL_T_{close_time_ms}"
-                                    # Compute limit price with offset for maker execution
-                                    sl_limit_price = compute_sl_limit_price(
-                                        next_sl_price_rounded,
-                                        side_sign,
-                                        state.active_atr or r_value,
-                                        cfg.sl_maker_offset_atr_mult,
+                                    state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                                    state.sl_algo_client_order_id = (
+                                        _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                                        or sl_client_id
                                     )
-                                    sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
-                                    sl_algo_order = algo_stop_limit_order(
-                                        symbol=symbol,
-                                        side=sl_side,
-                                        quantity=qty_str,
-                                        trigger_price=next_sl_price_str,
-                                        price=sl_limit_price_str,
-                                        client=client,
-                                        client_order_id=sl_client_id,
-                                        algo_type=cfg.algo_type,
-                                        working_type=cfg.algo_working_type,
-                                        price_protect=cfg.algo_price_protect,
-                                        reduce_only=True,
-                                    )
-                                    if sl_algo_order is None:
-                                        log_event(cfg.log_path, {
-                                            "event": "sl_trail_rejected",
-                                            "symbol": symbol,
-                                            "side": "LONG" if side_sign == 1 else "SHORT",
-                                            "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
-                                            "stop_r": candidate_stop_r,
-                                            "best_close_r": format_float_2(state.trail_best_close_r),
-                                        })
-                                    else:
-                                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                                        state.sl_algo_client_order_id = (
-                                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                                            or sl_client_id
-                                        )
-                                        state.sl_price = next_sl_price_rounded
-                                        state.trail_stop_r = candidate_stop_r
-                                        log_event(cfg.log_path, {
-                                            "event": "sl_trail_update",
-                                            "symbol": symbol,
-                                            "side": "LONG" if side_sign == 1 else "SHORT",
-                                            "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
-                                            "stop_r": candidate_stop_r,
-                                            "best_close_r": format_float_2(state.trail_best_close_r),
-                                            "algo_id": state.sl_algo_id,
-                                        })
+                                state.sl_price = next_sl_price_rounded
+                                state.trail_stop_r = candidate_stop_r
+                                log_event(cfg.log_path, {
+                                    "event": "sl_trail_update",
+                                    "symbol": symbol,
+                                    "side": "LONG" if side_sign == 1 else "SHORT",
+                                    "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
+                                    "stop_r": candidate_stop_r,
+                                    "best_close_r": format_float_2(state.trail_best_close_r),
+                                    "algo_id": state.sl_algo_id,
+                                })
 
         if not allow_entry:
             return False
@@ -4205,51 +4192,41 @@ def run_live(cfg: LiveConfig) -> None:
                         sl_price_str = format_to_step(sl_price, filters["tick_size"])
                         state.sl_price = sl_price
 
-                        # Software SL: only track sl_price locally, no exchange algo order
-                        # Exchange algo SL: place conditional stop order (may execute as taker)
-                        if cfg.use_software_sl:
-                            state.sl_algo_id = None
-                            state.sl_algo_client_order_id = None
+                        # Place GTX conditional stop order (maker-only, 0 fees on USDC)
+                        # If GTX is rejected when triggered, software SL chase will kick in
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        sl_algo_order = algo_stop_limit_order(
+                            symbol=active_symbol,
+                            side=sl_side,
+                            quantity=qty_str,
+                            trigger_price=sl_price_str,
+                            price=sl_limit_price_str,
+                            client=client,
+                            client_order_id=sl_client_id,
+                            algo_type=cfg.algo_type,
+                            working_type=cfg.algo_working_type,
+                            price_protect=cfg.algo_price_protect,
+                            reduce_only=True,
+                        )
+                        if sl_algo_order is None:
                             log_event(cfg.log_path, {
-                                "event": "sl_software_set",
+                                "event": "sl_algo_order_rejected",
                                 "symbol": active_symbol,
                                 "sl_price": format_float_2(sl_price),
                             })
-                        else:
-                            sl_side = "SELL" if side == 1 else "BUY"
-                            sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
-                            # Compute limit price with offset for maker execution
-                            sl_limit_price = compute_sl_limit_price(
-                                sl_price,
-                                side,
-                                entry_atr,
-                                cfg.sl_maker_offset_atr_mult,
-                            )
-                            sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
-                            sl_algo_order = algo_stop_limit_order(
-                                symbol=active_symbol,
-                                side=sl_side,
-                                quantity=qty_str,
-                                trigger_price=sl_price_str,
-                                price=sl_limit_price_str,
-                                client=client,
-                                client_order_id=sl_client_id,
-                                algo_type=cfg.algo_type,
-                                working_type=cfg.algo_working_type,
-                                price_protect=cfg.algo_price_protect,
-                                reduce_only=True,
-                            )
-                            if sl_algo_order is None:
-                                log_event(cfg.log_path, {
-                                    "event": "sl_algo_order_rejected",
-                                    "symbol": active_symbol,
-                                    "sl_price": format_float_2(sl_price),
-                                })
-                            state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                            state.sl_algo_client_order_id = (
-                                _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                                or (sl_client_id if sl_algo_order else None)
-                            )
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
                         state.sl_order_id = None
                         state.sl_client_order_id = None
                         state.sl_triggered = False
@@ -4305,56 +4282,46 @@ def run_live(cfg: LiveConfig) -> None:
                         state.tp_price = tp_price
                         state.sl_price = sl_price
 
-                        # Software SL: only track sl_price locally, no exchange algo order
-                        # Exchange algo SL: place conditional stop order (may execute as taker)
-                        if cfg.use_software_sl:
-                            state.sl_algo_id = None
-                            state.sl_algo_client_order_id = None
+                        # Place GTX conditional stop order (maker-only, 0 fees on USDC)
+                        # If GTX is rejected when triggered, software SL chase will kick in
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
+                        sl_limit_price = compute_sl_limit_price(
+                            sl_price,
+                            side,
+                            entry_atr,
+                            cfg.sl_maker_offset_atr_mult,
+                        )
+                        sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                        # Verify position still exists before placing reduce-only order
+                        if has_open_position(client, active_symbol):
+                            sl_algo_order = algo_stop_limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                trigger_price=sl_price_str,
+                                price=sl_limit_price_str,
+                                client=client,
+                                client_order_id=sl_client_id,
+                                algo_type=cfg.algo_type,
+                                working_type=cfg.algo_working_type,
+                                price_protect=cfg.algo_price_protect,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_algo_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "entry_fill_sl"})
+                        if sl_algo_order is None:
                             log_event(cfg.log_path, {
-                                "event": "sl_software_set",
+                                "event": "sl_algo_order_rejected",
                                 "symbol": active_symbol,
                                 "sl_price": format_float_2(sl_price),
                             })
-                        else:
-                            sl_side = "SELL" if side == 1 else "BUY"
-                            sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
-                            # Compute limit price with offset for maker execution
-                            sl_limit_price = compute_sl_limit_price(
-                                sl_price,
-                                side,
-                                entry_atr,
-                                cfg.sl_maker_offset_atr_mult,
-                            )
-                            sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
-                            # Verify position still exists before placing reduce-only order
-                            if has_open_position(client, active_symbol):
-                                sl_algo_order = algo_stop_limit_order(
-                                    symbol=active_symbol,
-                                    side=sl_side,
-                                    quantity=qty_str,
-                                    trigger_price=sl_price_str,
-                                    price=sl_limit_price_str,
-                                    client=client,
-                                    client_order_id=sl_client_id,
-                                    algo_type=cfg.algo_type,
-                                    working_type=cfg.algo_working_type,
-                                    price_protect=cfg.algo_price_protect,
-                                    reduce_only=True,
-                                )
-                            else:
-                                sl_algo_order = None
-                                log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "entry_fill_sl"})
-                            if sl_algo_order is None:
-                                log_event(cfg.log_path, {
-                                    "event": "sl_algo_order_rejected",
-                                    "symbol": active_symbol,
-                                    "sl_price": format_float_2(sl_price),
-                                })
-                            state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                            state.sl_algo_client_order_id = (
-                                _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                                or (sl_client_id if sl_algo_order else None)
-                            )
+                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                        state.sl_algo_client_order_id = (
+                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                            or (sl_client_id if sl_algo_order else None)
+                        )
                         state.sl_order_id = None
                         state.sl_client_order_id = None
                         state.sl_triggered = False
@@ -4651,6 +4618,46 @@ def run_live(cfg: LiveConfig) -> None:
                         state.tp_order_id = None
                         state.tp_client_order_id = None
 
+                # Check if GTX algo stop was rejected/expired (price moved too fast)
+                # If so, clear algo_id to activate software SL chase
+                if state.sl_algo_id is not None and not state.sl_triggered:
+                    sl_algo_order = query_algo_order(client, active_symbol, algo_id=state.sl_algo_id)
+                    if sl_algo_order:
+                        algo_status = str(sl_algo_order.get("status", "")).upper()
+                        # GTX rejection shows as EXPIRED or REJECTED when triggered but couldn't fill as maker
+                        if algo_status in {"EXPIRED", "REJECTED"}:
+                            state.sl_triggered = True
+                            state.sl_algo_id = None
+                            state.sl_algo_client_order_id = None
+                            log_event(cfg.log_path, {
+                                "event": "sl_gtx_rejected_fallback",
+                                "symbol": active_symbol,
+                                "side": "LONG" if position_amt > 0 else "SHORT",
+                                "algo_status": algo_status,
+                                "sl_price": format_float_by_symbol(float(state.sl_price or 0), active_symbol),
+                                "bid": format_float_by_symbol(bid, active_symbol),
+                                "ask": format_float_by_symbol(ask, active_symbol),
+                            })
+                
+                # Safety: If price crossed stop but algo order hasn't triggered/executed yet,
+                # cancel algo order and switch to software SL for immediate execution
+                if state.sl_algo_id is not None and not state.sl_triggered and state.sl_price is not None and bid > 0 and ask > 0:
+                    stop_price = float(state.sl_price)
+                    stop_hit = (bid <= stop_price) if position_amt > 0 else (ask >= stop_price)
+                    if stop_hit:
+                        cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
+                        state.sl_algo_id = None
+                        state.sl_algo_client_order_id = None
+                        state.sl_triggered = True
+                        log_event(cfg.log_path, {
+                            "event": "sl_price_hit_cancel_algo",
+                            "symbol": active_symbol,
+                            "side": "LONG" if position_amt > 0 else "SHORT",
+                            "stop_price": format_float_by_symbol(stop_price, active_symbol),
+                            "bid": format_float_by_symbol(bid, active_symbol),
+                            "ask": format_float_by_symbol(ask, active_symbol),
+                        })
+
                 if state.sl_algo_id is None:
                     sl_order = None
                     if state.sl_order_id:
@@ -4819,11 +4826,11 @@ def run_live(cfg: LiveConfig) -> None:
                     sl_price_str = format_to_step(sl_price, filters["tick_size"])
                     if state.sl_price is None:
                         state.sl_price = sl_price
-                    # Software SL: no exchange algo order needed, just track sl_price locally
-                    if not cfg.use_software_sl and state.sl_algo_id is None and not state.sl_triggered:
+                    # Place GTX conditional stop order if not already placed
+                    # If GTX is rejected when triggered, software SL chase will kick in
+                    if state.sl_algo_id is None and not state.sl_triggered:
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
-                        # Compute limit price with offset for maker execution
                         sl_limit_price = compute_sl_limit_price(
                             sl_price,
                             side,
@@ -4869,11 +4876,11 @@ def run_live(cfg: LiveConfig) -> None:
                     if state.sl_price is None:
                         state.sl_price = sl_price
 
-                    # Software SL: no exchange algo order needed, just track sl_price locally
-                    if not cfg.use_software_sl and state.sl_algo_id is None and not state.sl_triggered:
+                    # Place GTX conditional stop order if not already placed
+                    # If GTX is rejected when triggered, software SL chase will kick in
+                    if state.sl_algo_id is None and not state.sl_triggered:
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
-                        # Compute limit price with offset for maker execution
                         sl_limit_price = compute_sl_limit_price(
                             sl_price,
                             side,

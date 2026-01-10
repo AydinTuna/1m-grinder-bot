@@ -36,10 +36,10 @@ class BacktestConfig:
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
-    swing_timeframe: str = "5m"
-    swing_left: int = 2
-    swing_right: int = 2
-    swing_resample_rule: str = "5min"
+    swing_timeframe: str = "1m"
+    swing_left: int = 45
+    swing_right: int = 45
+    swing_resample_rule: str = "1min"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
     leverage: float = 100.0  # max leverage for dynamic sizing
@@ -99,7 +99,6 @@ class LiveConfig:
     trail_buffer_r: float = 0.05
     sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
     sl_chase_interval_seconds: float = 0.5  # reprice unfilled SL limit orders to chase price (maker only)
-    use_software_sl: bool = True  # True: monitor SL in code and use GTX maker orders (0 fees on USDC). False: use exchange algo stop orders (taker fees)
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
