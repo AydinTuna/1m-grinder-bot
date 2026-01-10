@@ -33,14 +33,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import logging
 import math
 import os
 from os import getenv
+from pathlib import Path
 import random
 import socket
 import ssl
@@ -48,10 +51,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Iterable, Optional, Tuple, List, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -2086,6 +2090,502 @@ def klines_to_df(klines: List[List[object]]) -> pd.DataFrame:
     return df
 
 
+def load_klines_from_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Load kline data from a CSV file (e.g., from kline_data_fetcher.py or Binance public data).
+
+    Expected CSV columns (standard Binance kline format):
+        open_time_ms, open, high, low, close, volume, close_time_ms, ...
+
+    Returns a DataFrame indexed by UTC datetime with columns:
+        open, high, low, close, volume, close_time_ms
+    """
+    df = pd.read_csv(csv_path)
+
+    # Get timestamp column
+    if "open_time_ms" in df.columns:
+        ts_col = df["open_time_ms"]
+    elif df.columns[0] in {"open_time", "timestamp"}:
+        ts_col = df.iloc[:, 0]
+    else:
+        ts_col = df.iloc[:, 0]
+    
+    # Validate timestamps before conversion (filter out corrupted data)
+    # Valid range: 2010-01-01 to 2100-01-01 in milliseconds
+    MIN_VALID_MS = 1262304000000  # 2010-01-01 00:00:00 UTC
+    MAX_VALID_MS = 4102444800000  # 2100-01-01 00:00:00 UTC
+    
+    ts_numeric = pd.to_numeric(ts_col, errors="coerce")
+    valid_mask = (ts_numeric >= MIN_VALID_MS) & (ts_numeric <= MAX_VALID_MS) & ts_numeric.notna()
+    
+    invalid_count = (~valid_mask).sum()
+    if invalid_count > 0:
+        logging.warning(f"Filtered {invalid_count:,} rows with invalid timestamps from {csv_path}")
+        df = df[valid_mask].copy()
+        ts_col = ts_numeric[valid_mask]
+    
+    if df.empty:
+        raise ValueError(f"CSV file has no valid data after filtering: {csv_path}")
+    
+    # Convert to datetime
+    df["dt"] = pd.to_datetime(ts_col, unit="ms", utc=True)
+
+    df = df.set_index("dt")
+
+    # Ensure required columns exist and convert to proper types
+    required_cols = ["open", "high", "low", "close", "volume"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"CSV missing required column: {col}")
+        df[col] = df[col].astype(float)
+
+    # close_time_ms is optional but useful
+    if "close_time_ms" in df.columns:
+        df["close_time_ms"] = df["close_time_ms"].astype(int)
+    else:
+        # Estimate close_time_ms if not present (assume 1s interval as fallback)
+        df["close_time_ms"] = (df.index.astype(np.int64) // 1_000_000) + 999
+
+    # Keep only required columns
+    df = df[["open", "high", "low", "close", "volume", "close_time_ms"]]
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+
+    logging.info(f"Loaded {len(df):,} candles from CSV: {csv_path}")
+    return df
+
+
+def resample_1s_to_interval(df_1s: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Resample 1s candle data to a larger interval (e.g., "1m", "5m", "15m").
+
+    Args:
+        df_1s: DataFrame with 1s candles (open, high, low, close, volume, close_time_ms)
+        interval: Target interval string (e.g., "1m", "5m", "15m", "1h")
+
+    Returns:
+        DataFrame resampled to the target interval with proper OHLCV aggregation.
+    """
+    # Map interval string to pandas resample rule
+    interval_map = {
+        "1s": "1s",
+        "1m": "1min",
+        "3m": "3min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "6h": "6h",
+        "8h": "8h",
+        "12h": "12h",
+        "1d": "1D",
+    }
+
+    resample_rule = interval_map.get(interval)
+    if resample_rule is None:
+        raise ValueError(f"Unsupported interval for resampling: {interval}")
+
+    if interval == "1s":
+        # No resampling needed
+        return df_1s.copy()
+
+    # Resample with proper OHLCV aggregation
+    df_resampled = df_1s.resample(resample_rule, label="left", closed="left").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+        "close_time_ms": "last",
+    }).dropna()
+
+    logging.info(f"Resampled {len(df_1s):,} 1s candles to {len(df_resampled):,} {interval} candles")
+    return df_resampled
+
+
+# -----------------------------
+# Binance Public Data Fetching (data.binance.vision)
+# -----------------------------
+KLINE_DATA_DIR = Path(__file__).parent / "kline_data"
+PUBLIC_DATA_BASE = "https://data.binance.vision"
+SPOT_REST_BASE = "https://api.binance.com"
+FUTURES_REST_BASE = "https://fapi.binance.com"
+
+KLINE_CSV_HEADER = [
+    "open_time_ms", "open", "high", "low", "close", "volume",
+    "close_time_ms", "quote_asset_volume", "number_of_trades",
+    "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
+]
+
+
+def _parse_date(s: str) -> dt.date:
+    """Parse YYYY-MM-DD string to date object."""
+    return dt.datetime.strptime(s.split()[0], "%Y-%m-%d").date()
+
+
+def _daterange_inclusive(start: dt.date, end: dt.date) -> Iterable[dt.date]:
+    """Generate dates from start to end (inclusive)."""
+    d = start
+    while d <= end:
+        yield d
+        d += dt.timedelta(days=1)
+
+
+def _date_to_ms_utc(d: dt.date) -> int:
+    """Convert date to milliseconds UTC (start of day)."""
+    dttm = dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc)
+    return int(dttm.timestamp() * 1000)
+
+
+def _interval_to_ms_public(interval: str) -> int:
+    """Convert interval string to milliseconds."""
+    unit = interval[-1]
+    num = int(interval[:-1])
+    if unit == "s":
+        return num * 1000
+    if unit == "m":
+        return num * 60_000
+    if unit == "h":
+        return num * 3_600_000
+    if unit == "d":
+        return num * 86_400_000
+    raise ValueError(f"Unsupported interval: {interval}")
+
+
+def _public_daily_zip_url(symbol: str, interval: str, day: dt.date, market: str = "spot") -> str:
+    """Build URL for Binance public daily kline zip file.
+    
+    Args:
+        symbol: Trading pair (e.g., "BTCUSDC")
+        interval: Kline interval (e.g., "1s", "1m")
+        day: Date for the daily file
+        market: "spot" or "futures" (UM perpetual)
+    """
+    if market == "futures":
+        # UM Futures path: /data/futures/um/daily/klines/
+        return (
+            f"{PUBLIC_DATA_BASE}/data/futures/um/daily/klines/{symbol}/{interval}/"
+            f"{symbol}-{interval}-{day.isoformat()}.zip"
+        )
+    else:
+        # Spot path: /data/spot/daily/klines/
+        return (
+            f"{PUBLIC_DATA_BASE}/data/spot/daily/klines/{symbol}/{interval}/"
+            f"{symbol}-{interval}-{day.isoformat()}.zip"
+        )
+
+
+def _build_ssl_context_public() -> ssl.SSLContext:
+    """
+    Build SSL context for public data fetching.
+    
+    Handles macOS certificate issues by trying certifi first,
+    then falling back to system defaults or unverified context.
+    """
+    # Check environment variables for custom CA bundle
+    ca_bundle = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
+    ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
+    
+    # If explicitly disabled
+    if ssl_verify_env in {"0", "false", "no", "off"}:
+        return ssl._create_unverified_context()
+    
+    # Try explicit CA bundle
+    if ca_bundle:
+        try:
+            return ssl.create_default_context(cafile=ca_bundle)
+        except Exception:
+            pass
+    
+    # Try certifi (commonly installed, fixes macOS issues)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    
+    # Fall back to system defaults
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        # Last resort: unverified context
+        return ssl._create_unverified_context()
+
+
+# Cache the SSL context (built once per process)
+_PUBLIC_SSL_CONTEXT: Optional[ssl.SSLContext] = None
+
+
+def _get_ssl_context() -> ssl.SSLContext:
+    """Get cached SSL context for public data fetching."""
+    global _PUBLIC_SSL_CONTEXT
+    if _PUBLIC_SSL_CONTEXT is None:
+        _PUBLIC_SSL_CONTEXT = _build_ssl_context_public()
+    return _PUBLIC_SSL_CONTEXT
+
+
+def _fetch_public_day_zip(
+    symbol: str,
+    interval: str,
+    day: dt.date,
+    timeout: int = 60,
+    market: str = "spot",
+) -> Optional[List[List[str]]]:
+    """
+    Fetch daily kline data from Binance public data (data.binance.vision).
+    Returns list of kline rows if successful, None if 404.
+    
+    Args:
+        market: "spot" or "futures" (UM perpetual)
+    """
+    url = _public_daily_zip_url(symbol, interval, day, market=market)
+    ssl_ctx = _get_ssl_context()
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+            zdata = io.BytesIO(resp.read())
+            with zipfile.ZipFile(zdata) as zf:
+                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csv_names:
+                    raise RuntimeError(f"Zip from {url} had no CSV files inside.")
+                with zf.open(csv_names[0], "r") as f:
+                    text = io.TextIOWrapper(f, encoding="utf-8")
+                    reader = csv.reader(text)
+                    # Filter out header rows (first element should be numeric timestamp)
+                    rows = []
+                    for row in reader:
+                        if row and row[0].isdigit():
+                            rows.append(row)
+                    return rows
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def _fetch_rest_klines_chunk(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    timeout: int = 30,
+    market: str = "spot",
+) -> List[List[str]]:
+    """Fetch klines from Binance REST API for a single chunk.
+    
+    Args:
+        market: "spot" or "futures" (UM perpetual)
+    """
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": limit,
+    }
+    query = urllib.parse.urlencode(params)
+    if market == "futures":
+        url = f"{FUTURES_REST_BASE}/fapi/v1/klines?{query}"
+    else:
+        url = f"{SPOT_REST_BASE}/api/v3/klines?{query}"
+    ssl_ctx = _get_ssl_context()
+    
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [[str(x) for x in k] for k in data]
+    except urllib.error.HTTPError as e:
+        logging.warning(f"REST API error {e.code} for {url[:100]}...")
+        return []
+    except Exception as e:
+        logging.warning(f"REST API exception: {e}")
+        return []
+
+
+def _fetch_rest_day(
+    symbol: str,
+    interval: str,
+    day: dt.date,
+    polite_sleep_s: float = 0.2,
+    market: str = "spot",
+) -> List[List[str]]:
+    """Fetch a full day of klines via REST API with pagination.
+    
+    Args:
+        market: "spot" or "futures" (UM perpetual)
+    """
+    day_start_ms = _date_to_ms_utc(day)
+    day_end_ms = _date_to_ms_utc(day + dt.timedelta(days=1))
+    interval_ms = _interval_to_ms_public(interval)
+    
+    all_rows: List[List[str]] = []
+    cur = day_start_ms
+    
+    while cur < day_end_ms:
+        chunk = _fetch_rest_klines_chunk(
+            symbol=symbol,
+            interval=interval,
+            start_ms=cur,
+            end_ms=day_end_ms,
+            limit=1000,
+            market=market,
+        )
+        if not chunk:
+            break
+        
+        all_rows.extend(chunk)
+        last_open = int(chunk[-1][0])
+        cur = last_open + interval_ms
+        
+        if len(chunk) < 1000:
+            break
+        
+        time.sleep(polite_sleep_s)
+    
+    return all_rows
+
+
+def fetch_klines_public_data(
+    symbol: str,
+    interval: str,
+    start_date: str,
+    end_date: str,
+    *,
+    save_csv: bool = True,
+    force_refetch: bool = False,
+    market: str = "spot",
+) -> pd.DataFrame:
+    """
+    Fetch klines from Binance Public Data (data.binance.vision) with REST API fallback.
+    
+    Uses daily zip files from public data when available, falls back to REST API
+    for recent days or missing data.
+    
+    Args:
+        symbol: Trading pair (e.g., "BTCUSDC")
+        interval: Kline interval (e.g., "1s", "1m")
+        start_date: Start date string "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+        end_date: End date string "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+        save_csv: If True, save to kline_data/ folder for caching
+        force_refetch: If True, ignore cached CSV and refetch
+        market: "spot" or "futures" (UM perpetual). Note: 1s interval only available on spot.
+    
+    Returns:
+        DataFrame indexed by UTC datetime with OHLCV columns
+    """
+    symbol = symbol.upper()
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    
+    if end < start:
+        raise ValueError(f"end_date must be >= start_date: {start_date} to {end_date}")
+    
+    # Check for cached CSV (include market in filename to differentiate)
+    market_suffix = "_futures" if market == "futures" else ""
+    csv_filename = f"{symbol}_{interval}_{start.isoformat()}_to_{end.isoformat()}{market_suffix}.csv"
+    csv_path = KLINE_DATA_DIR / csv_filename
+    
+    if csv_path.exists() and not force_refetch:
+        print(f"Loading cached data from: {csv_path}")
+        return load_klines_from_csv(str(csv_path))
+    
+    # Ensure kline_data directory exists
+    KLINE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    market_label = "futures" if market == "futures" else "spot"
+    print(f"Fetching {interval} klines for {symbol} ({market_label}) from {start} to {end}...")
+    
+    combined_rows: List[List[str]] = []
+    public_ok = 0
+    public_missing = 0
+    rest_rows = 0
+    
+    total_days = (end - start).days + 1
+    
+    for i, day in enumerate(_daterange_inclusive(start, end)):
+        # Progress update
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"  Processing day {i + 1}/{total_days}: {day}")
+        
+        # Try public data first
+        try:
+            rows = _fetch_public_day_zip(symbol, interval, day, market=market)
+        except Exception as e:
+            logging.warning(f"Public data error for {day}: {e}. Falling back to REST.")
+            rows = None
+        
+        if rows is None:
+            public_missing += 1
+            # REST API fallback
+            try:
+                rows = _fetch_rest_day(symbol, interval, day, market=market)
+                rest_rows += len(rows)
+            except Exception as e:
+                logging.warning(f"REST API error for {day}: {e}. Skipping.")
+                continue
+        else:
+            public_ok += 1
+        
+        combined_rows.extend(rows)
+    
+    # Sort by open_time_ms
+    combined_rows.sort(key=lambda r: int(r[0]))
+    
+    print(f"Fetched {len(combined_rows):,} rows "
+          f"(public: {public_ok} days, REST fallback: {public_missing} days/{rest_rows:,} rows)")
+    
+    # Save to CSV if requested
+    if save_csv and combined_rows:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(KLINE_CSV_HEADER)
+            for row in combined_rows:
+                if len(row) == 12:
+                    w.writerow(row)
+        print(f"Saved to: {csv_path}")
+    
+    # Convert to DataFrame
+    if not combined_rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "close_time_ms"])
+    
+    return load_klines_from_csv(str(csv_path)) if save_csv else _rows_to_df(combined_rows)
+
+
+def _rows_to_df(rows: List[List[str]]) -> pd.DataFrame:
+    """Convert raw kline rows to DataFrame."""
+    df_rows = []
+    for r in rows:
+        if len(r) >= 7:
+            df_rows.append({
+                "dt": pd.to_datetime(int(r[0]), unit="ms", utc=True),
+                "open": float(r[1]),
+                "high": float(r[2]),
+                "low": float(r[3]),
+                "close": float(r[4]),
+                "volume": float(r[5]),
+                "close_time_ms": int(r[6]),
+            })
+    df = pd.DataFrame(df_rows).set_index("dt")
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    return df
+
+
+def get_cached_kline_path(symbol: str, interval: str, start_date: str, end_date: str) -> Optional[Path]:
+    """
+    Check if cached kline CSV exists for the given parameters.
+    Returns the path if exists, None otherwise.
+    """
+    symbol = symbol.upper()
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    csv_filename = f"{symbol}_{interval}_{start.isoformat()}_to_{end.isoformat()}.csv"
+    csv_path = KLINE_DATA_DIR / csv_filename
+    return csv_path if csv_path.exists() else None
+
+
 def fetch_klines_um_futures(
     symbol: str,
     interval: str,
@@ -2391,23 +2891,48 @@ def fetch_klines_spot_parallel(
     return df
 
 
+def build_1s_minute_index(df_1s: pd.DataFrame) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """
+    Pre-index 1s candles by minute for O(1) lookups.
+    
+    This is MUCH faster than scanning the entire DataFrame for each minute.
+    For 8.5M rows, this takes ~2-3 seconds but saves 10-20 minutes of backtest time.
+    
+    Args:
+        df_1s: DataFrame with 1s candles indexed by open time (UTC)
+    
+    Returns:
+        Dict mapping minute timestamp -> DataFrame of 1s candles for that minute
+    """
+    # Floor timestamps to minute
+    df_1s = df_1s.copy()
+    df_1s["_minute"] = df_1s.index.floor("min")
+    
+    # Group by minute and store each group
+    minute_index: Dict[pd.Timestamp, pd.DataFrame] = {}
+    for minute_ts, group in df_1s.groupby("_minute"):
+        minute_index[minute_ts] = group.drop(columns=["_minute"])
+    
+    return minute_index
+
+
 def get_1s_candles_for_minute(
-    df_1s: pd.DataFrame,
+    minute_index: Dict[pd.Timestamp, pd.DataFrame],
     minute_timestamp: pd.Timestamp,
 ) -> pd.DataFrame:
     """
-    Get the ~60 1s candles that fall within a 1-minute bar.
+    Get the ~60 1s candles that fall within a 1-minute bar using pre-built index.
+    
+    O(1) lookup instead of O(n) scan.
 
     Args:
-        df_1s: DataFrame with 1s candles indexed by open time (UTC)
+        minute_index: Pre-built dict from build_1s_minute_index()
         minute_timestamp: The open time of the 1m candle
 
     Returns:
-        DataFrame slice with 1s candles for that minute
+        DataFrame slice with 1s candles for that minute (empty DataFrame if not found)
     """
-    minute_end = minute_timestamp + pd.Timedelta(seconds=59, milliseconds=999)
-    mask = (df_1s.index >= minute_timestamp) & (df_1s.index <= minute_end)
-    return df_1s.loc[mask]
+    return minute_index.get(minute_timestamp, pd.DataFrame())
 
 
 def backtest_atr_grinder_lib(
@@ -2648,12 +3173,17 @@ def backtest_atr_grinder_lib(
 
     limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
 
+    # Pre-index 1s data by minute for O(1) lookups (HUGE performance improvement)
+    print("  Building 1s data index by minute...")
+    minute_index = build_1s_minute_index(df_1s)
+    print(f"  Indexed {len(minute_index):,} minutes")
+
     for i in range(1, len(df)):
         t = idx[i]
         prev_t = idx[i - 1]
 
-        # Get 1s candles for this minute
-        df_1s_minute = get_1s_candles_for_minute(df_1s, t)
+        # Get 1s candles for this minute (O(1) lookup)
+        df_1s_minute = get_1s_candles_for_minute(minute_index, t)
         has_1s_data = len(df_1s_minute) > 0
 
         # Fallback OHLC from 1m if no 1s data
@@ -4414,15 +4944,29 @@ def run_live(cfg: LiveConfig) -> None:
 # -----------------------------
 # Example usage
 # -----------------------------
-def run_backtest(use_lib: bool = True, parallel_workers: int = 15) -> None:
+def run_backtest(
+    symbol: str = "BTCUSDC",
+    start_date: str = "2022-07-11",
+    end_date: str = "2022-09-11",
+    use_lib: bool = True,
+    force_refetch: bool = False,
+    market: str = "futures",
+) -> None:
     """
-    Run backtest with optional Look-Inside-Bar (LIB) mode.
+    Run backtest with automatic data fetching from Binance Public Data.
+    
+    Data is automatically fetched from data.binance.vision (with REST API fallback)
+    and cached to kline_data/ folder for subsequent runs.
     
     Args:
-        use_lib: If True, use 1s candles from Spot API for more realistic execution simulation.
-                 If False, use original 1m-only backtest.
-        parallel_workers: Number of parallel threads for fetching 1s data (default 10).
-                         Use 1 for sequential fetching.
+        symbol: Trading pair (e.g., "BTCUSDC", "BTCUSDT")
+        start_date: Start date "YYYY-MM-DD"
+        end_date: End date "YYYY-MM-DD" (inclusive)
+        use_lib: If True, use 1s candles for Look-Inside-Bar execution simulation.
+                 If False, use signal-interval-only backtest.
+        force_refetch: If True, re-fetch data even if cached CSV exists.
+        market: "spot" or "futures" (UM perpetual). Default is "futures".
+                Note: 1s data for LIB mode always uses spot (not available on futures).
     """
     import time as time_module
     
@@ -4430,110 +4974,190 @@ def run_backtest(use_lib: bool = True, parallel_workers: int = 15) -> None:
     
     # Configuration
     cfg = BacktestConfig()
-    symbol_futures = "BTCUSDC"
-    symbol_spot = "BTCUSDC"
-    start_utc = "2026-01-06 00:00:00"
-    end_utc = "2026-01-10 00:00:00"
-    
-    # 1) Fetch signal candles from Futures (for signals)
     signal_interval = cfg.signal_interval
-    print(f"Fetching {signal_interval} klines from Futures API...")
-    fetch_signal_start = time_module.perf_counter()
-    df_signal = fetch_klines_um_futures(
-        symbol=symbol_futures,
-        interval=signal_interval,
-        start_utc=start_utc,
-        end_utc=end_utc,
-    )
-    fetch_signal_time = time_module.perf_counter() - fetch_signal_start
-    print(f"Loaded {len(df_signal):,} {signal_interval} candles from Futures ({fetch_signal_time:.2f}s)")
+    market_label = "Futures (Perpetual)" if market == "futures" else "Spot"
+    
+    print("=" * 60)
+    print(f"ATR Strategy Backtest")
+    print(f"Symbol: {symbol}")
+    print(f"Market: {market_label}")
+    print(f"Period: {start_date} to {end_date}")
+    print(f"Signal Interval: {signal_interval}")
+    print(f"LIB Mode: {'Enabled (1s resolution)' if use_lib else 'Disabled'}")
+    print("=" * 60)
     
     fetch_1s_time = 0.0
+    fetch_signal_time = 0.0
+    df_1s = pd.DataFrame()
+    
     if use_lib:
-        # 2) Fetch 1s data from Spot (for Look-Inside-Bar execution)
-        if parallel_workers > 1:
-            print(f"\nFetching 1s klines from Spot API (parallel with {parallel_workers} workers)...")
-            fetch_1s_start = time_module.perf_counter()
-            df_1s = fetch_klines_spot_parallel(
-                symbol=symbol_spot,
-                interval="1s",
-                start_utc=start_utc,
-                end_utc=end_utc,
-                max_workers=parallel_workers,
-            )
-        else:
-            print(f"\nFetching 1s klines from Spot API (sequential)...")
-            fetch_1s_start = time_module.perf_counter()
-            df_1s = fetch_klines_spot(
-                symbol=symbol_spot,
-                interval="1s",
-                start_utc=start_utc,
-                end_utc=end_utc,
-            )
+        # --- Fetch or load 1s data (always from spot - not available on futures) ---
+        print(f"\n[1/3] Loading 1s candle data (spot - for LIB execution)...")
+        fetch_1s_start = time_module.perf_counter()
+        
+        df_1s = fetch_klines_public_data(
+            symbol=symbol,
+            interval="1s",
+            start_date=start_date,
+            end_date=end_date,
+            save_csv=True,
+            force_refetch=force_refetch,
+            market="spot",  # 1s only available on spot
+        )
+        
         fetch_1s_time = time_module.perf_counter() - fetch_1s_start
-        print(f"Loaded {len(df_1s):,} 1s candles from Spot ({fetch_1s_time:.2f}s)")
+        print(f"Total 1s candles: {len(df_1s):,} ({fetch_1s_time:.2f}s)")
         
-        # Optional: Save 1s data to parquet for faster re-runs
-        # df_1s.to_parquet("btcusdc_1s_cache.parquet")
-        
-        # 3) Run LIB backtest
-        print(f"\nRunning Look-Inside-Bar backtest...")
+        if df_1s.empty:
+            print("ERROR: No 1s data available. Cannot run backtest.")
+            return
+    
+    # --- Fetch signal interval data ---
+    print(f"\n[2/3] Loading {signal_interval} candle data ({market})...")
+    fetch_signal_start = time_module.perf_counter()
+    
+    df_signal = fetch_klines_public_data(
+        symbol=symbol,
+        interval=signal_interval,
+        start_date=start_date,
+        end_date=end_date,
+        save_csv=True,
+        force_refetch=force_refetch,
+        market=market,
+    )
+    
+    fetch_signal_time = time_module.perf_counter() - fetch_signal_start
+    print(f"Total {signal_interval} candles: {len(df_signal):,} ({fetch_signal_time:.2f}s)")
+    
+    if df_signal.empty:
+        print("ERROR: No signal data available. Cannot run backtest.")
+        print("       Try --market spot or check if the symbol exists on futures.")
+        return
+    
+    # --- Run backtest ---
+    print(f"\n[3/3] Running backtest...")
+    if use_lib and not df_1s.empty:
+        # LIB backtest with 1s resolution
+        print(f"Mode: Look-Inside-Bar (1s execution simulation)")
         backtest_start = time_module.perf_counter()
         trades, df_bt, stats, trailing_df = backtest_atr_grinder_lib(df_signal, df_1s, cfg)
         backtest_time = time_module.perf_counter() - backtest_start
     else:
-        # Original backtest (1m only)
-        print(f"\nRunning standard {signal_interval} backtest...")
+        # Standard backtest (signal interval only)
+        print(f"Mode: Standard ({signal_interval} only)")
         backtest_start = time_module.perf_counter()
         trades, df_bt, stats, trailing_df = backtest_atr_grinder(df_signal, cfg)
         backtest_time = time_module.perf_counter() - backtest_start
 
     total_time = time_module.perf_counter() - total_start
 
-    # 4) Output
-    print("\n=== STATS ===")
+    # Output results
+    print("\n" + "=" * 60)
+    print("BACKTEST RESULTS")
+    print("=" * 60)
     for k, v in stats.items():
-        print(f"{k}: {v}")
+        print(f"  {k}: {v}")
 
     # Save results
     trades.to_csv("trades.csv", index=False)
     df_bt.to_csv("backtest_series.csv")
     
+    print("\n" + "-" * 60)
+    print("Output Files:")
     if not trailing_df.empty:
         trailing_df.to_csv("trailing_stops.csv", index=False)
-        print(f"\nSaved: trades.csv, backtest_series.csv, trailing_stops.csv ({len(trailing_df)} trailing stop updates)")
+        print(f"  - trades.csv")
+        print(f"  - backtest_series.csv")
+        print(f"  - trailing_stops.csv ({len(trailing_df)} trailing stop updates)")
     else:
-        print("\nSaved: trades.csv, backtest_series.csv")
+        print(f"  - trades.csv")
+        print(f"  - backtest_series.csv")
     
     if use_lib:
         # Show LIB-specific stats
         if not trades.empty and "lib_mode" in trades.columns:
             lib_trades = trades["lib_mode"].sum()
             total_trades = len(trades)
-            print(f"\nLIB mode: {lib_trades}/{total_trades} trades executed with 1s resolution")
+            print(f"\nLIB Execution: {lib_trades}/{total_trades} trades with 1s resolution")
     
     # Timing summary
-    print(f"\n=== TIMING ===")
-    print(f"Fetch {signal_interval} data: {fetch_signal_time:>8.2f}s")
-    if use_lib:
-        print(f"Fetch 1s data:  {fetch_1s_time:>8.2f}s")
-    print(f"Backtest:       {backtest_time:>8.2f}s")
-    print(f"Total:          {total_time:>8.2f}s")
+    print("\n" + "-" * 60)
+    print("Timing:")
+    print(f"  Fetch/Load 1s data:  {fetch_1s_time:>8.2f}s")
+    print(f"  Resample to {signal_interval}:      {fetch_signal_time:>8.2f}s")
+    print(f"  Backtest execution:  {backtest_time:>8.2f}s")
+    print(f"  Total:               {total_time:>8.2f}s")
+    print("=" * 60)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ATR 1m strategy")
-    parser.add_argument("--mode", choices=["backtest", "live"], default="backtest")
+    parser = argparse.ArgumentParser(
+        description="ATR Strategy - Backtest & Live Trading",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run backtest with default dates (uses futures/perpetual data)
+  python main.py --mode backtest
+  
+  # Run backtest with custom date range
+  python main.py --mode backtest --start 2022-06-20 --end 2022-09-26
+  
+  # Run backtest with different symbol
+  python main.py --mode backtest --symbol ETHUSDC --start 2023-01-01 --end 2023-03-31
+  
+  # Force re-fetch data (ignore cache)
+  python main.py --mode backtest --start 2022-07-01 --end 2022-07-31 --force-refetch
+  
+  # Run without Look-Inside-Bar mode (faster, less accurate)
+  python main.py --mode backtest --no-lib
+  
+  # Run backtest with spot data instead of futures
+  python main.py --mode backtest --market spot
+  
+  # Run live trading
+  python main.py --mode live
+        """,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["backtest", "live"],
+        default="backtest",
+        help="Run mode: 'backtest' or 'live' (default: backtest)",
+    )
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="BTCUSDC",
+        help="Trading pair symbol (default: BTCUSDC)",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default="2022-07-11",
+        help="Start date YYYY-MM-DD (default: 2022-07-11)",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default="2022-09-11",
+        help="End date YYYY-MM-DD (default: 2022-09-11)",
+    )
     parser.add_argument(
         "--no-lib",
         action="store_true",
-        help="Disable Look-Inside-Bar mode (use 1m-only backtest instead of 1s resolution)",
+        help="Disable Look-Inside-Bar mode (use signal-interval only backtest)",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=15,
-        help="Number of parallel workers for fetching 1s data (default: 15, use 1 for sequential)",
+        "--force-refetch",
+        action="store_true",
+        help="Force re-fetch data from Binance (ignore cached CSV)",
+    )
+    parser.add_argument(
+        "--market",
+        type=str,
+        choices=["spot", "futures"],
+        default="futures",
+        help="Market type: 'spot' or 'futures' (UM perpetual). Default: futures",
     )
     args = parser.parse_args()
 
@@ -4541,7 +5165,14 @@ def main() -> None:
         live_cfg = LiveConfig()
         run_live(live_cfg)
     else:
-        run_backtest(use_lib=not args.no_lib, parallel_workers=args.workers)
+        run_backtest(
+            symbol=args.symbol,
+            start_date=args.start,
+            end_date=args.end,
+            use_lib=not args.no_lib,
+            force_refetch=args.force_refetch,
+            market=args.market,
+        )
 
 
 if __name__ == "__main__":

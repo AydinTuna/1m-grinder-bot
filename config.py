@@ -36,10 +36,10 @@ class BacktestConfig:
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
-    swing_timeframe: str = "15m"
+    swing_timeframe: str = "5m"
     swing_left: int = 2
     swing_right: int = 2
-    swing_resample_rule: str = "15min"
+    swing_resample_rule: str = "5min"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
     leverage: float = 100.0  # max leverage for dynamic sizing
