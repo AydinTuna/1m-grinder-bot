@@ -99,6 +99,7 @@ class LiveConfig:
     trail_buffer_r: float = 0.05
     sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
     sl_chase_interval_seconds: float = 0.5  # reprice unfilled SL limit orders to chase price (maker only)
+    use_software_sl: bool = True  # True: monitor SL in code and use GTX maker orders (0 fees on USDC). False: use exchange algo stop orders (taker fees)
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
