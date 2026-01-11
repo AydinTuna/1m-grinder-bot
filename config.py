@@ -63,7 +63,7 @@ class BacktestConfig:
     use_trailing_stop: bool = True
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.05
-    sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
+    sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
 
 
 @dataclass
@@ -97,7 +97,7 @@ class LiveConfig:
     use_trailing_stop: bool = True
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.05
-    sl_maker_offset_atr_mult: float = 0.02  # offset for SL limit price to ensure maker execution
+    sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
     sl_chase_interval_seconds: float = 0.5  # reprice unfilled SL limit orders to chase price (maker only)
 
     # Algo order controls

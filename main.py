@@ -1669,7 +1669,7 @@ def algo_stop_limit_order(
         "quantity": quantity,
         "triggerPrice": trigger_price,
         "price": price,
-        "timeInForce": "GTX",  # Post-only: reject if would execute as taker (0 fees on USDC pairs)
+        "timeInForce": "GTC",
         "workingType": working_type,
         "priceProtect": _bool_to_binance_flag(price_protect),
     }
@@ -4617,46 +4617,6 @@ def run_live(cfg: LiveConfig) -> None:
                     if limit_order_inactive(tp_order):
                         state.tp_order_id = None
                         state.tp_client_order_id = None
-
-                # Check if GTX algo stop was rejected/expired (price moved too fast)
-                # If so, clear algo_id to activate software SL chase
-                if state.sl_algo_id is not None and not state.sl_triggered:
-                    sl_algo_order = query_algo_order(client, active_symbol, algo_id=state.sl_algo_id)
-                    if sl_algo_order:
-                        algo_status = str(sl_algo_order.get("status", "")).upper()
-                        # GTX rejection shows as EXPIRED or REJECTED when triggered but couldn't fill as maker
-                        if algo_status in {"EXPIRED", "REJECTED"}:
-                            state.sl_triggered = True
-                            state.sl_algo_id = None
-                            state.sl_algo_client_order_id = None
-                            log_event(cfg.log_path, {
-                                "event": "sl_gtx_rejected_fallback",
-                                "symbol": active_symbol,
-                                "side": "LONG" if position_amt > 0 else "SHORT",
-                                "algo_status": algo_status,
-                                "sl_price": format_float_by_symbol(float(state.sl_price or 0), active_symbol),
-                                "bid": format_float_by_symbol(bid, active_symbol),
-                                "ask": format_float_by_symbol(ask, active_symbol),
-                            })
-                
-                # Safety: If price crossed stop but algo order hasn't triggered/executed yet,
-                # cancel algo order and switch to software SL for immediate execution
-                if state.sl_algo_id is not None and not state.sl_triggered and state.sl_price is not None and bid > 0 and ask > 0:
-                    stop_price = float(state.sl_price)
-                    stop_hit = (bid <= stop_price) if position_amt > 0 else (ask >= stop_price)
-                    if stop_hit:
-                        cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
-                        state.sl_algo_id = None
-                        state.sl_algo_client_order_id = None
-                        state.sl_triggered = True
-                        log_event(cfg.log_path, {
-                            "event": "sl_price_hit_cancel_algo",
-                            "symbol": active_symbol,
-                            "side": "LONG" if position_amt > 0 else "SHORT",
-                            "stop_price": format_float_by_symbol(stop_price, active_symbol),
-                            "bid": format_float_by_symbol(bid, active_symbol),
-                            "ask": format_float_by_symbol(ask, active_symbol),
-                        })
 
                 if state.sl_algo_id is None:
                     sl_order = None
