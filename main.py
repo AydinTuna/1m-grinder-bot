@@ -870,17 +870,18 @@ def format_price_to_tick(value: float, tick_size: float, side: str, post_only: b
 
 def reprice_post_only(price: float, side: str, bid: float, ask: float, tick_size: float) -> float:
     """
-    Keeps a post-only LIMIT order outside the spread by at least 1 tick.
-    BUY: price <= bid - tick
-    SELL: price >= ask + tick
+    Keeps a post-only LIMIT order outside the spread by at least 2 ticks.
+    BUY: price <= bid - 2*tick
+    SELL: price >= ask + 2*tick
     """
     if tick_size <= 0:
         return price
     side_u = str(side).upper()
+    offset = 2 * tick_size
     if side_u == "BUY":
-        return min(price, bid - tick_size)
+        return min(price, bid - offset)
     if side_u == "SELL":
-        return max(price, ask + tick_size)
+        return max(price, ask + offset)
     return price
 
 
@@ -1669,7 +1670,7 @@ def algo_stop_limit_order(
         "quantity": quantity,
         "triggerPrice": trigger_price,
         "price": price,
-        "timeInForce": "GTC",
+        "timeInForce": "GTX",  # Post-only: ensure maker execution
         "workingType": working_type,
         "priceProtect": _bool_to_binance_flag(price_protect),
     }
@@ -4618,132 +4619,6 @@ def run_live(cfg: LiveConfig) -> None:
                         state.tp_order_id = None
                         state.tp_client_order_id = None
 
-                if state.sl_algo_id is None:
-                    sl_order = None
-                    if state.sl_order_id:
-                        sl_order = query_limit_order(client, active_symbol, order_id=state.sl_order_id)
-                        if limit_order_inactive(sl_order):
-                            state.sl_order_id = None
-                            state.sl_client_order_id = None
-                            state.sl_order_time = None
-                            sl_order = None
-
-                    if not state.sl_triggered and state.sl_price is not None and bid > 0 and ask > 0:
-                        stop_price = float(state.sl_price)
-                        stop_hit = (bid <= stop_price) if position_amt > 0 else (ask >= stop_price)
-                        if stop_hit:
-                            state.sl_triggered = True
-                            log_event(cfg.log_path, {
-                                "event": "sl_triggered",
-                                "symbol": active_symbol,
-                                "side": "LONG" if position_amt > 0 else "SHORT",
-                                "stop_price": format_float_by_symbol(stop_price, active_symbol),
-                                "bid": format_float_by_symbol(bid, active_symbol),
-                                "ask": format_float_by_symbol(ask, active_symbol),
-                            })
-
-                    if state.sl_triggered:
-                        # Ensure TP is canceled so we don't have two opposing LIMITs without reduceOnly.
-                        if state.tp_order_id:
-                            cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
-                            state.tp_order_id = None
-                            state.tp_client_order_id = None
-
-                        # Track executed and remaining quantity for partial fill handling
-                        executed_qty = 0.0
-                        remaining_qty = abs(position_amt)
-
-                        if state.sl_order_id is not None and sl_order:
-                            status = str(sl_order.get("status", "")).upper()
-                            try:
-                                executed_qty = float(sl_order.get("executedQty", 0) or 0)
-                            except (TypeError, ValueError):
-                                executed_qty = 0.0
-                            try:
-                                original_qty = float(sl_order.get("origQty", 0) or 0)
-                            except (TypeError, ValueError):
-                                original_qty = 0.0
-                            remaining_qty = original_qty - executed_qty if original_qty > 0 else abs(position_amt)
-
-                            # Chase unfilled orders after interval (maker price chasing)
-                            if status not in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
-                                if remaining_qty > 0 and state.sl_order_time is not None:
-                                    elapsed = time.time() - state.sl_order_time
-                                    if elapsed >= cfg.sl_chase_interval_seconds:
-                                        # Get current order price to log the chase
-                                        try:
-                                            old_price = float(sl_order.get("price", 0) or 0)
-                                        except (TypeError, ValueError):
-                                            old_price = 0.0
-
-                                        # Cancel stale order to reprice
-                                        if cancel_order_safely(client, active_symbol, order_id=state.sl_order_id):
-                                            log_event(cfg.log_path, {
-                                                "event": "sl_chase_cancel",
-                                                "symbol": active_symbol,
-                                                "old_price": format_float_by_symbol(old_price, active_symbol),
-                                                "executed_qty": format_float_2(executed_qty),
-                                                "remaining_qty": format_float_2(remaining_qty),
-                                                "elapsed_seconds": round(elapsed, 2),
-                                            })
-                                            state.sl_order_id = None
-                                            state.sl_client_order_id = None
-                                            state.sl_order_time = None
-                                            sl_order = None
-
-                        # Place new SL chase order if needed (for remaining unfilled quantity)
-                        if state.sl_order_id is None and remaining_qty > 0:
-                            close_side = "SELL" if position_amt > 0 else "BUY"
-                            close_qty = remaining_qty
-                            close_qty_str = format_to_step(close_qty, filters["step_size"])
-                            try:
-                                close_qty_num = float(close_qty_str)
-                            except (TypeError, ValueError):
-                                close_qty_num = 0.0
-                            if close_qty_num >= filters["min_qty"] and bid > 0 and ask > 0:
-                                # Price at best bid/ask + 1 tick to ensure maker
-                                close_price = ask if close_side == "SELL" else bid
-                                close_price_str = format_price_to_tick(close_price, tick_size, side=close_side, post_only=True)
-                                sl_client_id = f"ATR_SL_CHASE_{int(time.time() * 1000)}"
-                                # Verify position still exists before placing reduce-only order
-                                if has_open_position(client, active_symbol):
-                                    new_sl_order = limit_order(
-                                        symbol=active_symbol,
-                                        side=close_side,
-                                        quantity=close_qty_str,
-                                        price=close_price_str,
-                                        client=client,
-                                        client_order_id=sl_client_id,
-                                        tick_size=tick_size,
-                                        reduce_only=True,
-                                    )
-                                else:
-                                    new_sl_order = None
-                                    log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase"})
-                                state.sl_order_id = new_sl_order.get("orderId") if new_sl_order else None
-                                state.sl_client_order_id = (
-                                    (new_sl_order.get("clientOrderId") if new_sl_order else None)
-                                    or (sl_client_id if new_sl_order else None)
-                                )
-                                state.sl_order_time = time.time() if new_sl_order else None
-                                log_event(cfg.log_path, {
-                                    "event": "sl_chase_order",
-                                    "symbol": active_symbol,
-                                    "side": close_side,
-                                    "quantity": format_float_2(close_qty_num),
-                                    "price": format_float_by_symbol(float(close_price_str), active_symbol),
-                                    "order_id": state.sl_order_id,
-                                    "bid": format_float_by_symbol(bid, active_symbol),
-                                    "ask": format_float_by_symbol(ask, active_symbol),
-                                })
-                            else:
-                                log_event(cfg.log_path, {
-                                    "event": "sl_chase_skip_qty",
-                                    "symbol": active_symbol,
-                                    "position_amt": format_float_2(position_amt),
-                                    "remaining_qty": format_float_2(remaining_qty),
-                                    "quantity": close_qty_str,
-                                })
 
             # If in position and no exits placed, place them using current entryPrice
             if in_position and active_symbol and (
