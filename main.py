@@ -1670,7 +1670,7 @@ def algo_stop_limit_order(
         "quantity": quantity,
         "triggerPrice": trigger_price,
         "price": price,
-        "timeInForce": "GTX",  # Post-only: ensure maker execution
+        "timeInForce": "GTC",
         "workingType": working_type,
         "priceProtect": _bool_to_binance_flag(price_protect),
     }
