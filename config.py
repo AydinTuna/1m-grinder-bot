@@ -98,7 +98,7 @@ class LiveConfig:
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.05
     sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
-    sl_chase_interval_seconds: float = 0.5  # reprice unfilled SL limit orders to chase price (maker only)
+    sl_chase_interval_seconds: float = 1.0  # reprice unfilled SL limit orders to chase price (maker only)
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
