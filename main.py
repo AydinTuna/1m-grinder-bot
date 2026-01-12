@@ -440,74 +440,109 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             and position != 0
             and entry_price is not None
             and stop_price is not None
-            and trail_r_value is not None
-            and trail_best_close_r is not None
-            and trail_stop_r is not None
         ):
             c = float(df.at[t, "close"])
-            close_r = compute_close_r(entry_price, c, position, trail_r_value)
-            if close_r is not None:
-                side_str = "LONG" if position == 1 else "SHORT"
-                prev_best_r = trail_best_close_r
-                prev_stop_r = trail_stop_r
-                prev_stop_price = stop_price
-                
-                trail_best_close_r = max(trail_best_close_r, close_r)
-                next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
-                
-                # Log trailing stop evaluation
-                if next_stop_r > trail_stop_r:
-                    # Stop is moving - calculate new price
-                    new_stop_price = compute_trailing_sl_price(
-                        entry_price,
-                        position,
-                        trail_r_value,
-                        next_stop_r,
-                        cfg.trail_buffer_r,
-                    )
-                    
-                    # Log to CSV
-                    trailing_stop_updates.append({
-                        "timestamp": t,
-                        "entry_time": entry_time,
-                        "side": side_str,
-                        "entry_price": entry_price,
-                        "close_price": c,
-                        "close_r": close_r,
-                        "prev_best_r": prev_best_r,
-                        "new_best_r": trail_best_close_r,
-                        "prev_stop_r": prev_stop_r,
-                        "new_stop_r": next_stop_r,
-                        "prev_stop_price": prev_stop_price,
-                        "new_stop_price": new_stop_price,
-                        "r_value": trail_r_value,
-                        "trail_gap_r": cfg.trail_gap_r,
-                        "trail_buffer_r": cfg.trail_buffer_r,
-                        "stop_moved": True,
-                    })
-                    
-                    trail_stop_r = next_stop_r
-                    stop_price = new_stop_price
-                else:
-                    # Log to CSV
-                    trailing_stop_updates.append({
-                        "timestamp": t,
-                        "entry_time": entry_time,
-                        "side": side_str,
-                        "entry_price": entry_price,
-                        "close_price": c,
-                        "close_r": close_r,
-                        "prev_best_r": trail_best_close_r,
-                        "new_best_r": trail_best_close_r,
-                        "prev_stop_r": trail_stop_r,
-                        "new_stop_r": trail_stop_r,
-                        "prev_stop_price": stop_price,
-                        "new_stop_price": stop_price,
-                        "r_value": trail_r_value,
-                        "trail_gap_r": cfg.trail_gap_r,
-                        "trail_buffer_r": cfg.trail_buffer_r,
-                        "stop_moved": False,
-                    })
+            side_str = "LONG" if position == 1 else "SHORT"
+            prev_stop_price = stop_price
+
+            if cfg.trailing_mode == "dynamic_atr":
+                # Dynamic ATR trailing - stop moves with ATR, floored at -1R
+                current_atr = float(df.at[t, "atr"])
+                floor_stop = compute_sl_price(entry_price, position, used_signal_atr, cfg.sl_atr_mult)  # -1R
+                atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
+
+                # Apply floor only (stop can move up OR down, just not past -1R)
+                if position == 1:  # LONG
+                    new_stop = max(atr_stop, floor_stop)  # floor is minimum
+                else:  # SHORT
+                    new_stop = min(atr_stop, floor_stop)  # floor is maximum
+
+                stop_moved = new_stop != stop_price
+                if stop_moved:
+                    stop_price = new_stop
+
+                # Log to CSV
+                trailing_stop_updates.append({
+                    "timestamp": t,
+                    "entry_time": entry_time,
+                    "side": side_str,
+                    "entry_price": entry_price,
+                    "close_price": c,
+                    "current_atr": current_atr,
+                    "atr_stop": atr_stop,
+                    "floor_stop": floor_stop,
+                    "prev_stop_price": prev_stop_price,
+                    "new_stop_price": stop_price,
+                    "trailing_mode": "dynamic_atr",
+                    "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "stop_moved": stop_moved,
+                })
+
+            elif cfg.trailing_mode == "r_ladder" and trail_r_value is not None and trail_best_close_r is not None and trail_stop_r is not None:
+                # R-ladder trailing (existing logic)
+                close_r = compute_close_r(entry_price, c, position, trail_r_value)
+                if close_r is not None:
+                    prev_best_r = trail_best_close_r
+                    prev_stop_r = trail_stop_r
+
+                    trail_best_close_r = max(trail_best_close_r, close_r)
+                    next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+
+                    # Log trailing stop evaluation
+                    if next_stop_r > trail_stop_r:
+                        # Stop is moving - calculate new price
+                        new_stop_price = compute_trailing_sl_price(
+                            entry_price,
+                            position,
+                            trail_r_value,
+                            next_stop_r,
+                            cfg.trail_buffer_r,
+                        )
+
+                        # Log to CSV
+                        trailing_stop_updates.append({
+                            "timestamp": t,
+                            "entry_time": entry_time,
+                            "side": side_str,
+                            "entry_price": entry_price,
+                            "close_price": c,
+                            "close_r": close_r,
+                            "prev_best_r": prev_best_r,
+                            "new_best_r": trail_best_close_r,
+                            "prev_stop_r": prev_stop_r,
+                            "new_stop_r": next_stop_r,
+                            "prev_stop_price": prev_stop_price,
+                            "new_stop_price": new_stop_price,
+                            "r_value": trail_r_value,
+                            "trail_gap_r": cfg.trail_gap_r,
+                            "trail_buffer_r": cfg.trail_buffer_r,
+                            "trailing_mode": "r_ladder",
+                            "stop_moved": True,
+                        })
+
+                        trail_stop_r = next_stop_r
+                        stop_price = new_stop_price
+                    else:
+                        # Log to CSV
+                        trailing_stop_updates.append({
+                            "timestamp": t,
+                            "entry_time": entry_time,
+                            "side": side_str,
+                            "entry_price": entry_price,
+                            "close_price": c,
+                            "close_r": close_r,
+                            "prev_best_r": trail_best_close_r,
+                            "new_best_r": trail_best_close_r,
+                            "prev_stop_r": trail_stop_r,
+                            "new_stop_r": trail_stop_r,
+                            "prev_stop_price": stop_price,
+                            "new_stop_price": stop_price,
+                            "r_value": trail_r_value,
+                            "trail_gap_r": cfg.trail_gap_r,
+                            "trail_buffer_r": cfg.trail_buffer_r,
+                            "trailing_mode": "r_ladder",
+                            "stop_moved": False,
+                        })
 
         # --- ENTRY logic (signal on prev candle; optional mid-body limit) ---
         if position == 0:
@@ -1979,6 +2014,31 @@ def algo_order_executed(order: Optional[Dict[str, object]]) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+def algo_order_triggered_not_filled(order: Optional[Dict[str, object]]) -> bool:
+    """
+    Check if an algo order has been triggered (stop price hit) but not yet filled.
+    This happens when the stop limit is triggered but the limit order hasn't executed.
+    """
+    if not order:
+        return False
+    status = algo_order_status(order)
+    if status == "TRIGGERED":
+        # Check if any qty was actually filled
+        for key in ("executedQty", "executedQuantity", "executedVolume"):
+            value = order.get(key)
+            if value is None:
+                continue
+            try:
+                if float(value) > 0:
+                    return False  # Has fills, not just triggered
+            except (TypeError, ValueError):
+                continue
+        return True
+    return False
+
+
 def cancel_open_strategy_orders(
     client: BinanceUMFuturesREST,
     symbol: str,
@@ -3126,7 +3186,7 @@ def backtest_atr_grinder_lib(
         entry_t: pd.Timestamp,
         side_str: str,
     ) -> Tuple[float, float, int]:
-        """Update trailing stop using 1s closes."""
+        """Update trailing stop using 1s closes (R-ladder mode)."""
         nonlocal trailing_stop_updates
         current_best_r = best_close_r
         current_stop_r = stop_r
@@ -3164,6 +3224,7 @@ def backtest_atr_grinder_lib(
                         "r_value": r_value,
                         "trail_gap_r": cfg.trail_gap_r,
                         "trail_buffer_r": cfg.trail_buffer_r,
+                        "trailing_mode": "r_ladder",
                         "stop_moved": True,
                         "lib_mode": True,
                     })
@@ -3171,6 +3232,59 @@ def backtest_atr_grinder_lib(
                     current_sl_price = new_sl_price
 
         return current_sl_price, current_best_r, current_stop_r
+
+    def update_trailing_stop_dynamic_atr_lib(
+        pos: int,
+        entry_p: float,
+        signal_atr: float,
+        sl_price: float,
+        df_1s_chunk: pd.DataFrame,
+        df_signal: pd.DataFrame,
+        signal_t: pd.Timestamp,
+        entry_t: pd.Timestamp,
+        side_str: str,
+    ) -> float:
+        """Update trailing stop using dynamic ATR on 1s closes."""
+        nonlocal trailing_stop_updates
+        current_sl_price = sl_price
+        floor_stop = compute_sl_price(entry_p, pos, signal_atr, cfg.sl_atr_mult)  # -1R
+
+        # Get current ATR from signal timeframe
+        current_atr = float(df_signal.at[signal_t, "atr"])
+
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            c = float(candle_1s["close"])
+            prev_sl_price = current_sl_price
+
+            atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, pos)
+
+            # Apply floor only (stop can move up OR down, just not past -1R)
+            if pos == 1:  # LONG
+                new_stop = max(atr_stop, floor_stop)  # floor is minimum
+            else:  # SHORT
+                new_stop = min(atr_stop, floor_stop)  # floor is maximum
+
+            stop_moved = new_stop != current_sl_price
+            if stop_moved:
+                trailing_stop_updates.append({
+                    "timestamp": t_1s,
+                    "entry_time": entry_t,
+                    "side": side_str,
+                    "entry_price": entry_p,
+                    "close_price": c,
+                    "current_atr": current_atr,
+                    "atr_stop": atr_stop,
+                    "floor_stop": floor_stop,
+                    "prev_stop_price": prev_sl_price,
+                    "new_stop_price": new_stop,
+                    "trailing_mode": "dynamic_atr",
+                    "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "stop_moved": True,
+                    "lib_mode": True,
+                })
+                current_sl_price = new_stop
+
+        return current_sl_price
 
     limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
 
@@ -3201,12 +3315,18 @@ def backtest_atr_grinder_lib(
 
             if has_1s_data:
                 # Update trailing stop using 1s closes FIRST
-                if cfg.use_trailing_stop and trail_r_value is not None and trail_best_close_r is not None and trail_stop_r is not None:
+                if cfg.use_trailing_stop:
                     side_str = "LONG" if position == 1 else "SHORT"
-                    stop_price, trail_best_close_r, trail_stop_r = update_trailing_stop_lib(
-                        position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
-                        stop_price, df_1s_minute, entry_time, side_str
-                    )
+                    if cfg.trailing_mode == "dynamic_atr":
+                        stop_price = update_trailing_stop_dynamic_atr_lib(
+                            position, entry_price, used_signal_atr, stop_price,
+                            df_1s_minute, df, t, entry_time, side_str
+                        )
+                    elif cfg.trailing_mode == "r_ladder" and trail_r_value is not None and trail_best_close_r is not None and trail_stop_r is not None:
+                        stop_price, trail_best_close_r, trail_stop_r = update_trailing_stop_lib(
+                            position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
+                            stop_price, df_1s_minute, entry_time, side_str
+                        )
 
                 # Check exit using 1s candles
                 exited, exit_reason, exit_price, exit_time = check_exit_lib(
@@ -3291,46 +3411,80 @@ def backtest_atr_grinder_lib(
             and position != 0
             and entry_price is not None
             and stop_price is not None
-            and trail_r_value is not None
-            and trail_best_close_r is not None
-            and trail_stop_r is not None
         ):
             c = float(df.at[t, "close"])
-            close_r = compute_close_r(entry_price, c, position, trail_r_value)
-            if close_r is not None:
-                side_str = "LONG" if position == 1 else "SHORT"
-                prev_best_r = trail_best_close_r
-                prev_stop_r = trail_stop_r
-                prev_stop_price = stop_price
+            side_str = "LONG" if position == 1 else "SHORT"
+            prev_stop_price = stop_price
 
-                trail_best_close_r = max(trail_best_close_r, close_r)
-                next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+            if cfg.trailing_mode == "dynamic_atr":
+                # Dynamic ATR trailing - stop moves with ATR, floored at -1R
+                current_atr = float(df.at[t, "atr"])
+                floor_stop = compute_sl_price(entry_price, position, used_signal_atr, cfg.sl_atr_mult)  # -1R
+                atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
 
-                if next_stop_r > trail_stop_r:
-                    new_stop_price = compute_trailing_sl_price(
-                        entry_price, position, trail_r_value, next_stop_r, cfg.trail_buffer_r
-                    )
-                    trailing_stop_updates.append({
-                        "timestamp": t,
-                        "entry_time": entry_time,
-                        "side": side_str,
-                        "entry_price": entry_price,
-                        "close_price": c,
-                        "close_r": close_r,
-                        "prev_best_r": prev_best_r,
-                        "new_best_r": trail_best_close_r,
-                        "prev_stop_r": prev_stop_r,
-                        "new_stop_r": next_stop_r,
-                        "prev_stop_price": prev_stop_price,
-                        "new_stop_price": new_stop_price,
-                        "r_value": trail_r_value,
-                        "trail_gap_r": cfg.trail_gap_r,
-                        "trail_buffer_r": cfg.trail_buffer_r,
-                        "stop_moved": True,
-                        "lib_mode": False,
-                    })
-                    trail_stop_r = next_stop_r
-                    stop_price = new_stop_price
+                # Apply floor only (stop can move up OR down, just not past -1R)
+                if position == 1:  # LONG
+                    new_stop = max(atr_stop, floor_stop)  # floor is minimum
+                else:  # SHORT
+                    new_stop = min(atr_stop, floor_stop)  # floor is maximum
+
+                stop_moved = new_stop != stop_price
+                if stop_moved:
+                    stop_price = new_stop
+
+                # Log to CSV
+                trailing_stop_updates.append({
+                    "timestamp": t,
+                    "entry_time": entry_time,
+                    "side": side_str,
+                    "entry_price": entry_price,
+                    "close_price": c,
+                    "current_atr": current_atr,
+                    "atr_stop": atr_stop,
+                    "floor_stop": floor_stop,
+                    "prev_stop_price": prev_stop_price,
+                    "new_stop_price": stop_price,
+                    "trailing_mode": "dynamic_atr",
+                    "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "stop_moved": stop_moved,
+                    "lib_mode": False,
+                })
+
+            elif cfg.trailing_mode == "r_ladder" and trail_r_value is not None and trail_best_close_r is not None and trail_stop_r is not None:
+                close_r = compute_close_r(entry_price, c, position, trail_r_value)
+                if close_r is not None:
+                    prev_best_r = trail_best_close_r
+                    prev_stop_r = trail_stop_r
+
+                    trail_best_close_r = max(trail_best_close_r, close_r)
+                    next_stop_r = compute_trailing_stop_r(trail_best_close_r, trail_stop_r, cfg.trail_gap_r)
+
+                    if next_stop_r > trail_stop_r:
+                        new_stop_price = compute_trailing_sl_price(
+                            entry_price, position, trail_r_value, next_stop_r, cfg.trail_buffer_r
+                        )
+                        trailing_stop_updates.append({
+                            "timestamp": t,
+                            "entry_time": entry_time,
+                            "side": side_str,
+                            "entry_price": entry_price,
+                            "close_price": c,
+                            "close_r": close_r,
+                            "prev_best_r": prev_best_r,
+                            "new_best_r": trail_best_close_r,
+                            "prev_stop_r": prev_stop_r,
+                            "new_stop_r": next_stop_r,
+                            "prev_stop_price": prev_stop_price,
+                            "new_stop_price": new_stop_price,
+                            "r_value": trail_r_value,
+                            "trail_gap_r": cfg.trail_gap_r,
+                            "trail_buffer_r": cfg.trail_buffer_r,
+                            "trailing_mode": "r_ladder",
+                            "stop_moved": True,
+                            "lib_mode": False,
+                        })
+                        trail_stop_r = next_stop_r
+                        stop_price = new_stop_price
 
         # --- ENTRY logic ---
         if position == 0:
@@ -3612,6 +3766,19 @@ def compute_trailing_sl_price(entry_price: float, side: int, r_value: float, sto
         buffer_price = r_value * float(buffer_r)
         price = price + buffer_price if side == 1 else price - buffer_price
     return price
+
+
+def compute_dynamic_atr_stop(
+    close_price: float,
+    current_atr: float,
+    atr_mult: float,
+    side: int,
+) -> float:
+    """Calculate stop price based on close - ATR*mult (long) or close + ATR*mult (short)."""
+    if side == 1:  # LONG
+        return close_price - (current_atr * atr_mult)
+    else:  # SHORT
+        return close_price + (current_atr * atr_mult)
 
 
 def compute_sl_limit_price(trigger_price: float, side: int, atr_value: float, offset_mult: float) -> float:
@@ -4618,6 +4785,152 @@ def run_live(cfg: LiveConfig) -> None:
                     if limit_order_inactive(tp_order):
                         state.tp_order_id = None
                         state.tp_client_order_id = None
+
+                # SL Chase Logic: check if SL algo is triggered but not filled
+                if state.sl_algo_id:
+                    sl_algo_order = query_algo_order(client, active_symbol, algo_id=state.sl_algo_id)
+                    if algo_order_triggered_not_filled(sl_algo_order):
+                        # SL triggered but not filled - start/continue chase
+                        if not state.sl_triggered:
+                            state.sl_triggered = True
+                            state.sl_order_time = time.time()
+                            log_event(cfg.log_path, {
+                                "event": "sl_triggered_not_filled",
+                                "symbol": active_symbol,
+                                "sl_algo_id": state.sl_algo_id,
+                                "sl_price": format_float_2(state.sl_price),
+                            })
+                        
+                        # Check if chase timeout elapsed
+                        if state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
+                            side = 1 if position_amt > 0 else -1
+                            sl_side = "SELL" if side == 1 else "BUY"
+                            qty = abs(position_amt)
+                            qty_str = format_to_step(qty, filters["tick_size"])
+                            
+                            # Cancel old algo order
+                            cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
+                            state.sl_algo_id = None
+                            state.sl_algo_client_order_id = None
+                            
+                            # Calculate new chase price at current market with tick gap
+                            # For SELL: place at bid - tick to chase (maker on bid side)
+                            # For BUY: place at ask + tick to chase (maker on ask side)
+                            if sl_side == "SELL":
+                                chase_price = bid - tick_size if bid > 0 else state.sl_price
+                            else:
+                                chase_price = ask + tick_size if ask > 0 else state.sl_price
+                            chase_price_str = format_to_step(chase_price, tick_size)
+                            
+                            # Place new limit order at chase price
+                            sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
+                            if has_open_position(client, active_symbol):
+                                sl_chase_order = limit_order(
+                                    symbol=active_symbol,
+                                    side=sl_side,
+                                    quantity=qty_str,
+                                    price=chase_price_str,
+                                    client=client,
+                                    client_order_id=sl_chase_client_id,
+                                    tick_size=tick_size,
+                                    reduce_only=True,
+                                )
+                            else:
+                                sl_chase_order = None
+                                log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase"})
+                            
+                            if sl_chase_order:
+                                state.sl_order_id = sl_chase_order.get("orderId")
+                                state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
+                                log_event(cfg.log_path, {
+                                    "event": "sl_chase_placed",
+                                    "symbol": active_symbol,
+                                    "chase_price": format_float_2(chase_price),
+                                    "order_id": state.sl_order_id,
+                                    "bid": format_float_2(bid),
+                                    "ask": format_float_2(ask),
+                                })
+                            else:
+                                log_event(cfg.log_path, {
+                                    "event": "sl_chase_rejected",
+                                    "symbol": active_symbol,
+                                    "chase_price": format_float_2(chase_price),
+                                })
+                            
+                            # Reset timer for next chase attempt
+                            state.sl_order_time = time.time()
+                    elif algo_order_inactive(sl_algo_order):
+                        # Algo order cancelled/expired, clear it
+                        state.sl_algo_id = None
+                        state.sl_algo_client_order_id = None
+
+                # SL Chase Logic: check if SL limit order (from chase) is still pending
+                if state.sl_order_id and state.sl_triggered:
+                    sl_order = query_limit_order(client, active_symbol, order_id=state.sl_order_id)
+                    if limit_order_filled(sl_order):
+                        # SL chase order filled - will be handled by exit detection
+                        pass
+                    elif limit_order_inactive(sl_order):
+                        # Order cancelled/expired, clear it and reset chase timer
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
+                        state.sl_order_time = time.time()  # Reset timer to try again
+                    elif state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
+                        # Chase timeout elapsed, need to move the order
+                        side = 1 if position_amt > 0 else -1
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        qty = abs(position_amt)
+                        qty_str = format_to_step(qty, filters["tick_size"])
+                        
+                        # Cancel old order
+                        cancel_order_safely(client, active_symbol, order_id=state.sl_order_id)
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
+                        
+                        # Calculate new chase price at current market with tick gap
+                        if sl_side == "SELL":
+                            chase_price = bid - tick_size if bid > 0 else state.sl_price
+                        else:
+                            chase_price = ask + tick_size if ask > 0 else state.sl_price
+                        chase_price_str = format_to_step(chase_price, tick_size)
+                        
+                        # Place new limit order at chase price
+                        sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
+                        if has_open_position(client, active_symbol):
+                            sl_chase_order = limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                price=chase_price_str,
+                                client=client,
+                                client_order_id=sl_chase_client_id,
+                                tick_size=tick_size,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_chase_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase_move"})
+                        
+                        if sl_chase_order:
+                            state.sl_order_id = sl_chase_order.get("orderId")
+                            state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
+                            log_event(cfg.log_path, {
+                                "event": "sl_chase_moved",
+                                "symbol": active_symbol,
+                                "chase_price": format_float_2(chase_price),
+                                "order_id": state.sl_order_id,
+                                "bid": format_float_2(bid),
+                                "ask": format_float_2(ask),
+                            })
+                        else:
+                            log_event(cfg.log_path, {
+                                "event": "sl_chase_move_rejected",
+                                "symbol": active_symbol,
+                                "chase_price": format_float_2(chase_price),
+                            })
+                        
+                        # Reset timer for next chase attempt
+                        state.sl_order_time = time.time()
 
 
             # If in position and no exits placed, place them using current entryPrice

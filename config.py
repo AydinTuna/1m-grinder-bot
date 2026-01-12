@@ -61,8 +61,10 @@ class BacktestConfig:
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 0.25
     use_trailing_stop: bool = True
+    trailing_mode: str = "dynamic_atr"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
+    dynamic_trail_atr_mult: float = 1.00  # ATR multiplier for dynamic trailing
     sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
 
 
@@ -95,9 +97,12 @@ class LiveConfig:
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 0.25
     use_trailing_stop: bool = True
+    trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
+    dynamic_trail_atr_mult: float = 1.25  # ATR multiplier for dynamic trailing
     sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
+    sl_chase_timeout_seconds: float = 60.0  # seconds before chasing unfilled SL order
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
