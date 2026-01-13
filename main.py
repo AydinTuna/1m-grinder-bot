@@ -4816,8 +4816,8 @@ def run_live(cfg: LiveConfig) -> None:
                             side = 1 if position_amt > 0 else -1
                             sl_side = "SELL" if side == 1 else "BUY"
                             qty = abs(position_amt)
-                            qty_str = format_to_step(qty, filters["tick_size"])
-                            
+                            qty_str = format_to_step(qty, filters["step_size"])
+
                             # Cancel old algo order
                             cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
                             state.sl_algo_id = None
@@ -4880,7 +4880,7 @@ def run_live(cfg: LiveConfig) -> None:
                         side = 1 if position_amt > 0 else -1
                         sl_side = "SELL" if side == 1 else "BUY"
                         qty = abs(position_amt)
-                        qty_str = format_to_step(qty, filters["tick_size"])
+                        qty_str = format_to_step(qty, filters["step_size"])
 
                         # Calculate chase price at current market with tick gap
                         if sl_side == "SELL":
@@ -4943,8 +4943,8 @@ def run_live(cfg: LiveConfig) -> None:
                         side = 1 if position_amt > 0 else -1
                         sl_side = "SELL" if side == 1 else "BUY"
                         qty = abs(position_amt)
-                        qty_str = format_to_step(qty, filters["tick_size"])
-                        
+                        qty_str = format_to_step(qty, filters["step_size"])
+
                         # Cancel old order
                         cancel_order_safely(client, active_symbol, order_id=state.sl_order_id)
                         state.sl_order_id = None
