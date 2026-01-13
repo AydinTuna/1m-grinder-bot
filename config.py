@@ -44,10 +44,10 @@ class BacktestConfig:
     entry_limit_timeout_bars: int = 1
     leverage: float = 100.0  # max leverage for dynamic sizing
     min_leverage: float = 20.0
-    initial_capital: float = 200.0  # starting equity (margin cap per trade)
+    initial_capital: float = 500.0  # starting equity (margin cap per trade)
 
     # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 0.10
+    target_loss_usd: Optional[float] = 0.60
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -61,7 +61,7 @@ class BacktestConfig:
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 0.25
     use_trailing_stop: bool = True
-    trailing_mode: str = "dynamic_atr"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 1.00  # ATR multiplier for dynamic trailing
@@ -86,8 +86,8 @@ class LiveConfig:
     atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
     leverage: int = 100  # max leverage for dynamic sizing
     min_leverage: int = 20
-    margin_usd: float = 200.0  # margin cap per trade if targets are set
-    target_loss_usd: Optional[float] = 0.10
+    margin_usd: float = 500.0  # margin cap per trade if targets are set
+    target_loss_usd: Optional[float] = 0.60
 
     # Strategy thresholds
     thr1: float = 2.0
