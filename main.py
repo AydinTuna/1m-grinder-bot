@@ -4397,8 +4397,13 @@ def run_live(cfg: LiveConfig) -> None:
                         )
                         state.sl_order_id = None
                         state.sl_client_order_id = None
-                        state.sl_triggered = False
-                        state.sl_order_time = None
+                        # FIX: If algo order was rejected (likely immediate trigger), activate chase mode
+                        if sl_algo_order is None:
+                            state.sl_triggered = True
+                            state.sl_order_time = time.time()
+                        else:
+                            state.sl_triggered = False
+                            state.sl_order_time = None
                         state.entry_close_ms = None
 
                         log_event(cfg.log_path, {
@@ -4492,8 +4497,13 @@ def run_live(cfg: LiveConfig) -> None:
                         )
                         state.sl_order_id = None
                         state.sl_client_order_id = None
-                        state.sl_triggered = False
-                        state.sl_order_time = None
+                        # FIX: If algo order was rejected (likely immediate trigger), activate chase mode
+                        if sl_algo_order is None:
+                            state.sl_triggered = True
+                            state.sl_order_time = time.time()
+                        else:
+                            state.sl_triggered = False
+                            state.sl_order_time = None
                         state.entry_close_ms = None
 
                         log_event(cfg.log_path, {
@@ -4863,6 +4873,59 @@ def run_live(cfg: LiveConfig) -> None:
                         # Algo order cancelled/expired, clear it
                         state.sl_algo_id = None
                         state.sl_algo_client_order_id = None
+
+                # Handle case where algo order was rejected (immediate trigger) but no chase order placed yet
+                if state.sl_triggered and state.sl_algo_id is None and state.sl_order_id is None:
+                    if state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
+                        side = 1 if position_amt > 0 else -1
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        qty = abs(position_amt)
+                        qty_str = format_to_step(qty, filters["tick_size"])
+
+                        # Calculate chase price at current market with tick gap
+                        if sl_side == "SELL":
+                            chase_price = bid - tick_size if bid > 0 else state.sl_price
+                        else:
+                            chase_price = ask + tick_size if ask > 0 else state.sl_price
+                        chase_price_str = format_to_step(chase_price, tick_size)
+
+                        # Place initial chase limit order
+                        sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
+                        if has_open_position(client, active_symbol):
+                            sl_chase_order = limit_order(
+                                symbol=active_symbol,
+                                side=sl_side,
+                                quantity=qty_str,
+                                price=chase_price_str,
+                                client=client,
+                                client_order_id=sl_chase_client_id,
+                                tick_size=tick_size,
+                                reduce_only=True,
+                            )
+                        else:
+                            sl_chase_order = None
+                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase_initial"})
+
+                        if sl_chase_order:
+                            state.sl_order_id = sl_chase_order.get("orderId")
+                            state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
+                            log_event(cfg.log_path, {
+                                "event": "sl_chase_initial_placed",
+                                "symbol": active_symbol,
+                                "chase_price": format_float_2(chase_price),
+                                "order_id": state.sl_order_id,
+                                "bid": format_float_2(bid),
+                                "ask": format_float_2(ask),
+                            })
+                        else:
+                            log_event(cfg.log_path, {
+                                "event": "sl_chase_initial_rejected",
+                                "symbol": active_symbol,
+                                "chase_price": format_float_2(chase_price),
+                            })
+
+                        # Reset timer for next chase attempt
+                        state.sl_order_time = time.time()
 
                 # SL Chase Logic: check if SL limit order (from chase) is still pending
                 if state.sl_order_id and state.sl_triggered:
