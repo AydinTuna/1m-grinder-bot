@@ -102,7 +102,6 @@ class LiveConfig:
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 1.25  # ATR multiplier for dynamic trailing
     sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
-    sl_chase_timeout_seconds: float = 60.0  # seconds before chasing unfilled SL order
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"

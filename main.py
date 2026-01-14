@@ -267,6 +267,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         body_atr_mult=cfg.thr2,
         swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -1564,6 +1565,44 @@ def limit_order(
 
             params["price"] = new_price_str
             continue
+
+
+def market_order(
+    symbol: str,
+    side: str,
+    quantity: str,
+    client: BinanceUMFuturesREST,
+    client_order_id: Optional[str] = None,
+    reduce_only: bool = False,
+) -> Optional[Dict[str, object]]:
+    """
+    Places a market order on Binance Futures.
+    Used for emergency position closes when SL cannot be placed.
+    """
+    params: Dict[str, object] = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": quantity,
+    }
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+    if reduce_only:
+        params["reduceOnly"] = True
+
+    try:
+        return client.new_order(**params)
+    except ClientError as error:
+        error_code = getattr(error, "error_code", None)
+        status_code = getattr(error, "status_code", None)
+        error_message = getattr(error, "error_message", None)
+        logging.error(
+            "Market order error. status: %s, code: %s, message: %s",
+            status_code,
+            error_code,
+            error_message,
+        )
+        return None
 
 
 def query_limit_order(
@@ -3040,6 +3079,7 @@ def backtest_atr_grinder_lib(
         body_atr_mult=cfg.thr2,
         swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -3706,6 +3746,7 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
         body_atr_mult=cfg.thr2,
         swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     signal_val = int(signal.iloc[-1])
@@ -4030,7 +4071,7 @@ def run_live(cfg: LiveConfig) -> None:
                                 state.sl_algo_client_order_id = None
                                 
                                 # Place GTX conditional stop order (maker-only, 0 fees on USDC)
-                                # If GTX is rejected when triggered, software SL chase will kick in
+                                # If GTX is rejected when triggered, emergency market close will execute
                                 sl_side = "SELL" if side_sign == 1 else "BUY"
                                 sl_client_id = f"ATR_SL_T_{close_time_ms}"
                                 sl_limit_price = compute_sl_limit_price(
@@ -4361,7 +4402,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_price = sl_price
 
                         # Place GTX conditional stop order (maker-only, 0 fees on USDC)
-                        # If GTX is rejected when triggered, software SL chase will kick in
+                        # If GTX is rejected when triggered, emergency market close will execute
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
                         sl_limit_price = compute_sl_limit_price(
@@ -4385,42 +4426,75 @@ def run_live(cfg: LiveConfig) -> None:
                             reduce_only=True,
                         )
                         if sl_algo_order is None:
+                            # SL rejected - immediate market close for protection
                             log_event(cfg.log_path, {
                                 "event": "sl_algo_order_rejected",
                                 "symbol": active_symbol,
                                 "sl_price": format_float_2(sl_price),
                             })
-                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                        state.sl_algo_client_order_id = (
-                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                            or (sl_client_id if sl_algo_order else None)
-                        )
-                        state.sl_order_id = None
-                        state.sl_client_order_id = None
-                        # FIX: If algo order was rejected (likely immediate trigger), activate chase mode
-                        if sl_algo_order is None:
-                            state.sl_triggered = True
-                            state.sl_order_time = time.time()
-                        else:
+                            close_side = "SELL" if side == 1 else "BUY"
+                            emergency_close = market_order(
+                                symbol=active_symbol,
+                                side=close_side,
+                                quantity=qty_str,
+                                client=client,
+                                client_order_id=f"ATR_EMERGENCY_{int(time.time())}",
+                                reduce_only=True,
+                            )
+                            log_event(cfg.log_path, {
+                                "event": "emergency_market_close",
+                                "reason": "sl_algo_rejected_at_placement",
+                                "symbol": active_symbol,
+                                "side": close_side,
+                                "quantity": format_float_2(qty),
+                                "order_id": emergency_close.get("orderId") if emergency_close else None,
+                                "entry_price": format_float_2(entry_price),
+                            })
+                            # Reset state since position is closed
+                            state.sl_algo_id = None
+                            state.sl_algo_client_order_id = None
+                            state.sl_order_id = None
+                            state.sl_client_order_id = None
                             state.sl_triggered = False
                             state.sl_order_time = None
-                        state.entry_close_ms = None
+                            state.entry_close_ms = None
+                            state.entry_order_id = None
+                            state.entry_order_time = None
+                            state.pending_atr = None
+                            state.pending_side = None
+                            state.entry_margin_usd = None
+                            state.entry_leverage = None
+                            state.trail_r_value = None
+                            state.trail_best_close_r = None
+                            state.trail_stop_r = None
+                            state.active_symbol = None
+                        else:
+                            state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                            state.sl_algo_client_order_id = (
+                                _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                                or (sl_client_id if sl_algo_order else None)
+                            )
+                            state.sl_order_id = None
+                            state.sl_client_order_id = None
+                            state.sl_triggered = False
+                            state.sl_order_time = None
+                            state.entry_close_ms = None
 
-                        log_event(cfg.log_path, {
-                            "event": "entry_filled",
-                            "symbol": active_symbol,
-                            "order_id": order.get("orderId"),
-                            "side": "LONG" if side == 1 else "SHORT",
-                            "entry_price": format_float_2(entry_price),
-                            "quantity": format_float_2(qty),
-                            "entry_atr": format_float_2(state.active_atr),
-                            "margin_usd": format_float_2(state.entry_margin_usd),
-                            "leverage": state.entry_leverage,
-                            "sl_price": format_float_2(sl_price),
-                            "sl_algo_id": state.sl_algo_id,
-                            "trail_gap_r": cfg.trail_gap_r,
-                            "trail_buffer_r": cfg.trail_buffer_r,
-                        })
+                            log_event(cfg.log_path, {
+                                "event": "entry_filled",
+                                "symbol": active_symbol,
+                                "order_id": order.get("orderId"),
+                                "side": "LONG" if side == 1 else "SHORT",
+                                "entry_price": format_float_2(entry_price),
+                                "quantity": format_float_2(qty),
+                                "entry_atr": format_float_2(state.active_atr),
+                                "margin_usd": format_float_2(state.entry_margin_usd),
+                                "leverage": state.entry_leverage,
+                                "sl_price": format_float_2(sl_price),
+                                "sl_algo_id": state.sl_algo_id,
+                                "trail_gap_r": cfg.trail_gap_r,
+                                "trail_buffer_r": cfg.trail_buffer_r,
+                            })
                     else:
                         tp_price, sl_price = compute_tp_sl_prices(entry_price, side, entry_atr, cfg.tp_atr_mult, cfg.sl_atr_mult)
                         tp_price_str = format_to_step(tp_price, filters["tick_size"])
@@ -4456,7 +4530,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_price = sl_price
 
                         # Place GTX conditional stop order (maker-only, 0 fees on USDC)
-                        # If GTX is rejected when triggered, software SL chase will kick in
+                        # If GTX is rejected when triggered, emergency market close will execute
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_{entry_close_ms or ''}"
                         sl_limit_price = compute_sl_limit_price(
@@ -4467,7 +4541,9 @@ def run_live(cfg: LiveConfig) -> None:
                         )
                         sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
                         # Verify position still exists before placing reduce-only order
+                        sl_placement_attempted = False
                         if has_open_position(client, active_symbol):
+                            sl_placement_attempted = True
                             sl_algo_order = algo_stop_limit_order(
                                 symbol=active_symbol,
                                 side=sl_side,
@@ -4484,43 +4560,80 @@ def run_live(cfg: LiveConfig) -> None:
                         else:
                             sl_algo_order = None
                             log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "entry_fill_sl"})
-                        if sl_algo_order is None:
+                        
+                        if sl_algo_order is None and sl_placement_attempted:
+                            # SL rejected - immediate market close for protection
                             log_event(cfg.log_path, {
                                 "event": "sl_algo_order_rejected",
                                 "symbol": active_symbol,
                                 "sl_price": format_float_2(sl_price),
                             })
-                        state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
-                        state.sl_algo_client_order_id = (
-                            _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
-                            or (sl_client_id if sl_algo_order else None)
-                        )
-                        state.sl_order_id = None
-                        state.sl_client_order_id = None
-                        # FIX: If algo order was rejected (likely immediate trigger), activate chase mode
-                        if sl_algo_order is None:
-                            state.sl_triggered = True
-                            state.sl_order_time = time.time()
-                        else:
+                            # Cancel TP order since we're closing position
+                            if state.tp_order_id:
+                                cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
+                            close_side = "SELL" if side == 1 else "BUY"
+                            emergency_close = market_order(
+                                symbol=active_symbol,
+                                side=close_side,
+                                quantity=qty_str,
+                                client=client,
+                                client_order_id=f"ATR_EMERGENCY_{int(time.time())}",
+                                reduce_only=True,
+                            )
+                            log_event(cfg.log_path, {
+                                "event": "emergency_market_close",
+                                "reason": "sl_algo_rejected_at_placement",
+                                "symbol": active_symbol,
+                                "side": close_side,
+                                "quantity": format_float_2(qty),
+                                "order_id": emergency_close.get("orderId") if emergency_close else None,
+                                "entry_price": format_float_2(entry_price),
+                            })
+                            # Reset state since position is closed
+                            state.sl_algo_id = None
+                            state.sl_algo_client_order_id = None
+                            state.sl_order_id = None
+                            state.sl_client_order_id = None
                             state.sl_triggered = False
                             state.sl_order_time = None
-                        state.entry_close_ms = None
+                            state.entry_close_ms = None
+                            state.entry_order_id = None
+                            state.entry_order_time = None
+                            state.pending_atr = None
+                            state.pending_side = None
+                            state.entry_margin_usd = None
+                            state.entry_leverage = None
+                            state.tp_order_id = None
+                            state.tp_client_order_id = None
+                            state.tp_price = None
+                            state.active_symbol = None
+                        elif sl_algo_order is not None:
+                            state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                            state.sl_algo_client_order_id = (
+                                _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                                or (sl_client_id if sl_algo_order else None)
+                            )
+                            state.sl_order_id = None
+                            state.sl_client_order_id = None
+                            state.sl_triggered = False
+                            state.sl_order_time = None
+                            state.entry_close_ms = None
 
-                        log_event(cfg.log_path, {
-                            "event": "entry_filled",
-                            "symbol": active_symbol,
-                            "order_id": order.get("orderId"),
-                            "side": "LONG" if side == 1 else "SHORT",
-                            "entry_price": format_float_2(entry_price),
-                            "quantity": format_float_2(qty),
-                            "entry_atr": format_float_2(state.active_atr),
-                            "margin_usd": format_float_2(state.entry_margin_usd),
-                            "leverage": state.entry_leverage,
-                            "tp_price": format_float_2(tp_price),
-                            "sl_price": format_float_2(sl_price),
-                            "tp_order_id": state.tp_order_id,
-                            "sl_algo_id": state.sl_algo_id,
-                        })
+                            log_event(cfg.log_path, {
+                                "event": "entry_filled",
+                                "symbol": active_symbol,
+                                "order_id": order.get("orderId"),
+                                "side": "LONG" if side == 1 else "SHORT",
+                                "entry_price": format_float_2(entry_price),
+                                "quantity": format_float_2(qty),
+                                "entry_atr": format_float_2(state.active_atr),
+                                "margin_usd": format_float_2(state.entry_margin_usd),
+                                "leverage": state.entry_leverage,
+                                "tp_price": format_float_2(tp_price),
+                                "sl_price": format_float_2(sl_price),
+                                "tp_order_id": state.tp_order_id,
+                                "sl_algo_id": state.sl_algo_id,
+                            })
                 elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
                     log_event(cfg.log_path, {
                         "event": "entry_order_closed",
@@ -4796,204 +4909,64 @@ def run_live(cfg: LiveConfig) -> None:
                         state.tp_order_id = None
                         state.tp_client_order_id = None
 
-                # SL Chase Logic: check if SL algo is triggered but not filled
+                # Check if SL algo is triggered but GTX limit not filled - immediate market close
                 if state.sl_algo_id:
                     sl_algo_order = query_algo_order(client, active_symbol, algo_id=state.sl_algo_id)
                     if algo_order_triggered_not_filled(sl_algo_order):
-                        # SL triggered but not filled - start/continue chase
-                        if not state.sl_triggered:
-                            state.sl_triggered = True
-                            state.sl_order_time = time.time()
-                            log_event(cfg.log_path, {
-                                "event": "sl_triggered_not_filled",
-                                "symbol": active_symbol,
-                                "sl_algo_id": state.sl_algo_id,
-                                "sl_price": format_float_2(state.sl_price),
-                            })
+                        # SL triggered but GTX failed - immediate market close
+                        log_event(cfg.log_path, {
+                            "event": "sl_triggered_not_filled",
+                            "symbol": active_symbol,
+                            "sl_algo_id": state.sl_algo_id,
+                            "sl_price": format_float_2(state.sl_price),
+                        })
                         
-                        # Check if chase timeout elapsed
-                        if state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
-                            side = 1 if position_amt > 0 else -1
-                            sl_side = "SELL" if side == 1 else "BUY"
-                            qty = abs(position_amt)
-                            qty_str = format_to_step(qty, filters["step_size"])
-
-                            # Cancel old algo order
-                            cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
-                            state.sl_algo_id = None
-                            state.sl_algo_client_order_id = None
-                            
-                            # Calculate new chase price at current market with tick gap
-                            # For SELL: place at bid - tick to chase (maker on bid side)
-                            # For BUY: place at ask + tick to chase (maker on ask side)
-                            if sl_side == "SELL":
-                                chase_price = bid - tick_size if bid > 0 else state.sl_price
-                            else:
-                                chase_price = ask + tick_size if ask > 0 else state.sl_price
-                            chase_price_str = format_to_step(chase_price, tick_size)
-                            
-                            # Place new limit order at chase price
-                            sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
-                            if has_open_position(client, active_symbol):
-                                sl_chase_order = limit_order(
-                                    symbol=active_symbol,
-                                    side=sl_side,
-                                    quantity=qty_str,
-                                    price=chase_price_str,
-                                    client=client,
-                                    client_order_id=sl_chase_client_id,
-                                    tick_size=tick_size,
-                                    reduce_only=True,
-                                )
-                            else:
-                                sl_chase_order = None
-                                log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase"})
-                            
-                            if sl_chase_order:
-                                state.sl_order_id = sl_chase_order.get("orderId")
-                                state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
-                                log_event(cfg.log_path, {
-                                    "event": "sl_chase_placed",
-                                    "symbol": active_symbol,
-                                    "chase_price": format_float_2(chase_price),
-                                    "order_id": state.sl_order_id,
-                                    "bid": format_float_2(bid),
-                                    "ask": format_float_2(ask),
-                                })
-                            else:
-                                log_event(cfg.log_path, {
-                                    "event": "sl_chase_rejected",
-                                    "symbol": active_symbol,
-                                    "chase_price": format_float_2(chase_price),
-                                })
-                            
-                            # Reset timer for next chase attempt
-                            state.sl_order_time = time.time()
+                        side = 1 if position_amt > 0 else -1
+                        close_side = "SELL" if side == 1 else "BUY"
+                        qty = abs(position_amt)
+                        qty_str = format_to_step(qty, filters["step_size"])
+                        
+                        # Cancel the triggered algo order
+                        cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
+                        
+                        # Cancel TP order if exists
+                        if state.tp_order_id:
+                            cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
+                        
+                        # Immediate market close
+                        emergency_close = market_order(
+                            symbol=active_symbol,
+                            side=close_side,
+                            quantity=qty_str,
+                            client=client,
+                            client_order_id=f"ATR_EMERGENCY_{int(time.time())}",
+                            reduce_only=True,
+                        )
+                        log_event(cfg.log_path, {
+                            "event": "emergency_market_close",
+                            "reason": "sl_gtx_failed_at_trigger",
+                            "symbol": active_symbol,
+                            "side": close_side,
+                            "quantity": format_float_2(qty),
+                            "order_id": emergency_close.get("orderId") if emergency_close else None,
+                            "sl_price": format_float_2(state.sl_price),
+                        })
+                        
+                        # Reset state
+                        state.sl_algo_id = None
+                        state.sl_algo_client_order_id = None
+                        state.sl_order_id = None
+                        state.sl_client_order_id = None
+                        state.sl_triggered = False
+                        state.sl_order_time = None
+                        state.tp_order_id = None
+                        state.tp_client_order_id = None
+                        state.tp_price = None
+                        
                     elif algo_order_inactive(sl_algo_order):
                         # Algo order cancelled/expired, clear it
                         state.sl_algo_id = None
                         state.sl_algo_client_order_id = None
-
-                # Handle case where algo order was rejected (immediate trigger) but no chase order placed yet
-                if state.sl_triggered and state.sl_algo_id is None and state.sl_order_id is None:
-                    if state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
-                        side = 1 if position_amt > 0 else -1
-                        sl_side = "SELL" if side == 1 else "BUY"
-                        qty = abs(position_amt)
-                        qty_str = format_to_step(qty, filters["step_size"])
-
-                        # Calculate chase price at current market with tick gap
-                        if sl_side == "SELL":
-                            chase_price = bid - tick_size if bid > 0 else state.sl_price
-                        else:
-                            chase_price = ask + tick_size if ask > 0 else state.sl_price
-                        chase_price_str = format_to_step(chase_price, tick_size)
-
-                        # Place initial chase limit order
-                        sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
-                        if has_open_position(client, active_symbol):
-                            sl_chase_order = limit_order(
-                                symbol=active_symbol,
-                                side=sl_side,
-                                quantity=qty_str,
-                                price=chase_price_str,
-                                client=client,
-                                client_order_id=sl_chase_client_id,
-                                tick_size=tick_size,
-                                reduce_only=True,
-                            )
-                        else:
-                            sl_chase_order = None
-                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase_initial"})
-
-                        if sl_chase_order:
-                            state.sl_order_id = sl_chase_order.get("orderId")
-                            state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
-                            log_event(cfg.log_path, {
-                                "event": "sl_chase_initial_placed",
-                                "symbol": active_symbol,
-                                "chase_price": format_float_2(chase_price),
-                                "order_id": state.sl_order_id,
-                                "bid": format_float_2(bid),
-                                "ask": format_float_2(ask),
-                            })
-                        else:
-                            log_event(cfg.log_path, {
-                                "event": "sl_chase_initial_rejected",
-                                "symbol": active_symbol,
-                                "chase_price": format_float_2(chase_price),
-                            })
-
-                        # Reset timer for next chase attempt
-                        state.sl_order_time = time.time()
-
-                # SL Chase Logic: check if SL limit order (from chase) is still pending
-                if state.sl_order_id and state.sl_triggered:
-                    sl_order = query_limit_order(client, active_symbol, order_id=state.sl_order_id)
-                    if limit_order_filled(sl_order):
-                        # SL chase order filled - will be handled by exit detection
-                        pass
-                    elif limit_order_inactive(sl_order):
-                        # Order cancelled/expired, clear it and reset chase timer
-                        state.sl_order_id = None
-                        state.sl_client_order_id = None
-                        state.sl_order_time = time.time()  # Reset timer to try again
-                    elif state.sl_order_time and (time.time() - state.sl_order_time) >= cfg.sl_chase_timeout_seconds:
-                        # Chase timeout elapsed, need to move the order
-                        side = 1 if position_amt > 0 else -1
-                        sl_side = "SELL" if side == 1 else "BUY"
-                        qty = abs(position_amt)
-                        qty_str = format_to_step(qty, filters["step_size"])
-
-                        # Cancel old order
-                        cancel_order_safely(client, active_symbol, order_id=state.sl_order_id)
-                        state.sl_order_id = None
-                        state.sl_client_order_id = None
-                        
-                        # Calculate new chase price at current market with tick gap
-                        if sl_side == "SELL":
-                            chase_price = bid - tick_size if bid > 0 else state.sl_price
-                        else:
-                            chase_price = ask + tick_size if ask > 0 else state.sl_price
-                        chase_price_str = format_to_step(chase_price, tick_size)
-                        
-                        # Place new limit order at chase price
-                        sl_chase_client_id = f"ATR_SL_CHASE_{int(time.time())}"
-                        if has_open_position(client, active_symbol):
-                            sl_chase_order = limit_order(
-                                symbol=active_symbol,
-                                side=sl_side,
-                                quantity=qty_str,
-                                price=chase_price_str,
-                                client=client,
-                                client_order_id=sl_chase_client_id,
-                                tick_size=tick_size,
-                                reduce_only=True,
-                            )
-                        else:
-                            sl_chase_order = None
-                            log_event(cfg.log_path, {"event": "skip_reduce_only_no_position", "symbol": active_symbol, "stage": "sl_chase_move"})
-                        
-                        if sl_chase_order:
-                            state.sl_order_id = sl_chase_order.get("orderId")
-                            state.sl_client_order_id = sl_chase_order.get("clientOrderId") or sl_chase_client_id
-                            log_event(cfg.log_path, {
-                                "event": "sl_chase_moved",
-                                "symbol": active_symbol,
-                                "chase_price": format_float_2(chase_price),
-                                "order_id": state.sl_order_id,
-                                "bid": format_float_2(bid),
-                                "ask": format_float_2(ask),
-                            })
-                        else:
-                            log_event(cfg.log_path, {
-                                "event": "sl_chase_move_rejected",
-                                "symbol": active_symbol,
-                                "chase_price": format_float_2(chase_price),
-                            })
-                        
-                        # Reset timer for next chase attempt
-                        state.sl_order_time = time.time()
 
 
             # If in position and no exits placed, place them using current entryPrice
@@ -5038,7 +5011,7 @@ def run_live(cfg: LiveConfig) -> None:
                     if state.sl_price is None:
                         state.sl_price = sl_price
                     # Place GTX conditional stop order if not already placed
-                    # If GTX is rejected when triggered, software SL chase will kick in
+                    # If GTX is rejected when triggered, emergency market close will execute
                     if state.sl_algo_id is None and not state.sl_triggered:
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"
@@ -5088,7 +5061,7 @@ def run_live(cfg: LiveConfig) -> None:
                         state.sl_price = sl_price
 
                     # Place GTX conditional stop order if not already placed
-                    # If GTX is rejected when triggered, software SL chase will kick in
+                    # If GTX is rejected when triggered, emergency market close will execute
                     if state.sl_algo_id is None and not state.sl_triggered:
                         sl_side = "SELL" if side == 1 else "BUY"
                         sl_client_id = f"ATR_SL_RECOVER_{int(time.time())}"

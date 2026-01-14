@@ -256,6 +256,7 @@ def build_swing_atr_signals(
     body_atr_mult: float = 2.0,
     swing_proximity_atr_mult: float = 0.25,
     tolerance_pct: float = 0.0,
+    volume: Optional[pd.Series] = None,
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """
     Strategy rules (signal generated on candle close, entry after close):
@@ -272,6 +273,11 @@ def build_swing_atr_signals(
 
     Otherwise:
       - If candle body >= body_atr_mult*ATR => enter in same direction as candle
+
+    Trend continuation override:
+      If previous candle signaled a direction and current candle would flip:
+        - If current body > prev body AND volume > prev volume AND same candle direction
+        - Then continue the previous signal direction instead of flipping
 
     Returns:
       signal_dir: +1 long, -1 short, 0 none
@@ -355,6 +361,38 @@ def build_swing_atr_signals(
     signal[long_green | long_failed] = 1
     signal[short_break] = -1
     entry_price[short_break] = mid_body[short_break]
+
+    # Trend continuation override:
+    # If previous candle signaled, and current candle shows momentum in same direction:
+    # - body > prev_body
+    # - volume > prev_volume (if available)
+    # - candle direction matches previous signal (green for BUY, red for SELL)
+    # Then continue the previous signal instead of flipping
+    prev_signal = signal.shift(1).fillna(0).astype(int)
+    prev_body = body.shift(1)
+
+    # Conditions for continuation
+    body_bigger = body > prev_body
+    if volume is not None:
+        prev_volume = volume.shift(1)
+        vol_higher = volume > prev_volume
+    else:
+        vol_higher = True  # No volume data, skip volume check
+
+    # Candle direction must match previous signal: green(+1) matches BUY(+1), red(-1) matches SELL(-1)
+    dir_matches_prev_signal = (candle_dir == prev_signal)
+
+    # Only apply continuation if we would otherwise flip (current signal differs from prev signal)
+    would_flip = (signal != 0) & (prev_signal != 0) & (signal != prev_signal)
+
+    # Continuation condition: would flip, but momentum continues (big body, body bigger, vol higher, same dir)
+    continue_trend = would_flip & big_body & body_bigger & vol_higher & dir_matches_prev_signal
+
+    # Override: continue the previous signal direction
+    signal = signal.where(~continue_trend, prev_signal)
+
+    # Also clear entry_price for continued signals (use market entry, not limit)
+    entry_price = entry_price.where(~continue_trend, np.nan)
 
     active = signal != 0
     signal_atr[active] = atr[active]
