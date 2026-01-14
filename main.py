@@ -4909,59 +4909,74 @@ def run_live(cfg: LiveConfig) -> None:
                         state.tp_order_id = None
                         state.tp_client_order_id = None
 
-                # Check if SL algo is triggered but GTX limit not filled - immediate market close
+                # Check if SL algo is triggered but GTX limit not filled
                 if state.sl_algo_id:
                     sl_algo_order = query_algo_order(client, active_symbol, algo_id=state.sl_algo_id)
                     if algo_order_triggered_not_filled(sl_algo_order):
-                        # SL triggered but GTX failed - immediate market close
+                        # SL triggered but GTX failed
+                        side = 1 if position_amt > 0 else -1
+                        entry_price = state.entry_price or 0.0
+                        
+                        # Check if we're actually losing money
+                        # LONG: losing if bid < entry (we'd sell at bid)
+                        # SHORT: losing if ask > entry (we'd buy at ask)
+                        is_losing = (side == 1 and bid < entry_price) or (side == -1 and ask > entry_price)
+                        
                         log_event(cfg.log_path, {
                             "event": "sl_triggered_not_filled",
                             "symbol": active_symbol,
                             "sl_algo_id": state.sl_algo_id,
                             "sl_price": format_float_2(state.sl_price),
+                            "entry_price": format_float_2(entry_price),
+                            "bid": format_float_2(bid),
+                            "ask": format_float_2(ask),
+                            "is_losing": is_losing,
                         })
                         
-                        side = 1 if position_amt > 0 else -1
-                        close_side = "SELL" if side == 1 else "BUY"
-                        qty = abs(position_amt)
-                        qty_str = format_to_step(qty, filters["step_size"])
-                        
-                        # Cancel the triggered algo order
-                        cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
-                        
-                        # Cancel TP order if exists
-                        if state.tp_order_id:
-                            cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
-                        
-                        # Immediate market close
-                        emergency_close = market_order(
-                            symbol=active_symbol,
-                            side=close_side,
-                            quantity=qty_str,
-                            client=client,
-                            client_order_id=f"ATR_EMERGENCY_{int(time.time())}",
-                            reduce_only=True,
-                        )
-                        log_event(cfg.log_path, {
-                            "event": "emergency_market_close",
-                            "reason": "sl_gtx_failed_at_trigger",
-                            "symbol": active_symbol,
-                            "side": close_side,
-                            "quantity": format_float_2(qty),
-                            "order_id": emergency_close.get("orderId") if emergency_close else None,
-                            "sl_price": format_float_2(state.sl_price),
-                        })
-                        
-                        # Reset state
-                        state.sl_algo_id = None
-                        state.sl_algo_client_order_id = None
-                        state.sl_order_id = None
-                        state.sl_client_order_id = None
-                        state.sl_triggered = False
-                        state.sl_order_time = None
-                        state.tp_order_id = None
-                        state.tp_client_order_id = None
-                        state.tp_price = None
+                        if is_losing:
+                            # Only emergency close if price is against us
+                            close_side = "SELL" if side == 1 else "BUY"
+                            qty = abs(position_amt)
+                            qty_str = format_to_step(qty, filters["step_size"])
+                            
+                            # Cancel the triggered algo order
+                            cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
+                            
+                            # Cancel TP order if exists
+                            if state.tp_order_id:
+                                cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
+                            
+                            # Immediate market close
+                            emergency_close = market_order(
+                                symbol=active_symbol,
+                                side=close_side,
+                                quantity=qty_str,
+                                client=client,
+                                client_order_id=f"ATR_EMERGENCY_{int(time.time())}",
+                                reduce_only=True,
+                            )
+                            log_event(cfg.log_path, {
+                                "event": "emergency_market_close",
+                                "reason": "sl_gtx_failed_at_trigger",
+                                "symbol": active_symbol,
+                                "side": close_side,
+                                "quantity": format_float_2(qty),
+                                "order_id": emergency_close.get("orderId") if emergency_close else None,
+                                "sl_price": format_float_2(state.sl_price),
+                                "exit_price": format_float_2(bid if side == 1 else ask),
+                            })
+                            
+                            # Reset state
+                            state.sl_algo_id = None
+                            state.sl_algo_client_order_id = None
+                            state.sl_order_id = None
+                            state.sl_client_order_id = None
+                            state.sl_triggered = False
+                            state.sl_order_time = None
+                            state.tp_order_id = None
+                            state.tp_client_order_id = None
+                            state.tp_price = None
+                        # else: price moved back in our favor, let the position continue
                         
                     elif algo_order_inactive(sl_algo_order):
                         # Algo order cancelled/expired, clear it
