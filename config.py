@@ -35,7 +35,7 @@ class BacktestConfig:
     
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
-    signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
+    signal_atr_tolerance_pct: float = 0.1  # 0.1 = 10%
     swing_timeframe: str = "15m"
     swing_left: int = 2
     swing_right: int = 2
