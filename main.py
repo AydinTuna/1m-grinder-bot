@@ -305,6 +305,9 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     trailing_stop_updates: List[Dict] = []
 
     idx = df.index.to_list()
+    daily_loss_limit = cfg.daily_loss_limit_usd
+    daily_pnl_usd = 0.0
+    daily_date = idx[0].date() if idx else None
 
     def apply_slippage(price: float, side: int, is_entry: bool) -> float:
         """
@@ -353,6 +356,11 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     for i in range(1, len(df)):
         t = idx[i]
         prev_t = idx[i - 1]
+        if daily_date is not None:
+            current_date = t.date()
+            if current_date != daily_date:
+                daily_date = current_date
+                daily_pnl_usd = 0.0
 
         o = float(df.at[t, "open"])
         h = float(df.at[t, "high"])
@@ -399,6 +407,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                     pnl_net = -cfg.target_loss_usd
                     roi_net = pnl_net / active_margin if active_margin else roi_net
                 equity += pnl_net
+                if daily_loss_limit is not None and daily_loss_limit > 0:
+                    daily_pnl_usd += pnl_net
 
                 trades.append({
                     "entry_time": entry_time,
@@ -547,146 +557,32 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
 
         # --- ENTRY logic (signal on prev candle; optional mid-body limit) ---
         if position == 0:
-            # Cancel expired pending limit order before attempting fills.
-            if pending_side != 0 and pending_created_index is not None:
-                if (i - pending_created_index) >= limit_timeout_bars:
-                    pending_side = 0
-                    pending_limit_price = None
-                    pending_signal_atr = None
-                    pending_created_index = None
-
-            # Try to fill an existing pending limit order first.
-            if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
-                fill_raw = maybe_fill_limit(int(pending_side), float(pending_limit_price), o, h, l)
-                if fill_raw is not None:
-                    side = int(pending_side)
-                    signal_atr_value = float(pending_signal_atr)
-                    entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
-
-                    trade_margin, trade_leverage, _ = resolve_trade_sizing(
-                        entry_price=entry_price,
-                        atr_value=signal_atr_value,
-                        sl_atr_mult=cfg.sl_atr_mult,
-                        margin_cap=cfg.initial_capital,
-                        max_leverage=cfg.leverage,
-                        min_leverage=cfg.min_leverage,
-                        target_loss_usd=cfg.target_loss_usd,
-                    )
-                    if trade_margin is None or trade_leverage is None:
-                        pending_side = 0
-                        pending_limit_price = None
-                        pending_signal_atr = None
-                        pending_created_index = None
-                    else:
-                        if cfg.use_trailing_stop:
-                            target_price = None
-                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                            trail_best_close_r = 0.0
-                            trail_stop_r = -1
-                            stop_price = compute_trailing_sl_price(
-                                entry_price,
-                                side,
-                                trail_r_value,
-                                trail_stop_r,
-                                cfg.trail_buffer_r,
-                            )
-                        else:
-                            target_price, stop_price = compute_tp_sl_prices(
-                                entry_price,
-                                side,
-                                signal_atr_value,
-                                cfg.tp_atr_mult,
-                                cfg.sl_atr_mult,
-                            )
-
-                        position = side
-                        entry_time = t
-                        entry_index = i
-                        used_signal_atr = signal_atr_value
-                        active_margin = trade_margin
-                        active_leverage = trade_leverage
-                        active_notional = active_margin * active_leverage
-
+            daily_stop = (
+                daily_loss_limit is not None
+                and daily_loss_limit > 0
+                and daily_pnl_usd <= -daily_loss_limit
+            )
+            if daily_stop:
+                pending_side = 0
+                pending_limit_price = None
+                pending_signal_atr = None
+                pending_created_index = None
+            else:
+                # Cancel expired pending limit order before attempting fills.
+                if pending_side != 0 and pending_created_index is not None:
+                    if (i - pending_created_index) >= limit_timeout_bars:
                         pending_side = 0
                         pending_limit_price = None
                         pending_signal_atr = None
                         pending_created_index = None
 
-            # No pending order (or not filled yet): check the previous candle signal.
-            if position == 0 and pending_side == 0:
-                prev_signal = int(df.at[prev_t, "signal"])
-                prev_signal_atr = df.at[prev_t, "signal_atr"]
-                prev_entry_price = df.at[prev_t, "signal_entry_price"]
-
-                if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
-                    side = prev_signal
-                    signal_atr_value = float(prev_signal_atr)
-
-                    if prev_entry_price is not None and not (
-                        isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)
-                    ):
-                        pending_side = side
-                        pending_limit_price = float(prev_entry_price)
-                        pending_signal_atr = signal_atr_value
-                        pending_created_index = i
-
-                        fill_raw = maybe_fill_limit(side, float(prev_entry_price), o, h, l)
-                        if fill_raw is None:
-                            pass
-                        else:
-                            entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
-
-                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
-                                entry_price=entry_price,
-                                atr_value=signal_atr_value,
-                                sl_atr_mult=cfg.sl_atr_mult,
-                                margin_cap=cfg.initial_capital,
-                                max_leverage=cfg.leverage,
-                                min_leverage=cfg.min_leverage,
-                                target_loss_usd=cfg.target_loss_usd,
-                            )
-                            if trade_margin is None or trade_leverage is None:
-                                pending_side = 0
-                                pending_limit_price = None
-                                pending_signal_atr = None
-                                pending_created_index = None
-                            else:
-                                if cfg.use_trailing_stop:
-                                    target_price = None
-                                    trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                                    trail_best_close_r = 0.0
-                                    trail_stop_r = -1
-                                    stop_price = compute_trailing_sl_price(
-                                        entry_price,
-                                        side,
-                                        trail_r_value,
-                                        trail_stop_r,
-                                        cfg.trail_buffer_r,
-                                    )
-                                else:
-                                    target_price, stop_price = compute_tp_sl_prices(
-                                        entry_price,
-                                        side,
-                                        signal_atr_value,
-                                        cfg.tp_atr_mult,
-                                        cfg.sl_atr_mult,
-                                    )
-
-                                position = side
-                                entry_time = t
-                                entry_index = i
-                                used_signal_atr = signal_atr_value
-                                active_margin = trade_margin
-                                active_leverage = trade_leverage
-                                active_notional = active_margin * active_leverage
-
-                                pending_side = 0
-                                pending_limit_price = None
-                                pending_signal_atr = None
-                                pending_created_index = None
-
-                    else:
-                        entry_price = apply_slippage(o, side, is_entry=True)
+                # Try to fill an existing pending limit order first.
+                if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
+                    fill_raw = maybe_fill_limit(int(pending_side), float(pending_limit_price), o, h, l)
+                    if fill_raw is not None:
+                        side = int(pending_side)
+                        signal_atr_value = float(pending_signal_atr)
+                        entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
 
                         trade_margin, trade_leverage, _ = resolve_trade_sizing(
                             entry_price=entry_price,
@@ -698,36 +594,161 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                             target_loss_usd=cfg.target_loss_usd,
                         )
                         if trade_margin is None or trade_leverage is None:
-                            continue
-
-                        if cfg.use_trailing_stop:
-                            target_price = None
-                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                            trail_best_close_r = 0.0
-                            trail_stop_r = -1
-                            stop_price = compute_trailing_sl_price(
-                                entry_price,
-                                side,
-                                trail_r_value,
-                                trail_stop_r,
-                                cfg.trail_buffer_r,
-                            )
+                            pending_side = 0
+                            pending_limit_price = None
+                            pending_signal_atr = None
+                            pending_created_index = None
                         else:
-                            target_price, stop_price = compute_tp_sl_prices(
-                                entry_price,
-                                side,
-                                signal_atr_value,
-                                cfg.tp_atr_mult,
-                                cfg.sl_atr_mult,
-                            )
+                            if cfg.use_trailing_stop:
+                                target_price = None
+                                trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                trail_best_close_r = 0.0
+                                trail_stop_r = -1
+                                stop_price = compute_trailing_sl_price(
+                                    entry_price,
+                                    side,
+                                    trail_r_value,
+                                    trail_stop_r,
+                                    cfg.trail_buffer_r,
+                                )
+                            else:
+                                target_price, stop_price = compute_tp_sl_prices(
+                                    entry_price,
+                                    side,
+                                    signal_atr_value,
+                                    cfg.tp_atr_mult,
+                                    cfg.sl_atr_mult,
+                                )
 
-                        position = side
-                        entry_time = t
-                        entry_index = i
-                        used_signal_atr = signal_atr_value
-                        active_margin = trade_margin
-                        active_leverage = trade_leverage
-                        active_notional = active_margin * active_leverage
+                            position = side
+                            entry_time = t
+                            entry_index = i
+                            used_signal_atr = signal_atr_value
+                            active_margin = trade_margin
+                            active_leverage = trade_leverage
+                            active_notional = active_margin * active_leverage
+
+                            pending_side = 0
+                            pending_limit_price = None
+                            pending_signal_atr = None
+                            pending_created_index = None
+
+                # No pending order (or not filled yet): check the previous candle signal.
+                if position == 0 and pending_side == 0:
+                    prev_signal = int(df.at[prev_t, "signal"])
+                    prev_signal_atr = df.at[prev_t, "signal_atr"]
+                    prev_entry_price = df.at[prev_t, "signal_entry_price"]
+
+                    if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
+                        side = prev_signal
+                        signal_atr_value = float(prev_signal_atr)
+
+                        if prev_entry_price is not None and not (
+                            isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)
+                        ):
+                            pending_side = side
+                            pending_limit_price = float(prev_entry_price)
+                            pending_signal_atr = signal_atr_value
+                            pending_created_index = i
+
+                            fill_raw = maybe_fill_limit(side, float(prev_entry_price), o, h, l)
+                            if fill_raw is None:
+                                pass
+                            else:
+                                entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
+
+                                trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                    entry_price=entry_price,
+                                    atr_value=signal_atr_value,
+                                    sl_atr_mult=cfg.sl_atr_mult,
+                                    margin_cap=cfg.initial_capital,
+                                    max_leverage=cfg.leverage,
+                                    min_leverage=cfg.min_leverage,
+                                    target_loss_usd=cfg.target_loss_usd,
+                                )
+                                if trade_margin is None or trade_leverage is None:
+                                    pending_side = 0
+                                    pending_limit_price = None
+                                    pending_signal_atr = None
+                                    pending_created_index = None
+                                else:
+                                    if cfg.use_trailing_stop:
+                                        target_price = None
+                                        trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                        trail_best_close_r = 0.0
+                                        trail_stop_r = -1
+                                        stop_price = compute_trailing_sl_price(
+                                            entry_price,
+                                            side,
+                                            trail_r_value,
+                                            trail_stop_r,
+                                            cfg.trail_buffer_r,
+                                        )
+                                    else:
+                                        target_price, stop_price = compute_tp_sl_prices(
+                                            entry_price,
+                                            side,
+                                            signal_atr_value,
+                                            cfg.tp_atr_mult,
+                                            cfg.sl_atr_mult,
+                                        )
+
+                                    position = side
+                                    entry_time = t
+                                    entry_index = i
+                                    used_signal_atr = signal_atr_value
+                                    active_margin = trade_margin
+                                    active_leverage = trade_leverage
+                                    active_notional = active_margin * active_leverage
+
+                                    pending_side = 0
+                                    pending_limit_price = None
+                                    pending_signal_atr = None
+                                    pending_created_index = None
+
+                        else:
+                            entry_price = apply_slippage(o, side, is_entry=True)
+
+                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                entry_price=entry_price,
+                                atr_value=signal_atr_value,
+                                sl_atr_mult=cfg.sl_atr_mult,
+                                margin_cap=cfg.initial_capital,
+                                max_leverage=cfg.leverage,
+                                min_leverage=cfg.min_leverage,
+                                target_loss_usd=cfg.target_loss_usd,
+                            )
+                            if trade_margin is None or trade_leverage is None:
+                                continue
+
+                            if cfg.use_trailing_stop:
+                                target_price = None
+                                trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                trail_best_close_r = 0.0
+                                trail_stop_r = -1
+                                stop_price = compute_trailing_sl_price(
+                                    entry_price,
+                                    side,
+                                    trail_r_value,
+                                    trail_stop_r,
+                                    cfg.trail_buffer_r,
+                                )
+                            else:
+                                target_price, stop_price = compute_tp_sl_prices(
+                                    entry_price,
+                                    side,
+                                    signal_atr_value,
+                                    cfg.tp_atr_mult,
+                                    cfg.sl_atr_mult,
+                                )
+
+                            position = side
+                            entry_time = t
+                            entry_index = i
+                            used_signal_atr = signal_atr_value
+                            active_margin = trade_margin
+                            active_leverage = trade_leverage
+                            active_notional = active_margin * active_leverage
 
         equity_series.at[t] = equity
 
@@ -819,6 +840,8 @@ class LiveState:
     had_position: bool = False
     sl_triggered: bool = False
     sl_order_time: Optional[float] = None
+    daily_pnl_usd: float = 0.0
+    daily_date_utc: Optional[dt.date] = None
 
 
 def _utc_now_iso() -> str:
@@ -3117,6 +3140,9 @@ def backtest_atr_grinder_lib(
     trailing_stop_updates: List[Dict] = []
 
     idx = df.index.to_list()
+    daily_loss_limit = cfg.daily_loss_limit_usd
+    daily_pnl_usd = 0.0
+    daily_date = idx[0].date() if idx else None
 
     def apply_slippage(price: float, side: int, is_entry: bool) -> float:
         slip = cfg.slippage
@@ -3336,6 +3362,11 @@ def backtest_atr_grinder_lib(
     for i in range(1, len(df)):
         t = idx[i]
         prev_t = idx[i - 1]
+        if daily_date is not None:
+            current_date = t.date()
+            if current_date != daily_date:
+                daily_date = current_date
+                daily_pnl_usd = 0.0
 
         # Get 1s candles for this minute (O(1) lookup)
         df_1s_minute = get_1s_candles_for_minute(minute_index, t)
@@ -3408,6 +3439,8 @@ def backtest_atr_grinder_lib(
                     pnl_net = -cfg.target_loss_usd
                     roi_net = pnl_net / active_margin if active_margin else roi_net
                 equity += pnl_net
+                if daily_loss_limit is not None and daily_loss_limit > 0:
+                    daily_pnl_usd += pnl_net
 
                 trades.append({
                     "entry_time": entry_time,
@@ -3528,158 +3561,49 @@ def backtest_atr_grinder_lib(
 
         # --- ENTRY logic ---
         if position == 0:
-            if pending_side != 0 and pending_created_index is not None:
-                if (i - pending_created_index) >= limit_timeout_bars:
-                    pending_side = 0
-                    pending_limit_price = None
-                    pending_signal_atr = None
-                    pending_created_index = None
-
-            # Try to fill pending limit order using 1s data
-            if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
-                fill_raw = None
-                fill_time = t
-
-                if has_1s_data:
-                    fill_raw, fill_time = maybe_fill_limit_1s(int(pending_side), float(pending_limit_price), df_1s_minute)
-                else:
-                    # Fallback to 1m OHLC
-                    side = int(pending_side)
-                    if side == 1:
-                        if o <= pending_limit_price:
-                            fill_raw = o
-                        elif l <= pending_limit_price <= h:
-                            fill_raw = pending_limit_price
-                    elif side == -1:
-                        if o >= pending_limit_price:
-                            fill_raw = o
-                        elif l <= pending_limit_price <= h:
-                            fill_raw = pending_limit_price
-
-                if fill_raw is not None:
-                    side = int(pending_side)
-                    signal_atr_value = float(pending_signal_atr)
-                    entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
-
-                    trade_margin, trade_leverage, _ = resolve_trade_sizing(
-                        entry_price=entry_price,
-                        atr_value=signal_atr_value,
-                        sl_atr_mult=cfg.sl_atr_mult,
-                        margin_cap=cfg.initial_capital,
-                        max_leverage=cfg.leverage,
-                        min_leverage=cfg.min_leverage,
-                        target_loss_usd=cfg.target_loss_usd,
-                    )
-                    if trade_margin is None or trade_leverage is None:
-                        pending_side = 0
-                        pending_limit_price = None
-                        pending_signal_atr = None
-                        pending_created_index = None
-                    else:
-                        if cfg.use_trailing_stop:
-                            target_price = None
-                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                            trail_best_close_r = 0.0
-                            trail_stop_r = -1
-                            stop_price = compute_trailing_sl_price(
-                                entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
-                            )
-                        else:
-                            target_price, stop_price = compute_tp_sl_prices(
-                                entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
-                            )
-
-                        position = side
-                        entry_time = fill_time if has_1s_data else t
-                        entry_index = i
-                        used_signal_atr = signal_atr_value
-                        active_margin = trade_margin
-                        active_leverage = trade_leverage
-                        active_notional = active_margin * active_leverage
-
+            daily_stop = (
+                daily_loss_limit is not None
+                and daily_loss_limit > 0
+                and daily_pnl_usd <= -daily_loss_limit
+            )
+            if daily_stop:
+                pending_side = 0
+                pending_limit_price = None
+                pending_signal_atr = None
+                pending_created_index = None
+            else:
+                if pending_side != 0 and pending_created_index is not None:
+                    if (i - pending_created_index) >= limit_timeout_bars:
                         pending_side = 0
                         pending_limit_price = None
                         pending_signal_atr = None
                         pending_created_index = None
 
-            # Check for new signal
-            if position == 0 and pending_side == 0:
-                prev_signal = int(df.at[prev_t, "signal"])
-                prev_signal_atr = df.at[prev_t, "signal_atr"]
-                prev_entry_price = df.at[prev_t, "signal_entry_price"]
+                # Try to fill pending limit order using 1s data
+                if pending_side != 0 and pending_limit_price is not None and pending_signal_atr is not None:
+                    fill_raw = None
+                    fill_time = t
 
-                if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
-                    side = prev_signal
-                    signal_atr_value = float(prev_signal_atr)
-
-                    if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)):
-                        pending_side = side
-                        pending_limit_price = float(prev_entry_price)
-                        pending_signal_atr = signal_atr_value
-                        pending_created_index = i
-
-                        fill_raw = None
-                        fill_time = t
-
-                        if has_1s_data:
-                            fill_raw, fill_time = maybe_fill_limit_1s(side, float(prev_entry_price), df_1s_minute)
-                        else:
-                            if side == 1:
-                                if o <= prev_entry_price:
-                                    fill_raw = o
-                                elif l <= prev_entry_price <= h:
-                                    fill_raw = prev_entry_price
-                            elif side == -1:
-                                if o >= prev_entry_price:
-                                    fill_raw = o
-                                elif l <= prev_entry_price <= h:
-                                    fill_raw = prev_entry_price
-
-                        if fill_raw is not None:
-                            entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
-
-                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
-                                entry_price=entry_price,
-                                atr_value=signal_atr_value,
-                                sl_atr_mult=cfg.sl_atr_mult,
-                                margin_cap=cfg.initial_capital,
-                                max_leverage=cfg.leverage,
-                                min_leverage=cfg.min_leverage,
-                                target_loss_usd=cfg.target_loss_usd,
-                            )
-                            if trade_margin is None or trade_leverage is None:
-                                pending_side = 0
-                                pending_limit_price = None
-                                pending_signal_atr = None
-                                pending_created_index = None
-                            else:
-                                if cfg.use_trailing_stop:
-                                    target_price = None
-                                    trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                                    trail_best_close_r = 0.0
-                                    trail_stop_r = -1
-                                    stop_price = compute_trailing_sl_price(
-                                        entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
-                                    )
-                                else:
-                                    target_price, stop_price = compute_tp_sl_prices(
-                                        entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
-                                    )
-
-                                position = side
-                                entry_time = fill_time if has_1s_data else t
-                                entry_index = i
-                                used_signal_atr = signal_atr_value
-                                active_margin = trade_margin
-                                active_leverage = trade_leverage
-                                active_notional = active_margin * active_leverage
-
-                                pending_side = 0
-                                pending_limit_price = None
-                                pending_signal_atr = None
-                                pending_created_index = None
+                    if has_1s_data:
+                        fill_raw, fill_time = maybe_fill_limit_1s(int(pending_side), float(pending_limit_price), df_1s_minute)
                     else:
-                        entry_price = apply_slippage(o, side, is_entry=True)
+                        # Fallback to 1m OHLC
+                        side = int(pending_side)
+                        if side == 1:
+                            if o <= pending_limit_price:
+                                fill_raw = o
+                            elif l <= pending_limit_price <= h:
+                                fill_raw = pending_limit_price
+                        elif side == -1:
+                            if o >= pending_limit_price:
+                                fill_raw = o
+                            elif l <= pending_limit_price <= h:
+                                fill_raw = pending_limit_price
+
+                    if fill_raw is not None:
+                        side = int(pending_side)
+                        signal_atr_value = float(pending_signal_atr)
+                        entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
 
                         trade_margin, trade_leverage, _ = resolve_trade_sizing(
                             entry_price=entry_price,
@@ -3691,28 +3615,148 @@ def backtest_atr_grinder_lib(
                             target_loss_usd=cfg.target_loss_usd,
                         )
                         if trade_margin is None or trade_leverage is None:
-                            continue
-
-                        if cfg.use_trailing_stop:
-                            target_price = None
-                            trail_r_value = signal_atr_value * cfg.sl_atr_mult
-                            trail_best_close_r = 0.0
-                            trail_stop_r = -1
-                            stop_price = compute_trailing_sl_price(
-                                entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
-                            )
+                            pending_side = 0
+                            pending_limit_price = None
+                            pending_signal_atr = None
+                            pending_created_index = None
                         else:
-                            target_price, stop_price = compute_tp_sl_prices(
-                                entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
-                            )
+                            if cfg.use_trailing_stop:
+                                target_price = None
+                                trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                trail_best_close_r = 0.0
+                                trail_stop_r = -1
+                                stop_price = compute_trailing_sl_price(
+                                    entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                                )
+                            else:
+                                target_price, stop_price = compute_tp_sl_prices(
+                                    entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                                )
 
-                        position = side
-                        entry_time = t
-                        entry_index = i
-                        used_signal_atr = signal_atr_value
-                        active_margin = trade_margin
-                        active_leverage = trade_leverage
-                        active_notional = active_margin * active_leverage
+                            position = side
+                            entry_time = fill_time if has_1s_data else t
+                            entry_index = i
+                            used_signal_atr = signal_atr_value
+                            active_margin = trade_margin
+                            active_leverage = trade_leverage
+                            active_notional = active_margin * active_leverage
+
+                            pending_side = 0
+                            pending_limit_price = None
+                            pending_signal_atr = None
+                            pending_created_index = None
+
+                # Check for new signal
+                if position == 0 and pending_side == 0:
+                    prev_signal = int(df.at[prev_t, "signal"])
+                    prev_signal_atr = df.at[prev_t, "signal_atr"]
+                    prev_entry_price = df.at[prev_t, "signal_entry_price"]
+
+                    if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
+                        side = prev_signal
+                        signal_atr_value = float(prev_signal_atr)
+
+                        if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)):
+                            pending_side = side
+                            pending_limit_price = float(prev_entry_price)
+                            pending_signal_atr = signal_atr_value
+                            pending_created_index = i
+
+                            fill_raw = None
+                            fill_time = t
+
+                            if has_1s_data:
+                                fill_raw, fill_time = maybe_fill_limit_1s(side, float(prev_entry_price), df_1s_minute)
+                            else:
+                                if side == 1:
+                                    if o <= prev_entry_price:
+                                        fill_raw = o
+                                    elif l <= prev_entry_price <= h:
+                                        fill_raw = prev_entry_price
+                                elif side == -1:
+                                    if o >= prev_entry_price:
+                                        fill_raw = o
+                                    elif l <= prev_entry_price <= h:
+                                        fill_raw = prev_entry_price
+
+                            if fill_raw is not None:
+                                entry_price = apply_slippage(float(fill_raw), side, is_entry=True)
+
+                                trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                    entry_price=entry_price,
+                                    atr_value=signal_atr_value,
+                                    sl_atr_mult=cfg.sl_atr_mult,
+                                    margin_cap=cfg.initial_capital,
+                                    max_leverage=cfg.leverage,
+                                    min_leverage=cfg.min_leverage,
+                                    target_loss_usd=cfg.target_loss_usd,
+                                )
+                                if trade_margin is None or trade_leverage is None:
+                                    pending_side = 0
+                                    pending_limit_price = None
+                                    pending_signal_atr = None
+                                    pending_created_index = None
+                                else:
+                                    if cfg.use_trailing_stop:
+                                        target_price = None
+                                        trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                        trail_best_close_r = 0.0
+                                        trail_stop_r = -1
+                                        stop_price = compute_trailing_sl_price(
+                                            entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                                        )
+                                    else:
+                                        target_price, stop_price = compute_tp_sl_prices(
+                                            entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                                        )
+
+                                    position = side
+                                    entry_time = fill_time if has_1s_data else t
+                                    entry_index = i
+                                    used_signal_atr = signal_atr_value
+                                    active_margin = trade_margin
+                                    active_leverage = trade_leverage
+                                    active_notional = active_margin * active_leverage
+
+                                    pending_side = 0
+                                    pending_limit_price = None
+                                    pending_signal_atr = None
+                                    pending_created_index = None
+                        else:
+                            entry_price = apply_slippage(o, side, is_entry=True)
+
+                            trade_margin, trade_leverage, _ = resolve_trade_sizing(
+                                entry_price=entry_price,
+                                atr_value=signal_atr_value,
+                                sl_atr_mult=cfg.sl_atr_mult,
+                                margin_cap=cfg.initial_capital,
+                                max_leverage=cfg.leverage,
+                                min_leverage=cfg.min_leverage,
+                                target_loss_usd=cfg.target_loss_usd,
+                            )
+                            if trade_margin is None or trade_leverage is None:
+                                continue
+
+                            if cfg.use_trailing_stop:
+                                target_price = None
+                                trail_r_value = signal_atr_value * cfg.sl_atr_mult
+                                trail_best_close_r = 0.0
+                                trail_stop_r = -1
+                                stop_price = compute_trailing_sl_price(
+                                    entry_price, side, trail_r_value, trail_stop_r, cfg.trail_buffer_r
+                                )
+                            else:
+                                target_price, stop_price = compute_tp_sl_prices(
+                                    entry_price, side, signal_atr_value, cfg.tp_atr_mult, cfg.sl_atr_mult
+                                )
+
+                            position = side
+                            entry_time = t
+                            entry_index = i
+                            used_signal_atr = signal_atr_value
+                            active_margin = trade_margin
+                            active_leverage = trade_leverage
+                            active_notional = active_margin * active_leverage
 
         equity_series.at[t] = equity
 
@@ -4246,6 +4290,11 @@ def run_live(cfg: LiveConfig) -> None:
 
     while True:
         try:
+            today_utc = datetime.now(timezone.utc).date()
+            if state.daily_date_utc != today_utc:
+                state.daily_date_utc = today_utc
+                state.daily_pnl_usd = 0.0
+
             positions: Dict[str, Dict[str, str]] = {}
             open_symbols: List[str] = []
             for sym in symbols:
@@ -4788,6 +4837,21 @@ def run_live(cfg: LiveConfig) -> None:
                     notional = state.entry_price * state.entry_qty
                     if margin_used:
                         roi_net = pnl_net / margin_used
+                if pnl_net is not None:
+                    prev_daily_pnl = state.daily_pnl_usd
+                    state.daily_pnl_usd = prev_daily_pnl + pnl_net
+                    daily_loss_limit = cfg.daily_loss_limit_usd
+                    if (
+                        daily_loss_limit is not None
+                        and daily_loss_limit > 0
+                        and prev_daily_pnl > -daily_loss_limit
+                        and state.daily_pnl_usd <= -daily_loss_limit
+                    ):
+                        log_event(cfg.log_path, {
+                            "event": "daily_stop",
+                            "daily_pnl_usd": format_float_2(state.daily_pnl_usd),
+                            "daily_loss_limit_usd": format_float_2(daily_loss_limit),
+                        })
                 last_close_ms = last_close_ms_by_symbol.get(active_symbol)
                 if interval_ms and state.entry_signal_ms and last_close_ms:
                     bars_held = max(0, int((last_close_ms - state.entry_signal_ms) / interval_ms))
@@ -4916,12 +4980,12 @@ def run_live(cfg: LiveConfig) -> None:
                         # SL triggered but GTX failed
                         side = 1 if position_amt > 0 else -1
                         entry_price = state.entry_price or 0.0
-                        
+
                         # Check if we're actually losing money
                         # LONG: losing if bid < entry (we'd sell at bid)
                         # SHORT: losing if ask > entry (we'd buy at ask)
                         is_losing = (side == 1 and bid < entry_price) or (side == -1 and ask > entry_price)
-                        
+
                         log_event(cfg.log_path, {
                             "event": "sl_triggered_not_filled",
                             "symbol": active_symbol,
@@ -4932,20 +4996,20 @@ def run_live(cfg: LiveConfig) -> None:
                             "ask": format_float_2(ask),
                             "is_losing": is_losing,
                         })
-                        
+
                         if is_losing:
                             # Only emergency close if price is against us
                             close_side = "SELL" if side == 1 else "BUY"
                             qty = abs(position_amt)
                             qty_str = format_to_step(qty, filters["step_size"])
-                            
+
                             # Cancel the triggered algo order
                             cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
-                            
+
                             # Cancel TP order if exists
                             if state.tp_order_id:
                                 cancel_order_safely(client, active_symbol, order_id=state.tp_order_id)
-                            
+
                             # Immediate market close
                             emergency_close = market_order(
                                 symbol=active_symbol,
@@ -4965,7 +5029,7 @@ def run_live(cfg: LiveConfig) -> None:
                                 "sl_price": format_float_2(state.sl_price),
                                 "exit_price": format_float_2(bid if side == 1 else ask),
                             })
-                            
+
                             # Reset state
                             state.sl_algo_id = None
                             state.sl_algo_client_order_id = None
@@ -4976,7 +5040,68 @@ def run_live(cfg: LiveConfig) -> None:
                             state.tp_order_id = None
                             state.tp_client_order_id = None
                             state.tp_price = None
-                        # else: price moved back in our favor, let the position continue
+                        else:
+                            # Price moved back in our favor: re-arm a protective SL algo order
+                            entry_atr = state.active_atr or state.pending_atr or last_atr_by_symbol.get(active_symbol)
+                            sl_price = state.sl_price
+                            if sl_price is None:
+                                if cfg.use_trailing_stop and state.trail_r_value is not None:
+                                    sl_price = compute_trailing_sl_price(
+                                        entry_price,
+                                        side,
+                                        state.trail_r_value,
+                                        state.trail_stop_r if state.trail_stop_r is not None else -1,
+                                        cfg.trail_buffer_r,
+                                    )
+                                else:
+                                    _, sl_price = compute_tp_sl_prices(
+                                        entry_price,
+                                        side,
+                                        entry_atr or 0.0,
+                                        cfg.tp_atr_mult,
+                                        cfg.sl_atr_mult,
+                                    )
+                                state.sl_price = sl_price
+                            if sl_price is not None:
+                                # Cancel the triggered algo order before re-arming
+                                cancel_algo_order_safely(client, active_symbol, algo_id=state.sl_algo_id)
+                                sl_side = "SELL" if side == 1 else "BUY"
+                                sl_client_id = f"ATR_SL_REARM_{int(time.time())}"
+                                sl_price_str = format_to_step(sl_price, filters["tick_size"])
+                                sl_limit_price = compute_sl_limit_price(
+                                    sl_price,
+                                    side,
+                                    entry_atr or (state.active_atr or 0.0),
+                                    cfg.sl_maker_offset_atr_mult,
+                                )
+                                sl_limit_price_str = format_to_step(sl_limit_price, filters["tick_size"])
+                                sl_algo_order = algo_stop_limit_order(
+                                    symbol=active_symbol,
+                                    side=sl_side,
+                                    quantity=format_to_step(abs(position_amt), filters["step_size"]),
+                                    trigger_price=sl_price_str,
+                                    price=sl_limit_price_str,
+                                    client=client,
+                                    client_order_id=sl_client_id,
+                                    algo_type=cfg.algo_type,
+                                    working_type=cfg.algo_working_type,
+                                    price_protect=cfg.algo_price_protect,
+                                    reduce_only=True,
+                                )
+                                if sl_algo_order is None:
+                                    log_event(cfg.log_path, {
+                                        "event": "sl_rearm_rejected",
+                                        "symbol": active_symbol,
+                                        "sl_price": format_float_2(sl_price),
+                                    })
+                                else:
+                                    state.sl_algo_id = _extract_int(sl_algo_order, ("algoId", "algoOrderId", "orderId", "id"))
+                                    state.sl_algo_client_order_id = (
+                                        _extract_str(sl_algo_order, ("clientAlgoOrderId", "clientAlgoId", "clientOrderId", "clientId"))
+                                        or sl_client_id
+                                    )
+                                    state.sl_triggered = False
+                                    state.sl_order_time = None
                         
                     elif algo_order_inactive(sl_algo_order):
                         # Algo order cancelled/expired, clear it
@@ -5146,11 +5271,16 @@ def run_live(cfg: LiveConfig) -> None:
 
             active_symbol = state.active_symbol
             # New candle check / entry scan
+            daily_stop = (
+                cfg.daily_loss_limit_usd is not None
+                and cfg.daily_loss_limit_usd > 0
+                and state.daily_pnl_usd <= -cfg.daily_loss_limit_usd
+            )
             if active_symbol:
                 process_symbol_candle(active_symbol, allow_entry=False)
             elif not multi_position and state.entry_order_id is None and not open_symbols:
                 for symbol in symbols:
-                    if process_symbol_candle(symbol, allow_entry=True):
+                    if process_symbol_candle(symbol, allow_entry=not daily_stop):
                         active_symbol = symbol
                         break
         except ClientError as exc:
