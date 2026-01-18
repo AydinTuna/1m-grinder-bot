@@ -87,9 +87,9 @@ class LiveConfig:
     atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
     leverage: int = 125  # max leverage for dynamic sizing
     min_leverage: int = 20
-    margin_usd: float = 100.0  # margin cap per trade if targets are set
+    margin_usd: float = 300.0  # margin cap per trade if targets are set
     target_loss_usd: Optional[float] = 5.0
-    daily_loss_limit_usd: Optional[float] = 30.0
+    daily_loss_limit_usd: Optional[float] = 40.0
 
     # Strategy thresholds
     thr1: float = 2.0
