@@ -97,7 +97,7 @@ class LiveConfig:
 
     # Risk/exit controls
     tp_atr_mult: float = 2.0
-    sl_atr_mult: float = 0.25
+    sl_atr_mult: float = 1.0 
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
