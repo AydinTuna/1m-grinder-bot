@@ -112,8 +112,8 @@ class LiveConfig:
 
     # Execution controls
     tp_post_only: bool = True
-    entry_delay_min_seconds: float = 5.0
-    entry_delay_max_seconds: float = 5.0
+    entry_delay_min_seconds: float = 0.01
+    entry_delay_max_seconds: float = 0.01
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 1.0
