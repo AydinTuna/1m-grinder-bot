@@ -24,6 +24,21 @@ LIVE_TRADE_FIELDS: List[str] = [
     "bars_held",
 ]
 
+LIVE_SIGNAL_FIELDS: List[str] = [
+    "timestamp",
+    "symbol",
+    "side",
+    "signal",
+    "signal_atr",
+    "entry_price",
+    "open",
+    "high",
+    "low",
+    "close",
+    "atr",
+    "status",  # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_PENDING"
+]
+
 
 @dataclass
 class BacktestConfig:
@@ -78,7 +93,7 @@ class LiveConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 100  # bars to pull for stable ATR/EMA (1d candles)
-    leverage: int = 10  # fixed leverage for static sizing
+    leverage: int = 5  # fixed leverage for static sizing
     margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
@@ -110,5 +125,6 @@ class LiveConfig:
     entry_order_timeout_seconds: float = 55.0
     log_path: str = "trade_log.jsonl"
     live_trades_csv: str = "live_trades.csv"
+    live_signals_csv: str = "live_signals.csv"
     post_only: bool = True
     use_testnet: bool = False
