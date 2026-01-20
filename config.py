@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 
 LIVE_TRADE_FIELDS: List[str] = [
     "entry_time",
     "exit_time",
+    "symbol",
     "side",
     "entry_price",
     "exit_price",
     "signal_atr",
-    "tp_atr_mult",
-    "sl_atr_mult",
-    "target_price",
     "stop_price",
     "exit_reason",
     "roi_net",
@@ -30,25 +28,21 @@ LIVE_TRADE_FIELDS: List[str] = [
 @dataclass
 class BacktestConfig:
     # Timeframe for signal generation (ATR calculation, entry signals)
-    # Use "1m", "5m", "15m", "1h", etc. Execution still uses 1s candles.
-    signal_interval: str = "1m"
+    # Use "1d" for daily strategy. Execution uses 1m candles for trailing.
+    signal_interval: str = "1d"
     
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.1  # 0.1 = 10%
-    swing_timeframe: str = "15m"
+    swing_timeframe: str = "1d"
     swing_left: int = 2
     swing_right: int = 2
-    swing_resample_rule: str = "15min"
+    swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 125.0  # max leverage for dynamic sizing
-    min_leverage: float = 20.0
+    leverage: float = 20.0  # fixed leverage for static sizing
     initial_capital: float = 100.0  # starting equity (margin cap per trade)
-
-    # Position sizing target (optional, profit implied by TP/SL ratio)
-    target_loss_usd: Optional[float] = 5.0
-    daily_loss_limit_usd: Optional[float] = 30.0
+    margin_usd: float = 5.0  # static margin per trade
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -58,52 +52,49 @@ class BacktestConfig:
     thr1: float = 2.0
     thr2: float = 2.0
 
-    # Risk/exit controls
-    tp_atr_mult: float = 2.0
-    sl_atr_mult: float = 1.0
+    # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 1.00  # ATR multiplier for dynamic trailing
-    sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
+    trail_check_interval: str = "1m"  # interval for trailing stop updates (Look In Bar)
+    
+    # Multi-position settings
+    max_open_positions: int = 3  # max concurrent positions
 
 
 @dataclass
 class LiveConfig:
-    symbol: str = "BTCUSDC"
-    symbols: List[str] = field(default_factory=lambda: ["BTCUSDC"])
     # Timeframe for signal generation (ATR calculation, entry signals)
-    # Use "1m", "5m", "15m", "1h", etc. Price tracking uses poll_interval_seconds.
-    signal_interval: str = "1m"
+    # Use "1d" for daily strategy. Trailing stop uses trail_check_interval.
+    signal_interval: str = "1d"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
-    swing_timeframe: str = "15m"
+    swing_timeframe: str = "1d"
     swing_left: int = 2
     swing_right: int = 2
-    swing_resample_rule: str = "15min"
+    swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
-    atr_history_bars: int = 500  # bars to pull for stable ATR/EMA
-    leverage: int = 125  # max leverage for dynamic sizing
-    min_leverage: int = 20
-    margin_usd: float = 300.0  # margin cap per trade if targets are set
-    target_loss_usd: Optional[float] = 5.0
-    daily_loss_limit_usd: Optional[float] = 40.0
+    atr_history_bars: int = 100  # bars to pull for stable ATR/EMA (1d candles)
+    leverage: int = 20  # fixed leverage for static sizing
+    margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
 
-    # Risk/exit controls
-    tp_atr_mult: float = 2.0
-    sl_atr_mult: float = 1.0 
+    # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 1.25  # ATR multiplier for dynamic trailing
-    sl_maker_offset_atr_mult: float = 0.10  # offset for SL limit price to ensure fill (trigger-to-limit gap)
+    trail_check_interval: str = "1m"  # interval for trailing stop updates (Look In Bar)
+
+    # Multi-position settings
+    max_open_positions: int = 3  # max concurrent positions
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
@@ -111,12 +102,11 @@ class LiveConfig:
     algo_price_protect: bool = False
 
     # Execution controls
-    tp_post_only: bool = True
     entry_delay_min_seconds: float = 0.01
     entry_delay_max_seconds: float = 0.01
     spread_max_pct: float = 0.0001  # 0.01%
     atr_offset_mult: float = 0.02
-    poll_interval_seconds: float = 1.0
+    poll_interval_seconds: float = 60.0  # check every minute for trailing
     entry_order_timeout_seconds: float = 55.0
     log_path: str = "trade_log.jsonl"
     live_trades_csv: str = "live_trades.csv"
