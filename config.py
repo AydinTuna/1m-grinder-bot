@@ -36,7 +36,7 @@ LIVE_SIGNAL_FIELDS: List[str] = [
     "low",
     "close",
     "atr",
-    "status",  # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_PENDING"
+    "status",  # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_PENDING", "SKIPPED_OUTSIDE_WINDOW"
 ]
 
 
@@ -111,6 +111,10 @@ class LiveConfig:
     # Multi-position settings
     max_open_positions: int = 3  # max concurrent positions
 
+    # Entry time window (only enter positions within X minutes after daily candle close at 00:00 UTC)
+    # Set to 0 to disable this check and allow entries anytime
+    entry_window_minutes: int = 60
+
     # Algo order controls
     algo_type: str = "CONDITIONAL"
     algo_working_type: str = "CONTRACT_PRICE"
@@ -119,7 +123,7 @@ class LiveConfig:
     # Execution controls
     entry_delay_min_seconds: float = 0.01
     entry_delay_max_seconds: float = 0.01
-    spread_max_pct: float = 0.0001  # 0.01%
+    spread_max_pct: float = 1.0  # disabled (set to 0.0001 for 0.01% filter)
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 60.0  # check every minute for trailing
     entry_order_timeout_seconds: float = 55.0

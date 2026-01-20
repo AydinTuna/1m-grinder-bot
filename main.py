@@ -921,6 +921,28 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def is_within_entry_window(window_minutes: int) -> bool:
+    """
+    Check if current UTC time is within the entry window after daily candle close.
+    
+    Daily candle closes at 00:00 UTC. This function returns True if we're within
+    `window_minutes` after midnight UTC.
+    
+    Args:
+        window_minutes: Number of minutes after 00:00 UTC to allow entries.
+                       Set to 0 to disable this check (always returns True).
+    
+    Returns:
+        True if within the entry window or check is disabled, False otherwise.
+    """
+    if window_minutes <= 0:
+        return True  # Check disabled
+    
+    now = datetime.now(timezone.utc)
+    minutes_since_midnight = now.hour * 60 + now.minute
+    return minutes_since_midnight < window_minutes
+
+
 def log_event(log_path: str, event: Dict[str, object]) -> None:
     payload = dict(event)
     payload["ts"] = _utc_now_iso()
@@ -4751,6 +4773,8 @@ def run_live(cfg: LiveConfig) -> None:
                     status = "SKIPPED_PENDING"
                 elif not state.can_open_position(cfg.max_open_positions):
                     status = "SKIPPED_MAX_POS"
+                elif not is_within_entry_window(cfg.entry_window_minutes):
+                    status = "SKIPPED_OUTSIDE_WINDOW"
                 else:
                     status = "ACTED"
                 
@@ -4772,7 +4796,7 @@ def run_live(cfg: LiveConfig) -> None:
                 append_live_signal(cfg.live_signals_csv, signal_data)
                 
                 # Print signal to terminal
-                print(f"[SIGNAL] {symbol} {side_str} @ {signal_entry_price or 'MARKET':.6f} (ATR: {atr_value:.6f}) - {status}")
+                print(f"[SIGNAL] {symbol} {side_str} @ {f'{signal_entry_price:.6f}' if signal_entry_price else 'MARKET'} (ATR: {atr_value:.6f}) - {status}")
                 
                 # Log to event log
                 log_event(cfg.log_path, {
