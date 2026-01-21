@@ -64,8 +64,17 @@ from typing import Iterable, Optional, Tuple, List, Dict, Any
 import numpy as np
 import pandas as pd
 
-from config import BacktestConfig, LiveConfig, LIVE_TRADE_FIELDS, LIVE_SIGNAL_FIELDS
-from swing_levels import build_swing_atr_signals, compute_confirmed_swing_levels
+from config import BacktestConfig, LiveConfig, LIVE_TRADE_FIELDS, LIVE_SIGNAL_FIELDS, get_output_path
+from swing_levels import (
+    build_swing_atr_signals,
+    build_market_structure_signals,
+    compute_confirmed_swing_levels,
+    compute_market_structure_levels,
+    classify_market_structure,
+    detect_swings,
+    resample_ohlcv,
+    MarketStructurePoint,
+)
 
 try:
     from dotenv import load_dotenv
@@ -288,6 +297,21 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
 
     df["atr"] = atr_ema(df, cfg.atr_len)
 
+    # Compute market structure (HH/HL/LL/LH) levels
+    structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
+        df,
+        df["atr"],
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    df["hh_level"] = hh_series
+    df["hl_level"] = hl_series
+    df["ll_level"] = ll_series
+    df["lh_level"] = lh_series
+
+    # Also compute raw swing levels for reference
     swing_high, swing_low = compute_confirmed_swing_levels(
         df,
         swing_timeframe=cfg.swing_timeframe,
@@ -298,15 +322,14 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     df["swing_high_level"] = swing_high
     df["swing_low_level"] = swing_low
 
-    df["signal"], df["signal_atr"], df["signal_entry_price"] = build_swing_atr_signals(
+    # Generate signals based on market structure
+    df["signal"], df["signal_atr"], df["signal_entry_price"], df["signal_reason"], df["trend"] = build_market_structure_signals(
         df,
         df["atr"],
-        df["swing_high_level"],
-        df["swing_low_level"],
+        structure_points,
         body_atr_mult=cfg.thr2,
-        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
-        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -315,6 +338,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         df.loc[warmup_idx, "signal"] = 0
         df.loc[warmup_idx, "signal_atr"] = np.nan
         df.loc[warmup_idx, "signal_entry_price"] = np.nan
+        df.loc[warmup_idx, "signal_reason"] = ""
+        df.loc[warmup_idx, "trend"] = 0
 
     # Equity curve (USD)
     equity = cfg.initial_capital
@@ -402,10 +427,14 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         o = float(df.at[t, "open"])
         h = float(df.at[t, "high"])
         l = float(df.at[t, "low"])
+        c = float(df.at[t, "close"])
 
         # --- EXIT logic ---
+        # Exit only on candle CLOSE (not intra-candle high/low) for consistency
+        # with higher timeframe close exit behavior
         if position != 0 and entry_price is not None and stop_price is not None:
-            sl_hit = (l <= stop_price) if position == 1 else (h >= stop_price)
+            # Use close price for stop check (candle must CLOSE beyond stop)
+            sl_hit = (c <= stop_price) if position == 1 else (c >= stop_price)
 
             exited = False
             exit_reason = None
@@ -414,26 +443,27 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             if cfg.use_trailing_stop:
                 if sl_hit:
                     exit_reason = "SL"
-                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exit_price = apply_slippage(c, position, is_entry=False)
                     exited = True
             else:
                 if target_price is not None:
-                    tp_hit = (h >= target_price) if position == 1 else (l <= target_price)
+                    # TP also uses close price
+                    tp_hit = (c >= target_price) if position == 1 else (c <= target_price)
                 else:
                     tp_hit = False
 
                 if sl_hit and tp_hit:
                     # Conservative assumption when both hit in the same candle.
                     exit_reason = "SL"
-                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exit_price = apply_slippage(c, position, is_entry=False)
                     exited = True
                 elif tp_hit:
                     exit_reason = "TP"
-                    exit_price = apply_slippage(target_price, position, is_entry=False)
+                    exit_price = apply_slippage(c, position, is_entry=False)
                     exited = True
                 elif sl_hit:
                     exit_reason = "SL"
-                    exit_price = apply_slippage(stop_price, position, is_entry=False)
+                    exit_price = apply_slippage(c, position, is_entry=False)
                     exited = True
 
             if exited:
@@ -490,19 +520,27 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 floor_stop = entry_price  # Floor at breakeven (0R), no negative stops
                 atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
 
-                # Apply floor only (stop can move up OR down, just not past breakeven)
+                # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
                 if position == 1:  # LONG
                     new_stop = max(atr_stop, floor_stop)  # floor is minimum
                 else:  # SHORT
                     new_stop = min(atr_stop, floor_stop)  # floor is maximum
 
-                # Only set stop if it's at breakeven or better
+                # Only set stop if price has moved activation_r in our favor
+                # This prevents immediate breakeven stops that get hit by normal volatility
+                activation_threshold = (trail_r_value if trail_r_value is not None else current_atr) * cfg.dynamic_trail_activation_r
                 if position == 1:
-                    should_set_stop = new_stop >= entry_price  # Stop at or above entry for LONG
+                    price_moved_enough = c >= entry_price + activation_threshold
+                    should_set_stop = price_moved_enough and new_stop >= entry_price
                 else:
-                    should_set_stop = new_stop <= entry_price  # Stop at or below entry for SHORT
+                    price_moved_enough = c <= entry_price - activation_threshold
+                    should_set_stop = price_moved_enough and new_stop <= entry_price
 
-                stop_moved = should_set_stop and (stop_price is None or new_stop != stop_price)
+                # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
+                if position == 1:  # LONG
+                    stop_moved = should_set_stop and (stop_price is None or new_stop > stop_price)
+                else:  # SHORT
+                    stop_moved = should_set_stop and (stop_price is None or new_stop < stop_price)
                 if stop_moved:
                     stop_price = new_stop
 
@@ -520,6 +558,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                     "new_stop_price": stop_price,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "price_moved_enough": price_moved_enough,
                     "stop_moved": stop_moved,
                 })
 
@@ -633,7 +673,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                             target_price = None
                             trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                             trail_best_close_r = 0.0
-                            trail_stop_r = 0  # Start at breakeven, no negative stops
+                            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                             stop_price = None  # No stop until price reaches breakeven
                         else:
                             target_price, stop_price = compute_tp_sl_prices(
@@ -700,7 +740,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                                     target_price = None
                                     trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                                     trail_best_close_r = 0.0
-                                    trail_stop_r = 0  # Start at breakeven, no negative stops
+                                    trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                                     stop_price = None  # No stop until price reaches breakeven
                                 else:
                                     target_price, stop_price = compute_tp_sl_prices(
@@ -743,7 +783,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                             target_price = None
                             trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                             trail_best_close_r = 0.0
-                            trail_stop_r = 0  # Start at breakeven, no negative stops
+                            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                             stop_price = None  # No stop until price reaches breakeven
                         else:
                             target_price, stop_price = compute_tp_sl_prices(
@@ -853,7 +893,7 @@ class PositionState:
     entry_atr: float  # ATR at entry (frozen for R-based trailing)
     trail_r_value: float  # R value = entry_atr (for trailing stop calculation)
     trail_best_close_r: float = 0.0  # best close in R units
-    trail_stop_r: int = 0  # current trailing stop level in R (0 = breakeven, no negative stops)
+    trail_stop_r: int = -1  # current trailing stop level in R (-1 = no stop until 1R profit)
     sl_algo_id: Optional[int] = None
     sl_algo_client_order_id: Optional[str] = None
     sl_price: Optional[float] = None
@@ -977,6 +1017,52 @@ def format_float_by_symbol(value: Optional[float], symbol: str) -> Optional[floa
     if is_btc_symbol(symbol):
         return format_float_1(value)
     return format_float_2(value)
+
+
+def get_precision_from_tick_size(tick_size: float) -> int:
+    """
+    Get decimal precision from tick_size.
+    E.g., tick_size=0.0001 -> precision=4
+          tick_size=0.01 -> precision=2
+          tick_size=1.0 -> precision=0
+    """
+    if tick_size <= 0:
+        return 8  # default fallback
+    tick_str = f"{tick_size:.10f}".rstrip('0')
+    if '.' in tick_str:
+        return len(tick_str.split('.')[1])
+    return 0
+
+
+def format_price_with_precision(value: Optional[float], tick_size: float) -> Optional[str]:
+    """
+    Format a price value with precision derived from tick_size.
+    Returns string representation with proper decimal places.
+    """
+    if value is None:
+        return None
+    try:
+        precision = get_precision_from_tick_size(tick_size)
+        return f"{float(value):.{precision}f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def format_price_for_logging(value: Optional[float], tick_size: Optional[float]) -> str:
+    """
+    Format a price value for logging (CSV, JSON).
+    Uses tick_size precision if available, otherwise falls back to 8 decimals.
+    """
+    if value is None:
+        return ""
+    try:
+        if tick_size and tick_size > 0:
+            precision = get_precision_from_tick_size(tick_size)
+        else:
+            precision = 8  # fallback for unknown symbols
+        return f"{float(value):.{precision}f}"
+    except (TypeError, ValueError):
+        return ""
 
 
 def format_float_2_str(value: Optional[float]) -> str:
@@ -1461,6 +1547,47 @@ def get_all_usdt_perpetuals(client: BinanceUMFuturesREST) -> List[str]:
             and s.get("status") == "TRADING"):
             symbols.append(s.get("symbol"))
     return sorted(symbols)
+
+
+def get_all_usdt_perpetuals_with_filters(client: BinanceUMFuturesREST) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    """
+    Fetch all USDT perpetual symbols AND their filters in a single API call.
+    Much faster than calling get_symbol_filters() for each symbol individually.
+    
+    Returns:
+        Tuple of (symbols_list, filters_by_symbol_dict)
+    """
+    info = client.exchange_info()
+    symbols = []
+    filters_by_symbol: Dict[str, Dict[str, float]] = {}
+    
+    for s in info.get("symbols", []):
+        # Only include PERPETUAL contracts with USDT as quote asset
+        if (s.get("contractType") == "PERPETUAL" 
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"):
+            symbol = s.get("symbol")
+            symbols.append(symbol)
+            
+            # Extract filters
+            tick_size = None
+            step_size = None
+            min_qty = None
+            for f in s.get("filters", []):
+                if f.get("filterType") == "PRICE_FILTER":
+                    tick_size = float(f["tickSize"])
+                elif f.get("filterType") == "LOT_SIZE":
+                    step_size = float(f["stepSize"])
+                    min_qty = float(f["minQty"])
+            
+            if tick_size is not None and step_size is not None and min_qty is not None:
+                filters_by_symbol[symbol] = {
+                    "tick_size": tick_size,
+                    "step_size": step_size,
+                    "min_qty": min_qty,
+                }
+    
+    return sorted(symbols), filters_by_symbol
 
 
 def get_book_ticker(client: BinanceUMFuturesREST, symbol: str) -> Tuple[float, float]:
@@ -2325,6 +2452,111 @@ def append_live_signal(csv_path: str, signal_data: Dict[str, object]) -> None:
             value = signal_data.get(field)
             row[field] = "" if value is None else value
         writer.writerow(row)
+
+
+def save_live_swing_levels(
+    file_path: str,
+    symbol: str,
+    df: pd.DataFrame,
+    swing_timeframe: str,
+    swing_left: int,
+    swing_right: int,
+    resample_rule: str,
+) -> None:
+    """
+    Save detected swing levels and market structure (HH/HL/LL/LH) to a JSON file.
+    
+    Updates the file with swing levels for the given symbol, preserving data for other symbols.
+    """
+    if not file_path or df.empty:
+        return
+    
+    # Detect swings on the specified timeframe
+    if swing_timeframe == "1m":
+        df_tf = df
+        tf = "1m"
+    else:
+        df_tf = resample_ohlcv(df, rule=resample_rule)
+        tf = swing_timeframe
+    
+    swings = detect_swings(df_tf, timeframe=tf, left=swing_left, right=swing_right)
+    
+    # Get current swing high/low levels (last confirmed)
+    swing_highs = [s for s in swings if s.kind == "swing_high"]
+    swing_lows = [s for s in swings if s.kind == "swing_low"]
+    current_swing_high = swing_highs[-1].level if swing_highs else None
+    current_swing_low = swing_lows[-1].level if swing_lows else None
+    
+    # Compute ATR for market structure classification
+    atr = atr_ema(df_tf, length=14)
+    
+    # Classify swings into market structure (HH/HL/LL/LH)
+    structure_points = classify_market_structure(swings, df_tf, atr)
+    
+    # Get current market structure levels
+    hh_points = [sp for sp in structure_points if sp.structure_kind == "HH"]
+    hl_points = [sp for sp in structure_points if sp.structure_kind == "HL"]
+    ll_points = [sp for sp in structure_points if sp.structure_kind == "LL"]
+    lh_points = [sp for sp in structure_points if sp.structure_kind == "LH"]
+    
+    current_hh = hh_points[-1].swing_point.high if hh_points else None
+    current_hl = hl_points[-1].swing_point.low if hl_points else None
+    current_ll = ll_points[-1].swing_point.low if ll_points else None
+    current_lh = lh_points[-1].swing_point.high if lh_points else None
+    
+    # Determine current trend based on last structure point
+    current_trend = "UNDEFINED"
+    if structure_points:
+        last_structure = structure_points[-1].structure_kind
+        if last_structure in ("HH", "HL"):
+            current_trend = "UPTREND"
+        elif last_structure in ("LL", "LH"):
+            current_trend = "DOWNTREND"
+    
+    # Load existing data or create new
+    data: Dict[str, Any] = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    
+    # Update data for this symbol
+    data[symbol] = {
+        "updated_at": _utc_now_iso(),
+        "params": {
+            "timeframe": swing_timeframe,
+            "left": swing_left,
+            "right": swing_right,
+        },
+        "current_levels": {
+            "swing_high": current_swing_high,
+            "swing_low": current_swing_low,
+        },
+        "market_structure": {
+            "trend": current_trend,
+            "hh": current_hh,
+            "hl": current_hl,
+            "ll": current_ll,
+            "lh": current_lh,
+        },
+        "stats": {
+            "bars": len(df_tf),
+            "swing_highs": len(swing_highs),
+            "swing_lows": len(swing_lows),
+            "hh_count": len(hh_points),
+            "hl_count": len(hl_points),
+            "ll_count": len(ll_points),
+            "lh_count": len(lh_points),
+        },
+        "swings": [s.to_dict() for s in swings],
+        "structure_points": [sp.to_dict() for sp in structure_points],
+    }
+    
+    # Save back to file
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def klines_to_df(klines: List[List[object]]) -> pd.DataFrame:
@@ -3221,6 +3453,21 @@ def backtest_atr_grinder_lib(
 
     df["atr"] = atr_ema(df, cfg.atr_len)
 
+    # Compute market structure (HH/HL/LL/LH) levels
+    structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
+        df,
+        df["atr"],
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    df["hh_level"] = hh_series
+    df["hl_level"] = hl_series
+    df["ll_level"] = ll_series
+    df["lh_level"] = lh_series
+
+    # Also compute raw swing levels for reference
     swing_high, swing_low = compute_confirmed_swing_levels(
         df,
         swing_timeframe=cfg.swing_timeframe,
@@ -3231,15 +3478,14 @@ def backtest_atr_grinder_lib(
     df["swing_high_level"] = swing_high
     df["swing_low_level"] = swing_low
 
-    df["signal"], df["signal_atr"], df["signal_entry_price"] = build_swing_atr_signals(
+    # Generate signals based on market structure
+    df["signal"], df["signal_atr"], df["signal_entry_price"], df["signal_reason"], df["trend"] = build_market_structure_signals(
         df,
         df["atr"],
-        df["swing_high_level"],
-        df["swing_low_level"],
+        structure_points,
         body_atr_mult=cfg.thr2,
-        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
-        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -3248,6 +3494,8 @@ def backtest_atr_grinder_lib(
         df.loc[warmup_idx, "signal"] = 0
         df.loc[warmup_idx, "signal_atr"] = np.nan
         df.loc[warmup_idx, "signal_entry_price"] = np.nan
+        df.loc[warmup_idx, "signal_reason"] = ""
+        df.loc[warmup_idx, "trend"] = 0
 
     # Equity curve (USD)
     equity = cfg.initial_capital
@@ -3317,79 +3565,65 @@ def backtest_atr_grinder_lib(
         df_1s_chunk: pd.DataFrame,
         use_trailing: bool,
     ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp]]:
-        """Check for exit using 1s candles in chronological order.
+        """Check for exit using candle closes at higher timeframe boundaries (e.g., 4h).
         
         Note: sl_price may be None if no stop has been set yet (breakeven-only stops).
+        Exit only triggers when a higher timeframe candle CLOSES beyond the stop.
         """
         # If no stop price is set, no SL can be hit
         if sl_price is None:
             # Check only TP (if not using trailing and TP is set)
             if not use_trailing and tp_price is not None:
                 for t_1s, candle_1s in df_1s_chunk.iterrows():
-                    h = float(candle_1s["high"])
-                    l = float(candle_1s["low"])
-                    if pos == 1 and h >= tp_price:
-                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    # Only check on exit interval boundaries
+                    if not is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
+                        continue
+                    c = float(candle_1s["close"])
+                    if pos == 1 and c >= tp_price:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s
-                    elif pos == -1 and l <= tp_price:
-                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    elif pos == -1 and c <= tp_price:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s
             return False, None, None, None
 
         for t_1s, candle_1s in df_1s_chunk.iterrows():
-            o = float(candle_1s["open"])
-            h = float(candle_1s["high"])
-            l = float(candle_1s["low"])
+            # Only check exit on higher timeframe boundaries (e.g., 4h close)
+            if not is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
+                continue
+
+            c = float(candle_1s["close"])
 
             if pos == 1:  # LONG
-                # Gap down through stop
-                if o <= sl_price:
-                    exit_price = apply_slippage(o, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-
-                sl_hit = l <= sl_price
-                tp_hit = (not use_trailing) and tp_price is not None and h >= tp_price
+                # Exit if candle CLOSES below stop
+                sl_hit = c <= sl_price
+                tp_hit = (not use_trailing) and tp_price is not None and c >= tp_price
 
                 if sl_hit and tp_hit:
-                    # Both could be hit - use proximity to open
-                    dist_to_sl = o - sl_price
-                    dist_to_tp = tp_price - o
-                    if dist_to_sl <= dist_to_tp:
-                        exit_price = apply_slippage(sl_price, pos, is_entry=False)
-                        return True, "SL", exit_price, t_1s
-                    else:
-                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
-                        return True, "TP", exit_price, t_1s
+                    # Both hit - conservative: use SL
+                    exit_price = apply_slippage(c, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
                 elif sl_hit:
-                    exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                    exit_price = apply_slippage(c, pos, is_entry=False)
                     return True, "SL", exit_price, t_1s
                 elif tp_hit:
-                    exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    exit_price = apply_slippage(c, pos, is_entry=False)
                     return True, "TP", exit_price, t_1s
 
             else:  # SHORT
-                # Gap up through stop
-                if o >= sl_price:
-                    exit_price = apply_slippage(o, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-
-                sl_hit = h >= sl_price
-                tp_hit = (not use_trailing) and tp_price is not None and l <= tp_price
+                # Exit if candle CLOSES above stop
+                sl_hit = c >= sl_price
+                tp_hit = (not use_trailing) and tp_price is not None and c <= tp_price
 
                 if sl_hit and tp_hit:
-                    dist_to_sl = sl_price - o
-                    dist_to_tp = o - tp_price
-                    if dist_to_sl <= dist_to_tp:
-                        exit_price = apply_slippage(sl_price, pos, is_entry=False)
-                        return True, "SL", exit_price, t_1s
-                    else:
-                        exit_price = apply_slippage(tp_price, pos, is_entry=False)
-                        return True, "TP", exit_price, t_1s
+                    # Both hit - conservative: use SL
+                    exit_price = apply_slippage(c, pos, is_entry=False)
+                    return True, "SL", exit_price, t_1s
                 elif sl_hit:
-                    exit_price = apply_slippage(sl_price, pos, is_entry=False)
+                    exit_price = apply_slippage(c, pos, is_entry=False)
                     return True, "SL", exit_price, t_1s
                 elif tp_hit:
-                    exit_price = apply_slippage(tp_price, pos, is_entry=False)
+                    exit_price = apply_slippage(c, pos, is_entry=False)
                     return True, "TP", exit_price, t_1s
 
         return False, None, None, None
@@ -3468,6 +3702,117 @@ def backtest_atr_grinder_lib(
 
         return current_sl_price, current_best_r, current_stop_r
 
+    def process_trailing_and_exit_lib(
+        pos: int,
+        entry_p: float,
+        r_value: float,
+        best_close_r: float,
+        stop_r: int,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        df_1s_chunk: pd.DataFrame,
+        entry_t: pd.Timestamp,
+        side_str: str,
+        use_trailing: bool,
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp], Optional[float], float, int]:
+        """
+        Process 1m candles sequentially: update trailing stop THEN check exit for each candle.
+        
+        Returns:
+            (exited, exit_reason, exit_price, exit_time, final_sl_price, final_best_r, final_stop_r)
+        """
+        nonlocal trailing_stop_updates
+        current_best_r = best_close_r
+        current_stop_r = stop_r
+        current_sl_price = sl_price
+
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            o = float(candle_1s["open"])
+            h = float(candle_1s["high"])
+            l = float(candle_1s["low"])
+            c = float(candle_1s["close"])
+
+            # Step 1: Update trailing stop based on close
+            close_r = compute_close_r(entry_p, c, pos, r_value)
+            if close_r is not None:
+                prev_best_r = current_best_r
+                prev_stop_r = current_stop_r
+                prev_sl_price = current_sl_price
+
+                if close_r > current_best_r:
+                    current_best_r = close_r
+
+                next_stop_r = compute_trailing_stop_r(current_best_r, current_stop_r, cfg.trail_gap_r)
+
+                should_update = (
+                    (current_sl_price is None and next_stop_r >= 0) or
+                    (next_stop_r > current_stop_r and next_stop_r >= 0)
+                )
+                if should_update:
+                    new_sl_price = compute_trailing_sl_price(
+                        entry_p, pos, r_value, next_stop_r, cfg.trail_buffer_r
+                    )
+                    trailing_stop_updates.append({
+                        "timestamp": t_1s,
+                        "entry_time": entry_t,
+                        "side": side_str,
+                        "entry_price": entry_p,
+                        "close_price": c,
+                        "close_r": close_r,
+                        "prev_best_r": prev_best_r,
+                        "new_best_r": current_best_r,
+                        "prev_stop_r": prev_stop_r,
+                        "new_stop_r": next_stop_r,
+                        "prev_stop_price": prev_sl_price,
+                        "new_stop_price": new_sl_price,
+                        "r_value": r_value,
+                        "trail_gap_r": cfg.trail_gap_r,
+                        "trail_buffer_r": cfg.trail_buffer_r,
+                        "trailing_mode": "r_ladder",
+                        "stop_moved": True,
+                        "lib_mode": True,
+                    })
+                    current_stop_r = next_stop_r
+                    current_sl_price = new_sl_price
+
+            # Step 2: Check exit only on higher timeframe close (e.g., 4h)
+            # Only check exit if stop is set AND this is an exit check boundary
+            if current_sl_price is not None and is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
+                if pos == 1:  # LONG
+                    # Exit if candle CLOSES below stop
+                    sl_hit = c <= current_sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c >= tp_price
+
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+
+                else:  # SHORT
+                    # Exit if candle CLOSES above stop
+                    sl_hit = c >= current_sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c <= tp_price
+
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+
+        # No exit triggered
+        return False, None, None, None, current_sl_price, current_best_r, current_stop_r
+
     def update_trailing_stop_dynamic_atr_lib(
         pos: int,
         entry_p: float,
@@ -3496,19 +3841,26 @@ def backtest_atr_grinder_lib(
 
             atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, pos)
 
-            # Apply floor only (stop can move up OR down, just not past breakeven)
+            # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
             if pos == 1:  # LONG
                 new_stop = max(atr_stop, floor_stop)  # floor is minimum
             else:  # SHORT
                 new_stop = min(atr_stop, floor_stop)  # floor is maximum
 
-            # Only set stop if it's at breakeven or better
+            # Only set stop if price has moved activation_r in our favor
+            activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
             if pos == 1:
-                should_set_stop = new_stop >= entry_p  # Stop at or above entry for LONG
+                price_moved_enough = c >= entry_p + activation_threshold
+                should_set_stop = price_moved_enough and new_stop >= entry_p
             else:
-                should_set_stop = new_stop <= entry_p  # Stop at or below entry for SHORT
+                price_moved_enough = c <= entry_p - activation_threshold
+                should_set_stop = price_moved_enough and new_stop <= entry_p
 
-            stop_moved = should_set_stop and (current_sl_price is None or new_stop != current_sl_price)
+            # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
+            if pos == 1:  # LONG
+                stop_moved = should_set_stop and (current_sl_price is None or new_stop > current_sl_price)
+            else:  # SHORT
+                stop_moved = should_set_stop and (current_sl_price is None or new_stop < current_sl_price)
             if stop_moved:
                 trailing_stop_updates.append({
                     "timestamp": t_1s,
@@ -3523,12 +3875,131 @@ def backtest_atr_grinder_lib(
                     "new_stop_price": new_stop,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "price_moved_enough": price_moved_enough,
                     "stop_moved": True,
                     "lib_mode": True,
                 })
                 current_sl_price = new_stop
 
         return current_sl_price
+
+    def process_trailing_and_exit_dynamic_atr_lib(
+        pos: int,
+        entry_p: float,
+        signal_atr: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        df_1s_chunk: pd.DataFrame,
+        df_signal: pd.DataFrame,
+        signal_t: pd.Timestamp,
+        entry_t: pd.Timestamp,
+        side_str: str,
+        use_trailing: bool,
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp], Optional[float]]:
+        """
+        Process 1m candles sequentially with dynamic ATR trailing: update trailing stop THEN check exit for each candle.
+        
+        Only sets stops at breakeven (0R) or better - no negative stops.
+        
+        Returns:
+            (exited, exit_reason, exit_price, exit_time, final_sl_price)
+        """
+        nonlocal trailing_stop_updates
+        current_sl_price = sl_price
+        floor_stop = entry_p  # Floor at breakeven (0R), no negative stops
+
+        # Get current ATR from signal timeframe
+        current_atr = float(df_signal.at[signal_t, "atr"])
+
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            o = float(candle_1s["open"])
+            h = float(candle_1s["high"])
+            l = float(candle_1s["low"])
+            c = float(candle_1s["close"])
+
+            # Step 1: Update trailing stop based on close
+            prev_sl_price = current_sl_price
+            atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, pos)
+
+            # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
+            if pos == 1:  # LONG
+                new_stop = max(atr_stop, floor_stop)  # floor is minimum
+            else:  # SHORT
+                new_stop = min(atr_stop, floor_stop)  # floor is maximum
+
+            # Only set stop if price has moved activation_r in our favor
+            activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
+            if pos == 1:
+                price_moved_enough = c >= entry_p + activation_threshold
+                should_set_stop = price_moved_enough and new_stop >= entry_p
+            else:
+                price_moved_enough = c <= entry_p - activation_threshold
+                should_set_stop = price_moved_enough and new_stop <= entry_p
+
+            # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
+            if pos == 1:  # LONG
+                stop_moved = should_set_stop and (current_sl_price is None or new_stop > current_sl_price)
+            else:  # SHORT
+                stop_moved = should_set_stop and (current_sl_price is None or new_stop < current_sl_price)
+            if stop_moved:
+                trailing_stop_updates.append({
+                    "timestamp": t_1s,
+                    "entry_time": entry_t,
+                    "side": side_str,
+                    "entry_price": entry_p,
+                    "close_price": c,
+                    "current_atr": current_atr,
+                    "atr_stop": atr_stop,
+                    "floor_stop": floor_stop,
+                    "prev_stop_price": prev_sl_price,
+                    "new_stop_price": new_stop,
+                    "trailing_mode": "dynamic_atr",
+                    "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "price_moved_enough": price_moved_enough,
+                    "stop_moved": True,
+                    "lib_mode": True,
+                })
+                current_sl_price = new_stop
+
+            # Step 2: Check exit only on higher timeframe close (e.g., 4h)
+            # Only check exit if stop is set AND this is an exit check boundary
+            if current_sl_price is not None and is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
+                if pos == 1:  # LONG
+                    # Exit if candle CLOSES below stop
+                    sl_hit = c <= current_sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c >= tp_price
+
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s, current_sl_price
+
+                else:  # SHORT
+                    # Exit if candle CLOSES above stop
+                    sl_hit = c >= current_sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c <= tp_price
+
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s, current_sl_price
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s, current_sl_price
+
+        # No exit triggered
+        return False, None, None, None, current_sl_price
 
     limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
 
@@ -3582,31 +4053,34 @@ def backtest_atr_grinder_lib(
                     position, stop_price, target_price, df_1m_bar, cfg.use_trailing_stop
                 )
             else:
-                # Fallback to 1m OHLC (original logic)
-                sl_hit = (l <= stop_price) if position == 1 else (h >= stop_price)
+                # Fallback to signal candle close (no 1m data)
+                # Use close price for stop check (candle must CLOSE beyond stop)
+                c = float(df.at[t, "close"])
+                sl_hit = (c <= stop_price) if position == 1 else (c >= stop_price)
 
                 if cfg.use_trailing_stop:
                     if sl_hit:
                         exit_reason = "SL"
-                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exit_price = apply_slippage(c, position, is_entry=False)
                         exited = True
                 else:
                     if target_price is not None:
-                        tp_hit = (h >= target_price) if position == 1 else (l <= target_price)
+                        # TP also uses close price
+                        tp_hit = (c >= target_price) if position == 1 else (c <= target_price)
                     else:
                         tp_hit = False
 
                     if sl_hit and tp_hit:
                         exit_reason = "SL"
-                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exit_price = apply_slippage(c, position, is_entry=False)
                         exited = True
                     elif tp_hit:
                         exit_reason = "TP"
-                        exit_price = apply_slippage(target_price, position, is_entry=False)
+                        exit_price = apply_slippage(c, position, is_entry=False)
                         exited = True
                     elif sl_hit:
                         exit_reason = "SL"
-                        exit_price = apply_slippage(stop_price, position, is_entry=False)
+                        exit_price = apply_slippage(c, position, is_entry=False)
                         exited = True
 
             if exited:
@@ -3664,19 +4138,26 @@ def backtest_atr_grinder_lib(
                 floor_stop = entry_price  # Floor at breakeven (0R), no negative stops
                 atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
 
-                # Apply floor only (stop can move up OR down, just not past breakeven)
+                # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
                 if position == 1:  # LONG
                     new_stop = max(atr_stop, floor_stop)  # floor is minimum
                 else:  # SHORT
                     new_stop = min(atr_stop, floor_stop)  # floor is maximum
 
-                # Only set stop if it's at breakeven or better
+                # Only set stop if price has moved activation_r in our favor
+                activation_threshold = (trail_r_value if trail_r_value is not None else current_atr) * cfg.dynamic_trail_activation_r
                 if position == 1:
-                    should_set_stop = new_stop >= entry_price  # Stop at or above entry for LONG
+                    price_moved_enough = c >= entry_price + activation_threshold
+                    should_set_stop = price_moved_enough and new_stop >= entry_price
                 else:
-                    should_set_stop = new_stop <= entry_price  # Stop at or below entry for SHORT
+                    price_moved_enough = c <= entry_price - activation_threshold
+                    should_set_stop = price_moved_enough and new_stop <= entry_price
 
-                stop_moved = should_set_stop and (stop_price is None or new_stop != stop_price)
+                # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
+                if position == 1:  # LONG
+                    stop_moved = should_set_stop and (stop_price is None or new_stop > stop_price)
+                else:  # SHORT
+                    stop_moved = should_set_stop and (stop_price is None or new_stop < stop_price)
                 if stop_moved:
                     stop_price = new_stop
 
@@ -3694,6 +4175,8 @@ def backtest_atr_grinder_lib(
                     "new_stop_price": stop_price,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
+                    "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "price_moved_enough": price_moved_enough,
                     "stop_moved": stop_moved,
                     "lib_mode": False,
                 })
@@ -3797,7 +4280,7 @@ def backtest_atr_grinder_lib(
                             target_price = None
                             trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                             trail_best_close_r = 0.0
-                            trail_stop_r = 0  # Start at breakeven, no negative stops
+                            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                             stop_price = None  # No stop until price reaches breakeven
                         else:
                             target_price, stop_price = compute_tp_sl_prices(
@@ -3811,6 +4294,82 @@ def backtest_atr_grinder_lib(
                         active_margin = trade_margin
                         active_leverage = trade_leverage
                         active_notional = active_margin * active_leverage
+
+                        # FIX: Run trailing stop AND exit check together, candle-by-candle
+                        if has_1m_data and cfg.use_trailing_stop and trail_r_value is not None:
+                            side_str = "LONG" if position == 1 else "SHORT"
+                            if cfg.trailing_mode == "r_ladder" and trail_best_close_r is not None and trail_stop_r is not None:
+                                exited, exit_reason, exit_price_check, exit_time_check, stop_price, trail_best_close_r, trail_stop_r = process_trailing_and_exit_lib(
+                                    position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
+                                    stop_price, target_price, df_1m_bar, entry_time, side_str, cfg.use_trailing_stop
+                                )
+                                if exited:
+                                    roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                    pnl_net = roi_net * active_margin
+                                    equity += pnl_net
+                                    trades.append({
+                                        "entry_time": entry_time,
+                                        "exit_time": exit_time_check,
+                                        "side": side_str,
+                                        "entry_price": entry_price,
+                                        "exit_price": exit_price_check,
+                                        "signal_atr": used_signal_atr,
+                                        "stop_price": stop_price,
+                                        "exit_reason": exit_reason,
+                                        "roi_net": roi_net,
+                                        "pnl_net": pnl_net,
+                                        "margin_used": active_margin,
+                                        "notional": active_notional,
+                                        "equity_after": equity,
+                                        "bars_held": 0,
+                                        "lib_mode": True,
+                                    })
+                                    position = 0
+                                    entry_price = None
+                                    target_price = None
+                                    stop_price = None
+                                    trail_r_value = None
+                                    trail_best_close_r = None
+                                    trail_stop_r = None
+                                    entry_time = None
+                                    entry_index = None
+                                    used_signal_atr = None
+                            elif cfg.trailing_mode == "dynamic_atr" and used_signal_atr is not None:
+                                exited, exit_reason, exit_price_check, exit_time_check, stop_price = process_trailing_and_exit_dynamic_atr_lib(
+                                    position, entry_price, used_signal_atr, stop_price,
+                                    target_price, df_1m_bar, df, t, entry_time, side_str, cfg.use_trailing_stop
+                                )
+                                if exited:
+                                    roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                    pnl_net = roi_net * active_margin
+                                    equity += pnl_net
+                                    trades.append({
+                                        "entry_time": entry_time,
+                                        "exit_time": exit_time_check,
+                                        "side": side_str,
+                                        "entry_price": entry_price,
+                                        "exit_price": exit_price_check,
+                                        "signal_atr": used_signal_atr,
+                                        "stop_price": stop_price,
+                                        "exit_reason": exit_reason,
+                                        "roi_net": roi_net,
+                                        "pnl_net": pnl_net,
+                                        "margin_used": active_margin,
+                                        "notional": active_notional,
+                                        "equity_after": equity,
+                                        "bars_held": 0,
+                                        "lib_mode": True,
+                                    })
+                                    position = 0
+                                    entry_price = None
+                                    target_price = None
+                                    stop_price = None
+                                    trail_r_value = None
+                                    trail_best_close_r = None
+                                    trail_stop_r = None
+                                    entry_time = None
+                                    entry_index = None
+                                    used_signal_atr = None
 
                         pending_side = 0
                         pending_limit_price = None
@@ -3872,7 +4431,7 @@ def backtest_atr_grinder_lib(
                                     target_price = None
                                     trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                                     trail_best_close_r = 0.0
-                                    trail_stop_r = 0  # Start at breakeven, no negative stops
+                                    trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                                     stop_price = None  # No stop until price reaches breakeven
                                 else:
                                     target_price, stop_price = compute_tp_sl_prices(
@@ -3886,6 +4445,82 @@ def backtest_atr_grinder_lib(
                                 active_margin = trade_margin
                                 active_leverage = trade_leverage
                                 active_notional = active_margin * active_leverage
+
+                                # FIX: Run trailing stop AND exit check together, candle-by-candle
+                                if has_1m_data and cfg.use_trailing_stop and trail_r_value is not None:
+                                    side_str = "LONG" if position == 1 else "SHORT"
+                                    if cfg.trailing_mode == "r_ladder" and trail_best_close_r is not None and trail_stop_r is not None:
+                                        exited, exit_reason, exit_price_check, exit_time_check, stop_price, trail_best_close_r, trail_stop_r = process_trailing_and_exit_lib(
+                                            position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
+                                            stop_price, target_price, df_1m_bar, entry_time, side_str, cfg.use_trailing_stop
+                                        )
+                                        if exited:
+                                            roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                            pnl_net = roi_net * active_margin
+                                            equity += pnl_net
+                                            trades.append({
+                                                "entry_time": entry_time,
+                                                "exit_time": exit_time_check,
+                                                "side": side_str,
+                                                "entry_price": entry_price,
+                                                "exit_price": exit_price_check,
+                                                "signal_atr": used_signal_atr,
+                                                "stop_price": stop_price,
+                                                "exit_reason": exit_reason,
+                                                "roi_net": roi_net,
+                                                "pnl_net": pnl_net,
+                                                "margin_used": active_margin,
+                                                "notional": active_notional,
+                                                "equity_after": equity,
+                                                "bars_held": 0,
+                                                "lib_mode": True,
+                                            })
+                                            position = 0
+                                            entry_price = None
+                                            target_price = None
+                                            stop_price = None
+                                            trail_r_value = None
+                                            trail_best_close_r = None
+                                            trail_stop_r = None
+                                            entry_time = None
+                                            entry_index = None
+                                            used_signal_atr = None
+                                    elif cfg.trailing_mode == "dynamic_atr" and used_signal_atr is not None:
+                                        exited, exit_reason, exit_price_check, exit_time_check, stop_price = process_trailing_and_exit_dynamic_atr_lib(
+                                            position, entry_price, used_signal_atr, stop_price,
+                                            target_price, df_1m_bar, df, t, entry_time, side_str, cfg.use_trailing_stop
+                                        )
+                                        if exited:
+                                            roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                            pnl_net = roi_net * active_margin
+                                            equity += pnl_net
+                                            trades.append({
+                                                "entry_time": entry_time,
+                                                "exit_time": exit_time_check,
+                                                "side": side_str,
+                                                "entry_price": entry_price,
+                                                "exit_price": exit_price_check,
+                                                "signal_atr": used_signal_atr,
+                                                "stop_price": stop_price,
+                                                "exit_reason": exit_reason,
+                                                "roi_net": roi_net,
+                                                "pnl_net": pnl_net,
+                                                "margin_used": active_margin,
+                                                "notional": active_notional,
+                                                "equity_after": equity,
+                                                "bars_held": 0,
+                                                "lib_mode": True,
+                                            })
+                                            position = 0
+                                            entry_price = None
+                                            target_price = None
+                                            stop_price = None
+                                            trail_r_value = None
+                                            trail_best_close_r = None
+                                            trail_stop_r = None
+                                            entry_time = None
+                                            entry_index = None
+                                            used_signal_atr = None
 
                                 pending_side = 0
                                 pending_limit_price = None
@@ -3911,7 +4546,7 @@ def backtest_atr_grinder_lib(
                             target_price = None
                             trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
                             trail_best_close_r = 0.0
-                            trail_stop_r = 0  # Start at breakeven, no negative stops
+                            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
                             stop_price = None  # No stop until price reaches breakeven
                         else:
                             target_price, stop_price = compute_tp_sl_prices(
@@ -3925,6 +4560,84 @@ def backtest_atr_grinder_lib(
                         active_margin = trade_margin
                         active_leverage = trade_leverage
                         active_notional = active_margin * active_leverage
+
+                        # FIX: Run trailing stop AND exit check together, candle-by-candle
+                        if has_1m_data and cfg.use_trailing_stop and trail_r_value is not None:
+                            side_str = "LONG" if position == 1 else "SHORT"
+                            if cfg.trailing_mode == "r_ladder" and trail_best_close_r is not None and trail_stop_r is not None:
+                                # Use combined function that processes candles sequentially
+                                exited, exit_reason, exit_price_check, exit_time_check, stop_price, trail_best_close_r, trail_stop_r = process_trailing_and_exit_lib(
+                                    position, entry_price, trail_r_value, trail_best_close_r, trail_stop_r,
+                                    stop_price, target_price, df_1m_bar, entry_time, side_str, cfg.use_trailing_stop
+                                )
+                                if exited:
+                                    roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                    pnl_net = roi_net * active_margin
+                                    equity += pnl_net
+                                    trades.append({
+                                        "entry_time": entry_time,
+                                        "exit_time": exit_time_check,
+                                        "side": side_str,
+                                        "entry_price": entry_price,
+                                        "exit_price": exit_price_check,
+                                        "signal_atr": used_signal_atr,
+                                        "stop_price": stop_price,
+                                        "exit_reason": exit_reason,
+                                        "roi_net": roi_net,
+                                        "pnl_net": pnl_net,
+                                        "margin_used": active_margin,
+                                        "notional": active_notional,
+                                        "equity_after": equity,
+                                        "bars_held": 0,
+                                        "lib_mode": True,
+                                    })
+                                    position = 0
+                                    entry_price = None
+                                    target_price = None
+                                    stop_price = None
+                                    trail_r_value = None
+                                    trail_best_close_r = None
+                                    trail_stop_r = None
+                                    entry_time = None
+                                    entry_index = None
+                                    used_signal_atr = None
+                            elif cfg.trailing_mode == "dynamic_atr" and used_signal_atr is not None:
+                                # Use combined function that processes candles sequentially
+                                exited, exit_reason, exit_price_check, exit_time_check, stop_price = process_trailing_and_exit_dynamic_atr_lib(
+                                    position, entry_price, used_signal_atr, stop_price,
+                                    target_price, df_1m_bar, df, t, entry_time, side_str, cfg.use_trailing_stop
+                                )
+                                if exited:
+                                    roi_net = net_roi_from_prices(entry_price, exit_price_check, position, active_leverage)
+                                    pnl_net = roi_net * active_margin
+                                    equity += pnl_net
+                                    trades.append({
+                                        "entry_time": entry_time,
+                                        "exit_time": exit_time_check,
+                                        "side": side_str,
+                                        "entry_price": entry_price,
+                                        "exit_price": exit_price_check,
+                                        "signal_atr": used_signal_atr,
+                                        "stop_price": stop_price,
+                                        "exit_reason": exit_reason,
+                                        "roi_net": roi_net,
+                                        "pnl_net": pnl_net,
+                                        "margin_used": active_margin,
+                                        "notional": active_notional,
+                                        "equity_after": equity,
+                                        "bars_held": 0,
+                                        "lib_mode": True,
+                                    })
+                                    position = 0
+                                    entry_price = None
+                                    target_price = None
+                                    stop_price = None
+                                    trail_r_value = None
+                                    trail_best_close_r = None
+                                    trail_stop_r = None
+                                    entry_time = None
+                                    entry_index = None
+                                    used_signal_atr = None
 
         equity_series.at[t] = equity
 
@@ -3965,42 +4678,47 @@ def backtest_atr_grinder_lib(
     return trades_df, df, stats, trailing_df
 
 
-def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float], Optional[float]]:
+def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float], Optional[float], Optional[str]]:
     warmup = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
     if len(df) <= warmup:
-        return 0, None, None, None
+        return 0, None, None, None, None
 
     atr = atr_ema(df, cfg.atr_len)
-    swing_high, swing_low = compute_confirmed_swing_levels(
+    
+    # Compute market structure (HH/HL/LL/LH) levels
+    structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
         df,
+        atr,
         swing_timeframe=cfg.swing_timeframe,
         left=cfg.swing_left,
         right=cfg.swing_right,
         resample_rule=cfg.swing_resample_rule,
     )
-    signal, signal_atr, signal_entry_price = build_swing_atr_signals(
+    
+    # Generate signals based on market structure
+    signal, signal_atr, signal_entry_price, signal_reason, trend = build_market_structure_signals(
         df,
         atr,
-        swing_high,
-        swing_low,
+        structure_points,
         body_atr_mult=cfg.thr2,
-        swing_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
-        volume=df["volume"] if "volume" in df.columns else None,
     )
 
     signal_val = int(signal.iloc[-1])
     atr_val = float(atr.iloc[-1])
     signal_atr_val = signal_atr.iloc[-1]
     entry_price_val = signal_entry_price.iloc[-1]
+    reason_val = signal_reason.iloc[-1]
     if signal_val == 0 or pd.isna(signal_atr_val) or math.isnan(atr_val):
-        return 0, None, atr_val if not math.isnan(atr_val) else None, None
+        return 0, None, atr_val if not math.isnan(atr_val) else None, None, None
     entry_price: Optional[float]
     if entry_price_val is not None and not pd.isna(entry_price_val):
         entry_price = float(entry_price_val)
     else:
         entry_price = None
-    return signal_val, float(signal_atr_val), atr_val, entry_price
+    reason: Optional[str] = str(reason_val) if reason_val else None
+    return signal_val, float(signal_atr_val), atr_val, entry_price, reason
 
 
 # Backward compatibility functions for backtest code
@@ -4143,6 +4861,47 @@ def compute_dynamic_atr_stop(
         return close_price + (current_atr * atr_mult)
 
 
+def is_exit_check_boundary(timestamp: pd.Timestamp, interval: str) -> bool:
+    """
+    Check if timestamp is at an interval boundary for exit checking.
+    
+    For 1m candles indexed by open time, the candle at (boundary - 1min) represents
+    the close of the higher timeframe candle.
+    
+    Examples for interval="4h":
+        - 03:59 → True (closes at 04:00, which is a 4h boundary)
+        - 07:59 → True (closes at 08:00)
+        - 04:00 → False (this candle closes at 04:01, not a boundary)
+    
+    Args:
+        timestamp: The 1m candle open timestamp
+        interval: Exit check interval like "1h", "4h", "1d"
+    
+    Returns:
+        True if this candle's close is at an interval boundary
+    """
+    # Parse interval
+    if interval.endswith("m"):
+        period_minutes = int(interval[:-1])
+    elif interval.endswith("h"):
+        period_minutes = int(interval[:-1]) * 60
+    elif interval.endswith("d"):
+        period_minutes = int(interval[:-1]) * 60 * 24
+    else:
+        # Default to 4h if unparseable
+        period_minutes = 240
+    
+    # The candle close time = timestamp + 1 minute
+    close_minute_of_day = timestamp.hour * 60 + timestamp.minute + 1
+    
+    # Handle midnight rollover (e.g., 23:59 close = 24:00 = 0 next day)
+    if close_minute_of_day >= 24 * 60:
+        close_minute_of_day = 0
+    
+    # Check if close time is at a boundary
+    return close_minute_of_day % period_minutes == 0
+
+
 # NOTE: compute_sl_limit_price removed - using market orders for trailing stop
 # NOTE: compute_margin_from_targets, compute_required_leverage, resolve_trade_sizing removed
 #       - using static position sizing (margin_usd x leverage)
@@ -4198,18 +4957,10 @@ def run_live(cfg: LiveConfig) -> None:
     # Initialize Binance client
     client = get_um_futures_client(cfg)
     
-    # Fetch all USDT perpetual symbols
-    logging.info("Fetching all USDT perpetual symbols...")
-    all_symbols = get_all_usdt_perpetuals(client)
-    logging.info("Found %d USDT perpetual symbols", len(all_symbols))
-    
-    # Get filters for all symbols
-    filters_by_symbol: Dict[str, Dict[str, float]] = {}
-    for sym in all_symbols:
-        try:
-            filters_by_symbol[sym] = get_symbol_filters(client, sym)
-        except Exception as exc:
-            logging.warning("Failed to get filters for %s: %s", sym, exc)
+    # Fetch all USDT perpetual symbols and filters in a single API call
+    logging.info("Fetching all USDT perpetual symbols and filters...")
+    all_symbols, filters_by_symbol = get_all_usdt_perpetuals_with_filters(client)
+    logging.info("Found %d USDT perpetual symbols with filters", len(all_symbols))
     
     # Initialize state
     state = LiveState()
@@ -4375,11 +5126,13 @@ def run_live(cfg: LiveConfig) -> None:
             pos_state.sl_price = next_sl_price_rounded
             pos_state.trail_stop_r = candidate_stop_r
             
+            # Get tick_size for proper price precision in log
+            sl_tick_size = filters.get("tick_size", 0.00000001)
             log_event(cfg.log_path, {
                 "event": "sl_trail_update",
                 "symbol": symbol,
                 "side": "LONG" if side_sign == 1 else "SHORT",
-                "sl_price": format_float_by_symbol(next_sl_price_rounded, symbol),
+                "sl_price": format_price_for_logging(next_sl_price_rounded, sl_tick_size),
                 "stop_r": candidate_stop_r,
                 "best_close_r": format_float_2(pos_state.trail_best_close_r),
                 "order_id": pos_state.sl_algo_id,
@@ -4394,12 +5147,12 @@ def run_live(cfg: LiveConfig) -> None:
     # -----------------------------------------------------------------
     # Helper: Check for entry signal on a symbol using 1d candle
     # -----------------------------------------------------------------
-    def check_entry_signal(symbol: str) -> Optional[Tuple[int, float, float, Optional[float]]]:
+    def check_entry_signal(symbol: str) -> Optional[Tuple[int, float, float, Optional[float], Optional[str]]]:
         """
         Check if there's an entry signal for the symbol based on 1d candle.
         
         Returns:
-            Tuple of (signal, signal_atr, atr_value, signal_entry_price) if signal found,
+            Tuple of (signal, signal_atr, atr_value, signal_entry_price, signal_reason) if signal found,
             None otherwise.
         """
         if symbol not in filters_by_symbol:
@@ -4428,31 +5181,47 @@ def run_live(cfg: LiveConfig) -> None:
         state.last_signal_close_ms[symbol] = close_time_ms
         
         df = klines_to_df(closed_klines)
-        signal, signal_atr, atr_value, signal_entry_price = compute_live_signal(df, cfg)
+        signal, signal_atr, atr_value, signal_entry_price, signal_reason = compute_live_signal(df, cfg)
         
         # Store ATR for trailing stop calculation
         last_atr_by_symbol[symbol] = atr_value
         
+        # Save detected swing levels to JSON file
+        save_live_swing_levels(
+            cfg.live_swing_levels_file,
+            symbol,
+            df,
+            cfg.swing_timeframe,
+            cfg.swing_left,
+            cfg.swing_right,
+            cfg.swing_resample_rule,
+        )
+        
         candle = df.iloc[-1]
         body = abs(float(candle["close"]) - float(candle["open"]))
+        
+        # Get tick_size for proper price precision
+        symbol_filters = filters_by_symbol.get(symbol, {})
+        tick_size = symbol_filters.get("tick_size", 0.00000001)
         
         log_event(cfg.log_path, {
             "event": "signal_candle_close",
             "symbol": symbol,
             "close_time_ms": close_time_ms,
-            "open": format_float_by_symbol(candle["open"], symbol),
-            "high": format_float_by_symbol(candle["high"], symbol),
-            "low": format_float_by_symbol(candle["low"], symbol),
-            "close": format_float_by_symbol(candle["close"], symbol),
-            "body": format_float_by_symbol(body, symbol),
-            "atr": format_float_by_symbol(atr_value, symbol),
+            "open": format_price_for_logging(candle["open"], tick_size),
+            "high": format_price_for_logging(candle["high"], tick_size),
+            "low": format_price_for_logging(candle["low"], tick_size),
+            "close": format_price_for_logging(candle["close"], tick_size),
+            "body": format_price_for_logging(body, tick_size),
+            "atr": format_price_for_logging(atr_value, tick_size),
             "signal": signal,
+            "signal_reason": signal_reason,
         })
         
         if signal == 0 or signal_atr is None or atr_value is None:
             return None
         
-        return (signal, signal_atr, atr_value, signal_entry_price)
+        return (signal, signal_atr, atr_value, signal_entry_price, signal_reason)
 
     # -----------------------------------------------------------------
     # Helper: Place entry order for a symbol
@@ -4654,7 +5423,7 @@ def run_live(cfg: LiveConfig) -> None:
                             entry_atr=pending.pending_atr,
                             trail_r_value=r_value,
                             trail_best_close_r=0.0,
-                            trail_stop_r=0,  # Start at breakeven, no negative stops
+                            trail_stop_r=cfg.trail_initial_stop_r,  # Initial stop R level from config
                             entry_time_iso=_utc_now_iso(),
                             entry_close_ms=pending.entry_close_ms,
                             entry_margin_usd=cfg.margin_usd,
@@ -4662,13 +5431,15 @@ def run_live(cfg: LiveConfig) -> None:
                         )
                         state.positions[symbol] = pos_state
                         
+                        # Get tick_size for proper price precision in log
+                        entry_tick_size = filters.get("tick_size", 0.00000001)
                         log_event(cfg.log_path, {
                             "event": "entry_filled",
                             "symbol": symbol,
                             "side": "LONG" if side == 1 else "SHORT",
-                            "entry_price": format_float_by_symbol(entry_price, symbol),
+                            "entry_price": format_price_for_logging(entry_price, entry_tick_size),
                             "quantity": format_float_2(qty),
-                            "r_value": format_float_by_symbol(r_value, symbol),
+                            "r_value": format_price_for_logging(r_value, entry_tick_size),
                         })
                     
                     del state.pending_entries[symbol]
@@ -4749,7 +5520,7 @@ def run_live(cfg: LiveConfig) -> None:
                 if signal_result is None:
                     continue
                 
-                signal, signal_atr, atr_value, signal_entry_price = signal_result
+                signal, signal_atr, atr_value, signal_entry_price, signal_reason = signal_result
                 side_str = "LONG" if signal == 1 else "SHORT"
                 
                 # Get candle data for logging
@@ -4779,34 +5550,43 @@ def run_live(cfg: LiveConfig) -> None:
                     status = "ACTED"
                 
                 # Log signal to CSV and console
+                # Get tick_size for proper price precision
+                symbol_filters = filters_by_symbol.get(symbol, {})
+                tick_size = symbol_filters.get("tick_size", 0.00000001)
+                
                 signal_data = {
                     "timestamp": _utc_now_iso(),
                     "symbol": symbol,
                     "side": side_str,
                     "signal": signal,
-                    "signal_atr": format_float_by_symbol(signal_atr, symbol),
-                    "entry_price": format_float_by_symbol(signal_entry_price, symbol) if signal_entry_price else "MARKET",
-                    "open": format_float_by_symbol(candle_open, symbol),
-                    "high": format_float_by_symbol(candle_high, symbol),
-                    "low": format_float_by_symbol(candle_low, symbol),
-                    "close": format_float_by_symbol(candle_close, symbol),
-                    "atr": format_float_by_symbol(atr_value, symbol),
+                    "signal_atr": format_price_for_logging(signal_atr, tick_size),
+                    "entry_price": format_price_for_logging(signal_entry_price, tick_size) if signal_entry_price else "MARKET",
+                    "open": format_price_for_logging(candle_open, tick_size),
+                    "high": format_price_for_logging(candle_high, tick_size),
+                    "low": format_price_for_logging(candle_low, tick_size),
+                    "close": format_price_for_logging(candle_close, tick_size),
+                    "atr": format_price_for_logging(atr_value, tick_size),
                     "status": status,
+                    "signal_reason": signal_reason or "",
                 }
                 append_live_signal(cfg.live_signals_csv, signal_data)
                 
-                # Print signal to terminal
-                print(f"[SIGNAL] {symbol} {side_str} @ {f'{signal_entry_price:.6f}' if signal_entry_price else 'MARKET'} (ATR: {atr_value:.6f}) - {status}")
+                # Print signal to terminal with proper precision
+                precision = get_precision_from_tick_size(tick_size)
+                entry_str = f"{signal_entry_price:.{precision}f}" if signal_entry_price else "MARKET"
+                atr_str = f"{atr_value:.{precision}f}" if atr_value else "N/A"
+                print(f"[SIGNAL] {symbol} {side_str} @ {entry_str} (ATR: {atr_str}) - {status} [{signal_reason or 'unknown'}]")
                 
                 # Log to event log
                 log_event(cfg.log_path, {
                     "event": "signal_detected",
                     "symbol": symbol,
                     "side": side_str,
-                    "signal_atr": format_float_by_symbol(signal_atr, symbol),
-                    "entry_price": format_float_by_symbol(signal_entry_price, symbol) if signal_entry_price else None,
-                    "atr": format_float_by_symbol(atr_value, symbol),
+                    "signal_atr": format_price_for_logging(signal_atr, tick_size),
+                    "entry_price": format_price_for_logging(signal_entry_price, tick_size) if signal_entry_price else None,
+                    "atr": format_price_for_logging(atr_value, tick_size),
                     "status": status,
+                    "signal_reason": signal_reason,
                 })
                 
                 # Place entry order if conditions allow
@@ -4899,7 +5679,7 @@ def run_backtest_single(
         if df_1m.empty:
             if verbose:
                 print(f"  WARNING: No 1m data for {symbol}, skipping.")
-            return pd.DataFrame(), {}, pd.DataFrame()
+            return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
     
     if verbose:
         print(f"  Loading {signal_interval} data...")
@@ -4916,7 +5696,7 @@ def run_backtest_single(
     if df_signal.empty:
         if verbose:
             print(f"  WARNING: No signal data for {symbol}, skipping.")
-        return pd.DataFrame(), {}, pd.DataFrame()
+        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
     
     if verbose:
         print(f"  Running backtest ({len(df_signal)} candles)...")
@@ -4935,13 +5715,32 @@ def run_backtest_single(
     if "signal" in df_bt.columns:
         signals_mask = df_bt["signal"] != 0
         if signals_mask.any():
-            signals_df = df_bt[signals_mask][["open", "high", "low", "close", "signal", "signal_atr", "signal_entry_price"]].copy()
+            # Include market structure levels (HH/HL/LL/LH) and trend
+            cols_to_extract = ["open", "high", "low", "close", "signal", "signal_atr", "signal_entry_price", "signal_reason"]
+            # Add market structure columns if they exist
+            for col in ["hh_level", "hl_level", "ll_level", "lh_level", "trend"]:
+                if col in df_bt.columns:
+                    cols_to_extract.append(col)
+            
+            signals_df = df_bt[signals_mask][cols_to_extract].copy()
             signals_df = signals_df.reset_index()
-            signals_df.columns = ["timestamp", "open", "high", "low", "close", "signal", "signal_atr", "entry_price"]
+            # Rename base columns
+            rename_map = {
+                df_bt.index.name or "index": "timestamp",
+                "signal_entry_price": "entry_price",
+            }
+            signals_df = signals_df.rename(columns=rename_map)
             signals_df["symbol"] = symbol
             signals_df["side"] = signals_df["signal"].map({1: "LONG", -1: "SHORT"})
+            # Map trend to string for readability
+            if "trend" in signals_df.columns:
+                signals_df["trend_dir"] = signals_df["trend"].map({1: "UPTREND", -1: "DOWNTREND", 0: "UNDEFINED"})
     
-    return trades, stats, signals_df
+    # Add symbol column to trailing_df
+    if not trailing_df.empty:
+        trailing_df["symbol"] = symbol
+    
+    return trades, stats, signals_df, trailing_df
 
 
 def run_backtest(
@@ -5008,6 +5807,7 @@ def run_backtest(
     all_trades: List[pd.DataFrame] = []
     all_stats: List[Dict[str, Any]] = []
     all_signals: List[pd.DataFrame] = []
+    all_trailing: List[pd.DataFrame] = []
     successful = 0
     failed = 0
     
@@ -5015,10 +5815,10 @@ def run_backtest(
     progress_lock = threading.Lock()
     completed_count = [0]  # Use list to allow mutation in nested function
     
-    def process_symbol(sym: str) -> Tuple[str, pd.DataFrame, Dict[str, float], pd.DataFrame, Optional[str]]:
+    def process_symbol(sym: str) -> Tuple[str, pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame, Optional[str]]:
         """Process a single symbol and return results."""
         try:
-            trades, stats, signals = run_backtest_single(
+            trades, stats, signals, trailing = run_backtest_single(
                 symbol=sym,
                 start_date=start_date,
                 end_date=end_date,
@@ -5028,9 +5828,9 @@ def run_backtest(
                 cfg=cfg,
                 verbose=False,  # Disable verbose for concurrent mode
             )
-            return sym, trades, stats, signals, None
+            return sym, trades, stats, signals, trailing, None
         except Exception as e:
-            return sym, pd.DataFrame(), {}, pd.DataFrame(), str(e)
+            return sym, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), str(e)
     
     # Use concurrent processing for multiple symbols
     if all_symbols and len(symbols) > 1 and max_workers > 1:
@@ -5042,7 +5842,7 @@ def run_backtest(
             
             # Process results as they complete
             for future in as_completed(future_to_symbol):
-                sym, trades, stats, signals, error = future.result()
+                sym, trades, stats, signals, trailing, error = future.result()
                 
                 with progress_lock:
                     completed_count[0] += 1
@@ -5055,6 +5855,10 @@ def run_backtest(
                     # Always collect signals even if no trades
                     if not signals.empty:
                         all_signals.append(signals)
+                    
+                    # Collect trailing stop updates
+                    if not trailing.empty:
+                        all_trailing.append(trailing)
                     
                     if not trades.empty:
                         all_trades.append(trades)
@@ -5072,7 +5876,7 @@ def run_backtest(
         for i, sym in enumerate(symbols, 1):
             print(f"\n[{i}/{len(symbols)}] {sym}")
             try:
-                trades, stats, signals = run_backtest_single(
+                trades, stats, signals, trailing = run_backtest_single(
                     symbol=sym,
                     start_date=start_date,
                     end_date=end_date,
@@ -5085,6 +5889,10 @@ def run_backtest(
                 # Always collect signals even if no trades
                 if not signals.empty:
                     all_signals.append(signals)
+                
+                # Collect trailing stop updates
+                if not trailing.empty:
+                    all_trailing.append(trailing)
                 
                 if not trades.empty:
                     all_trades.append(trades)
@@ -5147,16 +5955,24 @@ def run_backtest(
             print(f"  {sym}: {row['total_pnl']:+.2f} USD ({int(row['trades'])} trades)")
         
         # Save results
-        combined_trades.to_csv("trades.csv", index=False)
+        combined_trades.to_csv(get_output_path("trades.csv"), index=False)
         print("\n" + "-" * 60)
         print("Output Files:")
-        print(f"  - trades.csv ({total_trades} trades from {successful} symbols)")
+        print(f"  - output/trades.csv ({total_trades} trades from {successful} symbols)")
         
         # Save per-symbol stats
         if all_stats:
             stats_df = pd.DataFrame(all_stats)
-            stats_df.to_csv("backtest_stats_by_symbol.csv", index=False)
-            print(f"  - backtest_stats_by_symbol.csv")
+            stats_df.to_csv(get_output_path("backtest_stats_by_symbol.csv"), index=False)
+            print(f"  - output/backtest_stats_by_symbol.csv")
+        
+        # Save trailing stop updates
+        if all_trailing:
+            combined_trailing = pd.concat(all_trailing, ignore_index=True)
+            if "timestamp" in combined_trailing.columns:
+                combined_trailing = combined_trailing.sort_values("timestamp").reset_index(drop=True)
+            combined_trailing.to_csv(get_output_path("trailing_stops.csv"), index=False)
+            print(f"  - output/trailing_stops.csv ({len(combined_trailing)} updates)")
     else:
         print("  No trades generated across all symbols.")
     
@@ -5196,11 +6012,11 @@ def run_backtest(
             print(f"  {ts:<22} {sym:<12} {side:<6} {entry_str:<14} {atr_str:<12}")
         
         if total_signals > display_limit:
-            print(f"  ... and {total_signals - display_limit} more signals (see signals.csv)")
+            print(f"  ... and {total_signals - display_limit} more signals (see output/signals.csv)")
         
         # Save signals to file
-        combined_signals.to_csv("signals.csv", index=False)
-        print(f"\n  Saved to: signals.csv ({total_signals} signals)")
+        combined_signals.to_csv(get_output_path("signals.csv"), index=False)
+        print(f"\n  Saved to: output/signals.csv ({total_signals} signals)")
     else:
         print("\n" + "-" * 60)
         print("SIGNALS GENERATED:")

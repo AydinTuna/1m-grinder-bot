@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from config import BacktestConfig
+from config import BacktestConfig, get_output_path
 from main import (
     backtest_atr_grinder,
     backtest_atr_grinder_lib,
@@ -211,7 +211,7 @@ def save_results_csv(results: List[Dict[str, Any]], output_path: str) -> None:
                 all_keys.append(k)
     
     # Reorder: name first, then params, then stats
-    priority_keys = ["name", "initial_capital", "target_loss_usd", "trailing_mode"]
+    priority_keys = ["name", "trailing_mode", "trail_initial_stop_r", "trail_gap_r", "trail_buffer_r", "margin_usd"]
     ordered_keys = []
     for k in priority_keys:
         if k in all_keys:
@@ -329,9 +329,9 @@ def run_batch(
         cfg = create_config_from_run(run)
         
         # Show key parameters
-        print(f"       initial_capital: ${cfg.initial_capital:.2f}")
-        print(f"       target_loss_usd: ${cfg.target_loss_usd if cfg.target_loss_usd else 0:.2f}")
         print(f"       trailing_mode: {cfg.trailing_mode}")
+        print(f"       trail_initial_stop_r: {cfg.trail_initial_stop_r}")
+        print(f"       trail_gap_r: {cfg.trail_gap_r}")
         
         # Run backtest
         run_start = time_module.perf_counter()
@@ -341,11 +341,11 @@ def run_batch(
         # Build result dictionary
         result = {
             "name": run_name,
-            "initial_capital": cfg.initial_capital,
-            "target_loss_usd": cfg.target_loss_usd,
             "trailing_mode": cfg.trailing_mode,
-            "tp_atr_mult": cfg.tp_atr_mult,
-            "sl_atr_mult": cfg.sl_atr_mult,
+            "trail_initial_stop_r": cfg.trail_initial_stop_r,
+            "trail_gap_r": cfg.trail_gap_r,
+            "trail_buffer_r": cfg.trail_buffer_r,
+            "margin_usd": cfg.margin_usd,
         }
         result.update(stats)
         results.append(result)
@@ -362,11 +362,11 @@ def run_batch(
     print("BATCH RESULTS SUMMARY")
     print("=" * 70)
     
-    params_to_show = ["initial_capital", "target_loss_usd", "trailing_mode"]
+    params_to_show = ["trail_initial_stop_r", "trail_gap_r", "trail_buffer_r"]
     print_results_table(results, params_to_show)
     
     # Save to CSV
-    save_results_csv(results, "batch_results.csv")
+    save_results_csv(results, get_output_path("batch_results.csv"))
     
     print(f"\nTotal time: {total_time:.2f}s")
     print("=" * 70)
@@ -389,17 +389,17 @@ Examples:
   
 JSON Config Format:
   {
-    "start_date": "2022-07-11",
-    "end_date": "2022-09-11",
-    "symbol": "BTCUSDC",
+    "start_date": "2025-10-01",
+    "end_date": "2026-01-21",
+    "symbol": "ARPAUSDT",
     "market": "futures",
     "use_lib": true,
     "runs": [
       {
-        "name": "Run 1",
-        "initial_capital": 200,
-        "target_loss_usd": 0.15,
-        "trailing_mode": "r_ladder"
+        "name": "init_-1_gap_1.0",
+        "trail_initial_stop_r": -1,
+        "trail_gap_r": 1.0,
+        "trail_buffer_r": 0.10
       },
       ...
     ]

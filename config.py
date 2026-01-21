@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
+
+
+# Output directory for all data files (csv, json, png, etc.)
+OUTPUT_DIR: Path = Path(__file__).parent / "output"
+
+def get_output_path(filename: str) -> str:
+    """Get full path for an output file, ensuring the output directory exists."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    return str(OUTPUT_DIR / filename)
 
 
 LIVE_TRADE_FIELDS: List[str] = [
@@ -37,6 +47,7 @@ LIVE_SIGNAL_FIELDS: List[str] = [
     "close",
     "atr",
     "status",  # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_PENDING", "SKIPPED_OUTSIDE_WINDOW"
+    "signal_reason",  # e.g. "swing_high_rejection_short", "momentum_long", etc.
 ]
 
 
@@ -50,13 +61,13 @@ class BacktestConfig:
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.1  # 0.1 = 10%
     swing_timeframe: str = "1d"
-    swing_left: int = 2
-    swing_right: int = 2
+    swing_left: int = 1
+    swing_right: int = 1
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 20.0  # fixed leverage for static sizing
-    initial_capital: float = 100.0  # starting equity (margin cap per trade)
+    leverage: float = 5.0  # fixed leverage for static sizing
+    initial_capital: float = 5.0  # starting equity (margin cap per trade)
     margin_usd: float = 5.0  # static margin per trade
 
     # Costs
@@ -69,11 +80,14 @@ class BacktestConfig:
 
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
-    trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trailing_mode: str = "dynamic_atr"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trail_initial_stop_r: int = -2  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
-    dynamic_trail_atr_mult: float = 1.00  # ATR multiplier for dynamic trailing
+    dynamic_trail_atr_mult: float = 1.25  # ATR multiplier for dynamic trailing
+    dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     trail_check_interval: str = "1m"  # interval for trailing stop updates (Look In Bar)
+    trail_exit_check_interval: str = "4h"  # interval for exit check (only exit on this timeframe close)
     
     # Multi-position settings
     max_open_positions: int = 3  # max concurrent positions
@@ -92,8 +106,8 @@ class LiveConfig:
     swing_right: int = 1
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
-    atr_history_bars: int = 100  # bars to pull for stable ATR/EMA (1d candles)
-    leverage: int = 5  # fixed leverage for static sizing
+    atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
+    leverage: int = 20  # fixed leverage for static sizing
     margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
@@ -103,10 +117,13 @@ class LiveConfig:
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trail_initial_stop_r: int = -1  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 1.25  # ATR multiplier for dynamic trailing
+    dynamic_trail_activation_r: float = 1.0  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     trail_check_interval: str = "1m"  # interval for trailing stop updates (Look In Bar)
+    trail_exit_check_interval: str = "4h"  # interval for exit check (only exit on this timeframe close)
 
     # Multi-position settings
     max_open_positions: int = 3  # max concurrent positions
@@ -127,8 +144,9 @@ class LiveConfig:
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 60.0  # check every minute for trailing
     entry_order_timeout_seconds: float = 55.0
-    log_path: str = "trade_log.jsonl"
-    live_trades_csv: str = "live_trades.csv"
-    live_signals_csv: str = "live_signals.csv"
+    log_path: str = "output/trade_log.jsonl"
+    live_trades_csv: str = "output/live_trades.csv"
+    live_signals_csv: str = "output/live_signals.csv"
+    live_swing_levels_file: str = "output/swing_levels_live.json"  # detected swing levels for live trading
     post_only: bool = True
     use_testnet: bool = False

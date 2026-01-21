@@ -1,7 +1,9 @@
-*.csv
-*.jsonl
 venv/
 .env
 __pycache__/
-*.json
 kline_data/
+output/
+*.png
+*.csv
+*.json
+*.jsonl
