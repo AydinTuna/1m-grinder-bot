@@ -64,7 +64,30 @@ from typing import Iterable, Optional, Tuple, List, Dict, Any
 import numpy as np
 import pandas as pd
 
-from config import BacktestConfig, LiveConfig, LIVE_TRADE_FIELDS, LIVE_SIGNAL_FIELDS, get_output_path
+from config import (
+    BacktestConfig,
+    LiveConfig,
+    LIVE_TRADE_FIELDS,
+    LIVE_SIGNAL_FIELDS,
+    BACKTEST_SIGNAL_FIELDS,
+    BACKTEST_TRADE_FIELDS,
+    STRATEGY_VERSION,
+    STRATEGY_VERSION_NOTE,
+    OUTPUT_DIR,
+    get_output_path,
+    get_backtest_signals_dir,
+    get_backtest_trades_dir,
+    get_backtest_stats_dir,
+    get_backtest_charts_dir,
+    get_live_signals_dir,
+    get_live_trades_dir,
+    get_live_logs_dir,
+    get_data_klines_dir,
+    get_comparison_dir,
+    ensure_output_dirs,
+    save_config_snapshot,
+    generate_trade_id,
+)
 from swing_levels import (
     build_swing_atr_signals,
     build_market_structure_signals,
@@ -364,6 +387,12 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     pending_limit_price = None
     pending_signal_atr = None
     pending_created_index = None
+    pending_signal_reason = None  # Signal reason for pending order
+    
+    # Trade ID tracking for signal-trade linking
+    trade_counter = 0
+    current_trade_id: Optional[str] = None
+    current_signal_reason: Optional[str] = None
 
     trades: List[Dict] = []
     trailing_stop_updates: List[Dict] = []
@@ -486,6 +515,9 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                     "notional": active_notional,
                     "equity_after": equity,
                     "bars_held": i - (entry_index if entry_index is not None else i),
+                    "trade_id": current_trade_id,
+                    "signal_reason": current_signal_reason,
+                    "strategy_version": STRATEGY_VERSION,
                 })
 
                 # flat
@@ -499,6 +531,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 entry_time = None
                 entry_index = None
                 used_signal_atr = None
+                current_trade_id = None
+                current_signal_reason = None
                 active_margin = cfg.initial_capital
                 active_leverage = cfg.leverage
                 active_notional = active_margin * active_leverage
@@ -698,17 +732,25 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         active_margin = trade_margin
                         active_leverage = trade_leverage
                         active_notional = active_margin * active_leverage
+                        
+                        # Generate trade ID and track signal reason
+                        trade_counter += 1
+                        side_str = "LONG" if side == 1 else "SHORT"
+                        current_trade_id = generate_trade_id(df.attrs.get("symbol", "UNK"), str(t), side_str)
+                        current_signal_reason = pending_signal_reason
 
                         pending_side = 0
                         pending_limit_price = None
                         pending_signal_atr = None
                         pending_created_index = None
+                        pending_signal_reason = None
 
             # No pending order (or not filled yet): check the previous candle signal.
             if position == 0 and pending_side == 0:
                 prev_signal = int(df.at[prev_t, "signal"])
                 prev_signal_atr = df.at[prev_t, "signal_atr"]
                 prev_entry_price = df.at[prev_t, "signal_entry_price"]
+                prev_signal_reason = df.at[prev_t, "signal_reason"] if "signal_reason" in df.columns else None
 
                 if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
                     side = prev_signal
@@ -721,6 +763,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         pending_limit_price = float(prev_entry_price)
                         pending_signal_atr = signal_atr_value
                         pending_created_index = i
+                        pending_signal_reason = prev_signal_reason
 
                         fill_raw = maybe_fill_limit(side, float(prev_entry_price), o, h, l)
                         if fill_raw is None:
@@ -765,13 +808,21 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                                 active_margin = trade_margin
                                 active_leverage = trade_leverage
                                 active_notional = active_margin * active_leverage
+                                
+                                # Generate trade ID and track signal reason
+                                trade_counter += 1
+                                side_str = "LONG" if side == 1 else "SHORT"
+                                current_trade_id = generate_trade_id(df.attrs.get("symbol", "UNK"), str(t), side_str)
+                                current_signal_reason = prev_signal_reason
 
                                 pending_side = 0
                                 pending_limit_price = None
                                 pending_signal_atr = None
                                 pending_created_index = None
+                                pending_signal_reason = None
 
                     else:
+                        # Market entry (no limit price)
                         entry_price = apply_slippage(o, side, is_entry=True)
 
                         trade_margin, trade_leverage, _ = resolve_trade_sizing(
@@ -808,6 +859,12 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         active_margin = trade_margin
                         active_leverage = trade_leverage
                         active_notional = active_margin * active_leverage
+                        
+                        # Generate trade ID and track signal reason
+                        trade_counter += 1
+                        side_str = "LONG" if side == 1 else "SHORT"
+                        current_trade_id = generate_trade_id(df.attrs.get("symbol", "UNK"), str(t), side_str)
+                        current_signal_reason = prev_signal_reason
 
         equity_series.at[t] = equity
 
@@ -834,6 +891,9 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             "notional": active_notional,
             "equity_after": equity,
             "bars_held": len(df) - 1 - (entry_index if entry_index is not None else 0),
+            "trade_id": current_trade_id,
+            "signal_reason": current_signal_reason,
+            "strategy_version": STRATEGY_VERSION,
         })
         position = 0
 
@@ -887,6 +947,128 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
     return float(np.nanmax(dd))
 
 
+def compute_signal_stats(
+    signals_df: pd.DataFrame, 
+    trades_df: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Calculate performance metrics grouped by signal_reason and symbol.
+    
+    Args:
+        signals_df: DataFrame of signals with columns: timestamp, symbol, side, signal, 
+                   signal_atr, entry_price, signal_reason, trade_id (optional)
+        trades_df: DataFrame of trades with columns: entry_time, exit_time, side, 
+                  entry_price, exit_price, roi_net, pnl_net, trade_id, signal_reason
+    
+    Returns:
+        Tuple of (stats_by_signal, stats_by_symbol) DataFrames
+    """
+    # Initialize empty results
+    stats_by_signal = pd.DataFrame()
+    stats_by_symbol = pd.DataFrame()
+    
+    if trades_df.empty:
+        return stats_by_signal, stats_by_symbol
+    
+    # Stats by signal_reason
+    if "signal_reason" in trades_df.columns:
+        signal_groups = trades_df.groupby("signal_reason")
+        stats_by_signal = signal_groups.agg(
+            total_trades=("pnl_net", "count"),
+            wins=("pnl_net", lambda x: (x > 0).sum()),
+            losses=("pnl_net", lambda x: (x <= 0).sum()),
+            total_pnl=("pnl_net", "sum"),
+            avg_pnl=("pnl_net", "mean"),
+            avg_roi=("roi_net", "mean"),
+            best_trade=("pnl_net", "max"),
+            worst_trade=("pnl_net", "min"),
+        ).reset_index()
+        
+        # Calculate win rate
+        stats_by_signal["win_rate"] = stats_by_signal["wins"] / stats_by_signal["total_trades"]
+        
+        # Calculate signals that didn't become trades (if signals_df available)
+        if not signals_df.empty and "signal_reason" in signals_df.columns:
+            signal_counts = signals_df.groupby("signal_reason").size().reset_index(name="total_signals")
+            stats_by_signal = stats_by_signal.merge(signal_counts, on="signal_reason", how="left")
+            stats_by_signal["total_signals"] = stats_by_signal["total_signals"].fillna(stats_by_signal["total_trades"])
+            stats_by_signal["signals_skipped"] = stats_by_signal["total_signals"] - stats_by_signal["total_trades"]
+        else:
+            stats_by_signal["total_signals"] = stats_by_signal["total_trades"]
+            stats_by_signal["signals_skipped"] = 0
+        
+        # Reorder columns
+        cols_order = [
+            "signal_reason", "total_signals", "total_trades", "signals_skipped",
+            "wins", "losses", "win_rate", "total_pnl", "avg_pnl", "avg_roi",
+            "best_trade", "worst_trade"
+        ]
+        stats_by_signal = stats_by_signal[[c for c in cols_order if c in stats_by_signal.columns]]
+        
+        # Sort by total PnL descending
+        stats_by_signal = stats_by_signal.sort_values("total_pnl", ascending=False)
+    
+    # Stats by symbol
+    if "symbol" in trades_df.columns:
+        symbol_groups = trades_df.groupby("symbol")
+        stats_by_symbol = symbol_groups.agg(
+            total_trades=("pnl_net", "count"),
+            wins=("pnl_net", lambda x: (x > 0).sum()),
+            losses=("pnl_net", lambda x: (x <= 0).sum()),
+            total_pnl=("pnl_net", "sum"),
+            avg_pnl=("pnl_net", "mean"),
+            avg_roi=("roi_net", "mean"),
+            best_trade=("pnl_net", "max"),
+            worst_trade=("pnl_net", "min"),
+        ).reset_index()
+        
+        stats_by_symbol["win_rate"] = stats_by_symbol["wins"] / stats_by_symbol["total_trades"]
+        
+        # Sort by total PnL descending
+        stats_by_symbol = stats_by_symbol.sort_values("total_pnl", ascending=False)
+    
+    return stats_by_signal, stats_by_symbol
+
+
+def print_signal_stats(stats_by_signal: pd.DataFrame, stats_by_symbol: pd.DataFrame) -> None:
+    """Print signal performance statistics in a formatted table."""
+    
+    if not stats_by_signal.empty:
+        print("\n" + "-" * 80)
+        print("PER-SIGNAL-TYPE PERFORMANCE:")
+        print("-" * 80)
+        print(f"  {'Signal Reason':<30} {'Signals':>8} {'Traded':>7} {'Wins':>5} {'Win%':>7} {'Total PnL':>12} {'Avg PnL':>10}")
+        print(f"  {'-'*28} {'-'*8} {'-'*7} {'-'*5} {'-'*7} {'-'*12} {'-'*10}")
+        
+        for _, row in stats_by_signal.iterrows():
+            reason = str(row.get("signal_reason", "unknown"))[:28]
+            signals = int(row.get("total_signals", row.get("total_trades", 0)))
+            traded = int(row.get("total_trades", 0))
+            wins = int(row.get("wins", 0))
+            win_rate = row.get("win_rate", 0) * 100
+            total_pnl = row.get("total_pnl", 0)
+            avg_pnl = row.get("avg_pnl", 0)
+            
+            print(f"  {reason:<30} {signals:>8} {traded:>7} {wins:>5} {win_rate:>6.1f}% {total_pnl:>+11.2f} {avg_pnl:>+9.3f}")
+    
+    if not stats_by_symbol.empty and len(stats_by_symbol) > 1:
+        print("\n" + "-" * 80)
+        print("TOP 10 SYMBOLS BY PnL:")
+        print("-" * 80)
+        print(f"  {'Symbol':<15} {'Trades':>7} {'Wins':>5} {'Win%':>7} {'Total PnL':>12} {'Avg PnL':>10}")
+        print(f"  {'-'*13} {'-'*7} {'-'*5} {'-'*7} {'-'*12} {'-'*10}")
+        
+        for _, row in stats_by_symbol.head(10).iterrows():
+            symbol = str(row.get("symbol", "unknown"))[:13]
+            trades = int(row.get("total_trades", 0))
+            wins = int(row.get("wins", 0))
+            win_rate = row.get("win_rate", 0) * 100
+            total_pnl = row.get("total_pnl", 0)
+            avg_pnl = row.get("avg_pnl", 0)
+            
+            print(f"  {symbol:<15} {trades:>7} {wins:>5} {win_rate:>6.1f}% {total_pnl:>+11.2f} {avg_pnl:>+9.3f}")
+
+
 # -----------------------------
 # Live trading (Binance Futures)
 # -----------------------------
@@ -908,6 +1090,8 @@ class PositionState:
     entry_close_ms: int = 0
     entry_margin_usd: float = 0.0
     entry_leverage: int = 20
+    trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
+    signal_reason: Optional[str] = None  # Signal type that triggered this trade
 
 
 @dataclass 
@@ -919,6 +1103,8 @@ class PendingEntry:
     pending_atr: float
     pending_side: int  # +1 long, -1 short
     entry_close_ms: int
+    trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
+    signal_reason: Optional[str] = None  # Signal type that triggered this entry
 
 
 @dataclass
@@ -3527,6 +3713,12 @@ def backtest_atr_grinder_lib(
     pending_limit_price = None
     pending_signal_atr = None
     pending_created_index = None
+    pending_signal_reason = None  # Signal reason for pending order
+    
+    # Trade ID tracking for signal-trade linking
+    trade_counter = 0
+    current_trade_id: Optional[str] = None
+    current_signal_reason: Optional[str] = None
 
     trades: List[Dict] = []
     trailing_stop_updates: List[Dict] = []
@@ -4163,6 +4355,9 @@ def backtest_atr_grinder_lib(
                     "equity_after": equity,
                     "bars_held": i - (entry_index if entry_index is not None else i),
                     "lib_mode": has_1m_data,
+                    "trade_id": current_trade_id,
+                    "signal_reason": current_signal_reason,
+                    "strategy_version": STRATEGY_VERSION,
                 })
 
                 position = 0
@@ -4175,6 +4370,8 @@ def backtest_atr_grinder_lib(
                 entry_time = None
                 entry_index = None
                 used_signal_atr = None
+                current_trade_id = None
+                current_signal_reason = None
                 active_margin = cfg.initial_capital
                 active_leverage = cfg.leverage
                 active_notional = active_margin * active_leverage
@@ -4733,6 +4930,9 @@ def backtest_atr_grinder_lib(
             "equity_after": equity,
             "bars_held": len(df) - 1 - (entry_index if entry_index is not None else 0),
             "lib_mode": True,
+            "trade_id": current_trade_id,
+            "signal_reason": current_signal_reason,
+            "strategy_version": STRATEGY_VERSION,
         })
 
         position = 0
@@ -5045,16 +5245,21 @@ def run_live(cfg: LiveConfig) -> None:
     })
 
     # -----------------------------------------------------------------
-    # Helper: Update trailing stop for a position using 1m candle data
+    # Helper: Update trailing stop for a position using candle data
     # -----------------------------------------------------------------
     def update_trailing_stop(symbol: str, pos_state: PositionState) -> None:
-        """Update trailing stop for a position based on latest 1m candle close."""
+        """Update trailing stop for a position based on latest candle.
+        
+        Supports two modes:
+        - dynamic_atr: Uses candle high (LONG) or low (SHORT) with ATR multiplier
+        - r_ladder: Uses close price with R-unit ladder system
+        """
         if symbol not in filters_by_symbol:
             return
         
         filters = filters_by_symbol[symbol]
         
-        # Fetch latest 1m candle for trailing stop check
+        # Fetch latest candle for trailing stop check
         try:
             klines = client.klines(symbol=symbol, interval=cfg.trail_check_interval, limit=2)
         except ClientError as exc:
@@ -5075,51 +5280,94 @@ def run_live(cfg: LiveConfig) -> None:
         
         df = klines_to_df(closed_klines)
         candle = df.iloc[-1]
+        high_price = float(candle["high"])
+        low_price = float(candle["low"])
         close_price = float(candle["close"])
         
-        # Calculate close in R units
         entry_price = pos_state.entry_price
         side_sign = pos_state.entry_side
-        r_value = pos_state.trail_r_value
+        signal_atr = pos_state.trail_r_value  # signal_atr is stored in trail_r_value
         
-        if r_value <= 0:
+        if signal_atr <= 0:
             return
         
-        close_r = compute_close_r(entry_price, close_price, side_sign, r_value)
-        if close_r is None:
+        next_sl_price = None
+        candidate_stop_r = None
+        
+        if cfg.trailing_mode == "dynamic_atr":
+            # Dynamic ATR trailing - uses high (LONG) or low (SHORT) with ATR multiplier
+            
+            # Select price source for trailing
+            if cfg.dynamic_trail_price_source == "high_low":
+                trail_price = high_price if side_sign == 1 else low_price
+            else:
+                trail_price = close_price
+            
+            # Calculate new stop using ATR
+            atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr, cfg.dynamic_trail_atr_mult, side_sign)
+            
+            # Only set stop if price has moved activation_r in our favor
+            activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
+            if side_sign == 1:
+                price_moved_enough = close_price >= entry_price + activation_threshold
+            else:
+                price_moved_enough = close_price <= entry_price - activation_threshold
+            
+            if not price_moved_enough:
+                return
+            
+            # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
+            if side_sign == 1:  # LONG
+                stop_improved = pos_state.sl_price is None or atr_stop > pos_state.sl_price
+            else:  # SHORT
+                stop_improved = pos_state.sl_price is None or atr_stop < pos_state.sl_price
+            
+            if not stop_improved:
+                return
+            
+            next_sl_price = atr_stop
+            
+        else:
+            # R-ladder trailing (original logic)
+            close_r = compute_close_r(entry_price, close_price, side_sign, signal_atr)
+            if close_r is None:
+                return
+            
+            # Update best close R
+            pos_state.trail_best_close_r = max(pos_state.trail_best_close_r, close_r)
+            
+            # Calculate new trailing stop level
+            candidate_stop_r = compute_trailing_stop_r(
+                pos_state.trail_best_close_r,
+                pos_state.trail_stop_r,
+                cfg.trail_gap_r,
+            )
+            
+            # Only place stops at breakeven (0R) or better - no negative stops
+            if candidate_stop_r < 0:
+                return
+            
+            # Place stop when:
+            # 1. First time reaching ladder threshold (sl_price is None and candidate_stop_r >= 0)
+            # 2. Stop level improves (candidate_stop_r > trail_stop_r)
+            is_first_stop = pos_state.sl_price is None and candidate_stop_r >= 0
+            is_improvement = candidate_stop_r > pos_state.trail_stop_r
+            
+            if not (is_first_stop or is_improvement):
+                return
+            
+            # Calculate new SL price
+            next_sl_price = compute_trailing_sl_price(
+                entry_price,
+                side_sign,
+                signal_atr,
+                candidate_stop_r,
+                cfg.trail_buffer_r,
+            )
+        
+        if next_sl_price is None:
             return
         
-        # Update best close R
-        pos_state.trail_best_close_r = max(pos_state.trail_best_close_r, close_r)
-        
-        # Calculate new trailing stop level
-        candidate_stop_r = compute_trailing_stop_r(
-            pos_state.trail_best_close_r,
-            pos_state.trail_stop_r,
-            cfg.trail_gap_r,
-        )
-        
-        # Only place stops at breakeven (0R) or better - no negative stops
-        if candidate_stop_r < 0:
-            return
-        
-        # Place stop when:
-        # 1. First time reaching ladder threshold (sl_price is None and candidate_stop_r >= 0)
-        # 2. Stop level improves (candidate_stop_r > trail_stop_r)
-        is_first_stop = pos_state.sl_price is None and candidate_stop_r >= 0
-        is_improvement = candidate_stop_r > pos_state.trail_stop_r
-        
-        if not (is_first_stop or is_improvement):
-            return
-        
-        # Calculate new SL price
-        next_sl_price = compute_trailing_sl_price(
-            entry_price,
-            side_sign,
-            r_value,
-            candidate_stop_r,
-            cfg.trail_buffer_r,
-        )
         next_sl_price_str = format_to_step(next_sl_price, filters["tick_size"])
         
         try:
@@ -5190,7 +5438,8 @@ def run_live(cfg: LiveConfig) -> None:
             pos_state.sl_algo_id = sl_order.get("orderId")
             pos_state.sl_algo_client_order_id = sl_client_id
             pos_state.sl_price = next_sl_price_rounded
-            pos_state.trail_stop_r = candidate_stop_r
+            if candidate_stop_r is not None:
+                pos_state.trail_stop_r = candidate_stop_r
             
             # Get tick_size for proper price precision in log
             sl_tick_size = filters.get("tick_size", 0.00000001)
@@ -5199,8 +5448,10 @@ def run_live(cfg: LiveConfig) -> None:
                 "symbol": symbol,
                 "side": "LONG" if side_sign == 1 else "SHORT",
                 "sl_price": format_price_for_logging(next_sl_price_rounded, sl_tick_size),
+                "trailing_mode": cfg.trailing_mode,
+                "trail_price": format_price_for_logging(high_price if side_sign == 1 else low_price, sl_tick_size) if cfg.trailing_mode == "dynamic_atr" else None,
                 "stop_r": candidate_stop_r,
-                "best_close_r": format_float_2(pos_state.trail_best_close_r),
+                "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
                 "order_id": pos_state.sl_algo_id,
             })
         except ClientError as exc:
@@ -5298,6 +5549,8 @@ def run_live(cfg: LiveConfig) -> None:
         signal_atr: float,
         atr_value: float,
         signal_entry_price: Optional[float],
+        trade_id: Optional[str] = None,
+        signal_reason: Optional[str] = None,
     ) -> bool:
         """
         Place a limit entry order for the symbol.
@@ -5410,6 +5663,8 @@ def run_live(cfg: LiveConfig) -> None:
                 pending_atr=signal_atr,
                 pending_side=1 if side == "BUY" else -1,
                 entry_close_ms=close_time_ms,
+                trade_id=trade_id,
+                signal_reason=signal_reason,
             )
             state.pending_entries[symbol] = pending
             
@@ -5494,6 +5749,8 @@ def run_live(cfg: LiveConfig) -> None:
                             entry_close_ms=pending.entry_close_ms,
                             entry_margin_usd=cfg.margin_usd,
                             entry_leverage=cfg.leverage,
+                            trade_id=pending.trade_id,
+                            signal_reason=pending.signal_reason,
                         )
                         state.positions[symbol] = pos_state
                         
@@ -5562,6 +5819,9 @@ def run_live(cfg: LiveConfig) -> None:
                         "exit_reason": "trailing_sl",
                         "margin_used": pos_state.entry_margin_usd,
                         "notional": pos_state.entry_margin_usd * pos_state.entry_leverage,
+                        "trade_id": pos_state.trade_id,
+                        "signal_reason": pos_state.signal_reason,
+                        "strategy_version": STRATEGY_VERSION,
                     })
                     
                     # Cancel any pending SL orders
@@ -5620,6 +5880,11 @@ def run_live(cfg: LiveConfig) -> None:
                 symbol_filters = filters_by_symbol.get(symbol, {})
                 tick_size = symbol_filters.get("tick_size", 0.00000001)
                 
+                # Generate trade_id if signal is acted upon
+                live_trade_id = None
+                if status == "ACTED":
+                    live_trade_id = generate_trade_id(symbol, _utc_now_iso(), side_str)
+                
                 signal_data = {
                     "timestamp": _utc_now_iso(),
                     "symbol": symbol,
@@ -5634,6 +5899,8 @@ def run_live(cfg: LiveConfig) -> None:
                     "atr": format_price_for_logging(atr_value, tick_size),
                     "status": status,
                     "signal_reason": signal_reason or "",
+                    "trade_id": live_trade_id,
+                    "strategy_version": STRATEGY_VERSION,
                 }
                 append_live_signal(cfg.live_signals_csv, signal_data)
                 
@@ -5657,7 +5924,8 @@ def run_live(cfg: LiveConfig) -> None:
                 
                 # Place entry order if conditions allow
                 if status == "ACTED":
-                    if place_entry_order(symbol, signal, signal_atr, atr_value, signal_entry_price):
+                    if place_entry_order(symbol, signal, signal_atr, atr_value, signal_entry_price, 
+                                        trade_id=live_trade_id, signal_reason=signal_reason):
                         # Successfully placed entry order
                         logging.info("Entry order placed for %s", symbol)
                         
@@ -6020,25 +6288,43 @@ def run_backtest(
         for sym, row in symbol_pnl.tail(5).iterrows():
             print(f"  {sym}: {row['total_pnl']:+.2f} USD ({int(row['trades'])} trades)")
         
-        # Save results
-        combined_trades.to_csv(get_output_path("trades.csv"), index=False)
+        # Ensure versioned output directories exist
+        ensure_output_dirs()
+        
+        # Build filename suffix based on symbols and date range
+        symbol_tag = "ALL" if all_symbols else symbol
+        filename_suffix = f"{symbol_tag}_{start_date}_{end_date}"
+        
+        # Save trades to versioned directory
+        trades_dir = get_backtest_trades_dir()
+        trades_path = trades_dir / f"trades_{filename_suffix}.csv"
+        combined_trades.to_csv(trades_path, index=False)
+        
         print("\n" + "-" * 60)
-        print("Output Files:")
-        print(f"  - output/trades.csv ({total_trades} trades from {successful} symbols)")
+        print(f"Output Files (v{STRATEGY_VERSION}):")
+        print(f"  - {trades_path.relative_to(trades_path.parent.parent.parent.parent)} ({total_trades} trades)")
         
         # Save per-symbol stats
         if all_stats:
             stats_df = pd.DataFrame(all_stats)
-            stats_df.to_csv(get_output_path("backtest_stats_by_symbol.csv"), index=False)
-            print(f"  - output/backtest_stats_by_symbol.csv")
+            stats_dir = get_backtest_stats_dir()
+            stats_path = stats_dir / f"stats_by_symbol_{filename_suffix}.csv"
+            stats_df.to_csv(stats_path, index=False)
+            print(f"  - {stats_path.relative_to(stats_path.parent.parent.parent.parent)}")
         
         # Save trailing stop updates
         if all_trailing:
             combined_trailing = pd.concat(all_trailing, ignore_index=True)
             if "timestamp" in combined_trailing.columns:
                 combined_trailing = combined_trailing.sort_values("timestamp").reset_index(drop=True)
-            combined_trailing.to_csv(get_output_path("trailing_stops.csv"), index=False)
-            print(f"  - output/trailing_stops.csv ({len(combined_trailing)} updates)")
+            stats_dir = get_backtest_stats_dir()
+            trailing_path = stats_dir / f"trailing_stops_{filename_suffix}.csv"
+            combined_trailing.to_csv(trailing_path, index=False)
+            print(f"  - {trailing_path.relative_to(trailing_path.parent.parent.parent.parent)} ({len(combined_trailing)} updates)")
+        
+        # Save config snapshot
+        snapshot_path = save_config_snapshot(cfg, symbol_tag, start_date, end_date)
+        print(f"  - {snapshot_path.relative_to(snapshot_path.parent.parent.parent)}")
     else:
         print("  No trades generated across all symbols.")
     
@@ -6078,11 +6364,28 @@ def run_backtest(
             print(f"  {ts:<22} {sym:<12} {side:<6} {entry_str:<14} {atr_str:<12}")
         
         if total_signals > display_limit:
-            print(f"  ... and {total_signals - display_limit} more signals (see output/signals.csv)")
+            print(f"  ... and {total_signals - display_limit} more signals")
         
-        # Save signals to file
-        combined_signals.to_csv(get_output_path("signals.csv"), index=False)
-        print(f"\n  Saved to: output/signals.csv ({total_signals} signals)")
+        # Save signals to versioned directory
+        signals_dir = get_backtest_signals_dir()
+        signals_path = signals_dir / f"signals_{filename_suffix}.csv"
+        combined_signals.to_csv(signals_path, index=False)
+        print(f"\n  Saved to: {signals_path.relative_to(signals_path.parent.parent.parent.parent)} ({total_signals} signals)")
+        
+        # Compute and display signal performance stats
+        if all_trades:
+            combined_trades_for_stats = pd.concat(all_trades, ignore_index=True)
+            stats_by_signal, stats_by_symbol_detailed = compute_signal_stats(combined_signals, combined_trades_for_stats)
+            
+            # Print signal stats
+            print_signal_stats(stats_by_signal, stats_by_symbol_detailed)
+            
+            # Save signal stats to CSV
+            if not stats_by_signal.empty:
+                stats_dir = get_backtest_stats_dir()
+                signal_stats_path = stats_dir / f"stats_by_signal_{filename_suffix}.csv"
+                stats_by_signal.to_csv(signal_stats_path, index=False)
+                print(f"\n  Signal stats saved to: {signal_stats_path.relative_to(signal_stats_path.parent.parent.parent.parent)}")
     else:
         print("\n" + "-" * 60)
         print("SIGNALS GENERATED:")
@@ -6097,6 +6400,181 @@ def run_backtest(
     if all_symbols and len(symbols) > 1 and max_workers > 1:
         print(f"  Effective speedup:   ~{max_workers}x (with {max_workers} workers)")
     print("=" * 60)
+
+
+def run_stats() -> None:
+    """
+    Display live signal and trade statistics.
+    Reads from the live signals and trades CSV files and computes performance metrics.
+    """
+    print("=" * 80)
+    print(f"LIVE TRADING STATISTICS (Strategy v{STRATEGY_VERSION})")
+    print("=" * 80)
+    
+    # Load live signals
+    signals_path = get_live_signals_dir() / "signals.csv"
+    trades_path = get_live_trades_dir() / "trades.csv"
+    
+    # Also check old paths for backwards compatibility
+    old_signals_path = OUTPUT_DIR / "live_signals.csv"
+    old_trades_path = OUTPUT_DIR / "live_trades.csv"
+    
+    signals_df = pd.DataFrame()
+    trades_df = pd.DataFrame()
+    
+    if signals_path.exists():
+        signals_df = pd.read_csv(signals_path)
+    elif old_signals_path.exists():
+        signals_df = pd.read_csv(old_signals_path)
+    
+    if trades_path.exists():
+        trades_df = pd.read_csv(trades_path)
+    elif old_trades_path.exists():
+        trades_df = pd.read_csv(old_trades_path)
+    
+    print(f"\nSignals file: {signals_path if signals_path.exists() else old_signals_path}")
+    print(f"Trades file: {trades_path if trades_path.exists() else old_trades_path}")
+    
+    if signals_df.empty and trades_df.empty:
+        print("\nNo live signals or trades found.")
+        return
+    
+    # Basic stats
+    print(f"\nTotal signals logged: {len(signals_df)}")
+    print(f"Total trades logged: {len(trades_df)}")
+    
+    if not signals_df.empty:
+        if "status" in signals_df.columns:
+            status_counts = signals_df["status"].value_counts()
+            print("\nSignal Status Breakdown:")
+            for status, count in status_counts.items():
+                print(f"  {status}: {count}")
+    
+    if not trades_df.empty:
+        # Calculate trade stats
+        total_pnl = trades_df["pnl_net"].sum() if "pnl_net" in trades_df.columns else 0
+        wins = (trades_df["pnl_net"] > 0).sum() if "pnl_net" in trades_df.columns else 0
+        losses = (trades_df["pnl_net"] <= 0).sum() if "pnl_net" in trades_df.columns else 0
+        win_rate = wins / len(trades_df) * 100 if len(trades_df) > 0 else 0
+        
+        print(f"\nTrade Summary:")
+        print(f"  Total PnL: {total_pnl:+.2f} USD")
+        print(f"  Wins: {wins}, Losses: {losses}")
+        print(f"  Win Rate: {win_rate:.1f}%")
+        
+        # Compute detailed stats
+        stats_by_signal, stats_by_symbol = compute_signal_stats(signals_df, trades_df)
+        print_signal_stats(stats_by_signal, stats_by_symbol)
+    
+    print("\n" + "=" * 80)
+
+
+def run_compare(v1: str, v2: str, symbol: str = "ALL") -> None:
+    """
+    Compare backtest results between two strategy versions.
+    
+    Args:
+        v1: First version string (e.g., "1.0.0")
+        v2: Second version string (e.g., "1.1.0")
+        symbol: Symbol to compare (default: ALL)
+    """
+    print("=" * 80)
+    print(f"VERSION COMPARISON: v{v1} vs v{v2}")
+    print("=" * 80)
+    
+    # Find stats files for each version
+    v1_dir = OUTPUT_DIR / "backtest" / f"v{v1}"
+    v2_dir = OUTPUT_DIR / "backtest" / f"v{v2}"
+    
+    if not v1_dir.exists():
+        print(f"ERROR: Version {v1} directory not found: {v1_dir}")
+        return
+    if not v2_dir.exists():
+        print(f"ERROR: Version {v2} directory not found: {v2_dir}")
+        return
+    
+    # Find the most recent stats file for each version
+    def find_latest_stats(version_dir: Path, stat_type: str) -> Optional[Path]:
+        stats_dir = version_dir / "stats"
+        if not stats_dir.exists():
+            return None
+        files = list(stats_dir.glob(f"{stat_type}_*.csv"))
+        if not files:
+            return None
+        return max(files, key=lambda f: f.stat().st_mtime)
+    
+    v1_signal_stats = find_latest_stats(v1_dir, "stats_by_signal")
+    v2_signal_stats = find_latest_stats(v2_dir, "stats_by_signal")
+    
+    v1_trades = None
+    v2_trades = None
+    trades_dir_v1 = v1_dir / "trades"
+    trades_dir_v2 = v2_dir / "trades"
+    
+    if trades_dir_v1.exists():
+        trade_files_v1 = list(trades_dir_v1.glob("trades_*.csv"))
+        if trade_files_v1:
+            v1_trades = max(trade_files_v1, key=lambda f: f.stat().st_mtime)
+    
+    if trades_dir_v2.exists():
+        trade_files_v2 = list(trades_dir_v2.glob("trades_*.csv"))
+        if trade_files_v2:
+            v2_trades = max(trade_files_v2, key=lambda f: f.stat().st_mtime)
+    
+    # Load and compare trades
+    if v1_trades and v2_trades:
+        df_v1 = pd.read_csv(v1_trades)
+        df_v2 = pd.read_csv(v2_trades)
+        
+        total_v1 = len(df_v1)
+        total_v2 = len(df_v2)
+        pnl_v1 = df_v1["pnl_net"].sum() if "pnl_net" in df_v1.columns else 0
+        pnl_v2 = df_v2["pnl_net"].sum() if "pnl_net" in df_v2.columns else 0
+        wr_v1 = (df_v1["pnl_net"] > 0).sum() / total_v1 * 100 if total_v1 > 0 else 0
+        wr_v2 = (df_v2["pnl_net"] > 0).sum() / total_v2 * 100 if total_v2 > 0 else 0
+        
+        print(f"\n{'Metric':<20} {'v' + v1:>15} {'v' + v2:>15} {'Change':>15}")
+        print(f"{'-'*18} {'-'*15} {'-'*15} {'-'*15}")
+        print(f"{'Total Trades':<20} {total_v1:>15} {total_v2:>15} {total_v2 - total_v1:>+15}")
+        print(f"{'Total PnL':<20} {pnl_v1:>+14.2f} {pnl_v2:>+14.2f} {pnl_v2 - pnl_v1:>+14.2f}")
+        print(f"{'Win Rate':<20} {wr_v1:>14.1f}% {wr_v2:>14.1f}% {wr_v2 - wr_v1:>+14.1f}pp")
+        
+        # Compare by signal type if available
+        if v1_signal_stats and v2_signal_stats:
+            stats_v1 = pd.read_csv(v1_signal_stats)
+            stats_v2 = pd.read_csv(v2_signal_stats)
+            
+            if not stats_v1.empty and not stats_v2.empty:
+                print(f"\n" + "-" * 80)
+                print("PER-SIGNAL-TYPE COMPARISON:")
+                print("-" * 80)
+                
+                # Merge on signal_reason
+                merged = stats_v1.merge(
+                    stats_v2, 
+                    on="signal_reason", 
+                    how="outer", 
+                    suffixes=("_v1", "_v2")
+                ).fillna(0)
+                
+                print(f"{'Signal Reason':<25} {'v' + v1 + ' Win%':>12} {'v' + v2 + ' Win%':>12} {'Change':>10}")
+                print(f"{'-'*23} {'-'*12} {'-'*12} {'-'*10}")
+                
+                for _, row in merged.iterrows():
+                    reason = str(row.get("signal_reason", "unknown"))[:23]
+                    wr1 = row.get("win_rate_v1", 0) * 100
+                    wr2 = row.get("win_rate_v2", 0) * 100
+                    change = wr2 - wr1
+                    marker = " *" if abs(change) > 5 else ""
+                    print(f"{reason:<25} {wr1:>11.1f}% {wr2:>11.1f}% {change:>+9.1f}pp{marker}")
+    else:
+        print("\nCould not find trade files for comparison.")
+        if not v1_trades:
+            print(f"  Missing: v{v1} trades")
+        if not v2_trades:
+            print(f"  Missing: v{v2} trades")
+    
+    print("\n" + "=" * 80)
 
 
 def main() -> None:
@@ -6131,13 +6609,19 @@ Examples:
   
   # Run live trading
   python main.py --mode live
+  
+  # View live signal/trade statistics
+  python main.py --mode stats
+  
+  # Compare backtest results between two strategy versions
+  python main.py --mode compare --v1 1.0.0 --v2 1.1.0
         """,
     )
     parser.add_argument(
         "--mode",
-        choices=["backtest", "live"],
+        choices=["backtest", "live", "stats", "compare"],
         default="backtest",
-        help="Run mode: 'backtest' or 'live' (default: backtest)",
+        help="Run mode: 'backtest', 'live', 'stats', or 'compare' (default: backtest)",
     )
     parser.add_argument(
         "--symbol",
@@ -6185,11 +6669,31 @@ Examples:
         default=10,
         help="Number of parallel workers for concurrent processing (default: 10)",
     )
+    parser.add_argument(
+        "--v1",
+        type=str,
+        default=None,
+        help="First version for comparison (e.g., '1.0.0'). Used with --mode compare",
+    )
+    parser.add_argument(
+        "--v2",
+        type=str,
+        default=None,
+        help="Second version for comparison (e.g., '1.1.0'). Used with --mode compare",
+    )
     args = parser.parse_args()
 
     if args.mode == "live":
         live_cfg = LiveConfig()
         run_live(live_cfg)
+    elif args.mode == "stats":
+        run_stats()
+    elif args.mode == "compare":
+        if not args.v1 or not args.v2:
+            print("ERROR: --v1 and --v2 are required for compare mode")
+            print("Example: python main.py --mode compare --v1 1.0.0 --v2 1.1.0")
+            return
+        run_compare(args.v1, args.v2, args.symbol)
     else:
         run_backtest(
             symbol=args.symbol,

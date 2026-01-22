@@ -1,0 +1,30 @@
+{
+  "versions": [
+    {
+      "version": "1.0.0",
+      "date": "2026-01-22",
+      "changes": [
+        "Initial baseline strategy with versioning",
+        "Market structure signals: hh_breakout_long, ll_breakdown_short, bos_long, bos_short",
+        "Swing rejection signals: swing_high_rejection_short, swing_low_bounce_long",
+        "Dynamic ATR trailing stop with configurable activation",
+        "Multi-position support with max_open_positions limit"
+      ],
+      "signal_directions": {
+        "hh_breakout": "LONG",
+        "ll_breakdown": "SHORT",
+        "hh_rejection": "SHORT",
+        "ll_bounce": "LONG",
+        "bos_long": "LONG",
+        "bos_short": "SHORT",
+        "lh_rejection": "SHORT",
+        "hl_bounce": "LONG"
+      }
+    }
+  ],
+  "notes": [
+    "Update this file when changing signal logic",
+    "Increment STRATEGY_VERSION in config.py before running backtest",
+    "Document signal direction changes in signal_directions object"
+  ]
+}

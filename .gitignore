@@ -5,5 +5,7 @@ kline_data/
 output/
 *.png
 *.csv
-*.json
 *.jsonl
+backtets_params.json
+trail_stop_params.json
+*.md
