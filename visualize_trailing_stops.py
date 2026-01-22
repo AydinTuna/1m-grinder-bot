@@ -200,6 +200,13 @@ def plot_trailing_stops(trailing_stops: pd.DataFrame, trades: pd.DataFrame, symb
         ax.plot(group["timestamp"], group["new_stop_price"], 
                 label="Trailing Stop", color="magenta", linewidth=2.5, alpha=0.95)
         
+        # Extend last trailing stop level to exit time for easier analysis
+        last_ts = group["timestamp"].iloc[-1]
+        last_stop = group["new_stop_price"].iloc[-1]
+        if trade["exit_time"] > last_ts:
+            ax.plot([last_ts, trade["exit_time"]], [last_stop, last_stop],
+                    color="magenta", linewidth=2.5, alpha=0.5, linestyle="--")
+        
         # Plot floor stop (breakeven) - only if column exists (not used in dynamic_atr mode)
         if "floor_stop" in group.columns and pd.notna(group["floor_stop"].iloc[0]):
             ax.axhline(y=group["floor_stop"].iloc[0], color="cyan", linestyle="-.", 
@@ -315,6 +322,13 @@ def plot_stop_levels_detail(trailing_stops: pd.DataFrame, trades: pd.DataFrame, 
         # Plot trailing stop
         ax.plot(group["timestamp"], group["new_stop_price"], 
                 label="Trailing Stop", color="magenta", linewidth=2.5, alpha=0.95)
+        
+        # Extend last trailing stop level to exit time for easier analysis
+        last_ts = group["timestamp"].iloc[-1]
+        last_stop = group["new_stop_price"].iloc[-1]
+        if trade["exit_time"] > last_ts:
+            ax.plot([last_ts, trade["exit_time"]], [last_stop, last_stop],
+                    color="magenta", linewidth=2.5, alpha=0.5, linestyle="--")
         
         # Plot entry price
         ax.axhline(y=trade["entry_price"], color="lime", linestyle="--", 
