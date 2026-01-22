@@ -511,30 +511,36 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             and entry_price is not None
         ):
             c = float(df.at[t, "close"])
+            h = float(df.at[t, "high"])
+            l = float(df.at[t, "low"])
             side_str = "LONG" if position == 1 else "SHORT"
             prev_stop_price = stop_price
 
             if cfg.trailing_mode == "dynamic_atr":
                 # Dynamic ATR trailing - stop moves with ATR, floored at breakeven (0R)
-                current_atr = float(df.at[t, "atr"])
-                floor_stop = entry_price  # Floor at breakeven (0R), no negative stops
-                atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
+                # Use signal_atr (trail_r_value) for consistent risk, not current bar's ATR
+                signal_atr_for_trail = trail_r_value if trail_r_value is not None else float(df.at[t, "atr"])
+                
+                # Select price source for trailing: high_low uses favorable extreme (high for LONG, low for SHORT)
+                if cfg.dynamic_trail_price_source == "high_low":
+                    trail_price = h if position == 1 else l
+                else:
+                    trail_price = c
+                atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr_for_trail, cfg.dynamic_trail_atr_mult, position)
 
-                # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
-                if position == 1:  # LONG
-                    new_stop = max(atr_stop, floor_stop)  # floor is minimum
-                else:  # SHORT
-                    new_stop = min(atr_stop, floor_stop)  # floor is maximum
+                # FIX: No floor constraint - let ATR stop trail freely based on price
+                # The ratchet logic below ensures stop only moves in profitable direction
+                new_stop = atr_stop
 
                 # Only set stop if price has moved activation_r in our favor
                 # This prevents immediate breakeven stops that get hit by normal volatility
-                activation_threshold = (trail_r_value if trail_r_value is not None else current_atr) * cfg.dynamic_trail_activation_r
+                activation_threshold = signal_atr_for_trail * cfg.dynamic_trail_activation_r
                 if position == 1:
                     price_moved_enough = c >= entry_price + activation_threshold
-                    should_set_stop = price_moved_enough and new_stop >= entry_price
+                    should_set_stop = price_moved_enough
                 else:
                     price_moved_enough = c <= entry_price - activation_threshold
-                    should_set_stop = price_moved_enough and new_stop <= entry_price
+                    should_set_stop = price_moved_enough
 
                 # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
                 if position == 1:  # LONG
@@ -551,14 +557,15 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                     "side": side_str,
                     "entry_price": entry_price,
                     "close_price": c,
-                    "current_atr": current_atr,
+                    "trail_price": trail_price,
+                    "signal_atr": signal_atr_for_trail,
                     "atr_stop": atr_stop,
-                    "floor_stop": floor_stop,
                     "prev_stop_price": prev_stop_price,
                     "new_stop_price": stop_price,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
                     "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "dynamic_trail_price_source": cfg.dynamic_trail_price_source,
                     "price_moved_enough": price_moved_enough,
                     "stop_moved": stop_moved,
                 })
@@ -3827,34 +3834,31 @@ def backtest_atr_grinder_lib(
         """Update trailing stop using dynamic ATR on 1s closes.
         
         Only sets stops at breakeven (0R) or better - no negative stops.
+        Uses signal_atr from entry for consistent risk management.
         """
         nonlocal trailing_stop_updates
         current_sl_price = sl_price
-        floor_stop = entry_p  # Floor at breakeven (0R), no negative stops
 
-        # Get current ATR from signal timeframe
-        current_atr = float(df_signal.at[signal_t, "atr"])
+        # Use signal_atr from entry for consistent risk, not current bar's ATR
 
         for t_1s, candle_1s in df_1s_chunk.iterrows():
             c = float(candle_1s["close"])
             prev_sl_price = current_sl_price
 
-            atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, pos)
+            atr_stop = compute_dynamic_atr_stop(c, signal_atr, cfg.dynamic_trail_atr_mult, pos)
 
-            # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
-            if pos == 1:  # LONG
-                new_stop = max(atr_stop, floor_stop)  # floor is minimum
-            else:  # SHORT
-                new_stop = min(atr_stop, floor_stop)  # floor is maximum
+            # FIX: No floor constraint - let ATR stop trail freely based on price
+            # The ratchet logic below ensures stop only moves in profitable direction
+            new_stop = atr_stop
 
             # Only set stop if price has moved activation_r in our favor
             activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
             if pos == 1:
                 price_moved_enough = c >= entry_p + activation_threshold
-                should_set_stop = price_moved_enough and new_stop >= entry_p
+                should_set_stop = price_moved_enough
             else:
                 price_moved_enough = c <= entry_p - activation_threshold
-                should_set_stop = price_moved_enough and new_stop <= entry_p
+                should_set_stop = price_moved_enough
 
             # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
             if pos == 1:  # LONG
@@ -3868,9 +3872,8 @@ def backtest_atr_grinder_lib(
                     "side": side_str,
                     "entry_price": entry_p,
                     "close_price": c,
-                    "current_atr": current_atr,
+                    "signal_atr": signal_atr,
                     "atr_stop": atr_stop,
-                    "floor_stop": floor_stop,
                     "prev_stop_price": prev_sl_price,
                     "new_stop_price": new_stop,
                     "trailing_mode": "dynamic_atr",
@@ -3909,8 +3912,7 @@ def backtest_atr_grinder_lib(
         current_sl_price = sl_price
         floor_stop = entry_p  # Floor at breakeven (0R), no negative stops
 
-        # Get current ATR from signal timeframe
-        current_atr = float(df_signal.at[signal_t, "atr"])
+        # Use signal_atr from entry for consistent risk, not current bar's ATR
 
         for t_1s, candle_1s in df_1s_chunk.iterrows():
             o = float(candle_1s["open"])
@@ -3918,30 +3920,35 @@ def backtest_atr_grinder_lib(
             l = float(candle_1s["low"])
             c = float(candle_1s["close"])
 
-            # Step 1: Update trailing stop based on close
+            # Step 1: Update trailing stop based on price source
             prev_sl_price = current_sl_price
-            atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, pos)
+            
+            # Select price source for trailing: high_low uses favorable extreme (high for LONG, low for SHORT)
+            if cfg.dynamic_trail_price_source == "high_low":
+                trail_price = h if pos == 1 else l
+            else:
+                trail_price = c
+            atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr, cfg.dynamic_trail_atr_mult, pos)
 
-            # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
-            if pos == 1:  # LONG
-                new_stop = max(atr_stop, floor_stop)  # floor is minimum
-            else:  # SHORT
-                new_stop = min(atr_stop, floor_stop)  # floor is maximum
+            # FIX: No floor constraint - let ATR stop trail freely based on price
+            # The ratchet logic below ensures stop only moves in profitable direction
+            new_stop = atr_stop
 
             # Only set stop if price has moved activation_r in our favor
             activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
             if pos == 1:
                 price_moved_enough = c >= entry_p + activation_threshold
-                should_set_stop = price_moved_enough and new_stop >= entry_p
+                should_set_stop = price_moved_enough
             else:
                 price_moved_enough = c <= entry_p - activation_threshold
-                should_set_stop = price_moved_enough and new_stop <= entry_p
+                should_set_stop = price_moved_enough
 
             # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
             if pos == 1:  # LONG
                 stop_moved = should_set_stop and (current_sl_price is None or new_stop > current_sl_price)
             else:  # SHORT
                 stop_moved = should_set_stop and (current_sl_price is None or new_stop < current_sl_price)
+
             if stop_moved:
                 trailing_stop_updates.append({
                     "timestamp": t_1s,
@@ -3949,14 +3956,15 @@ def backtest_atr_grinder_lib(
                     "side": side_str,
                     "entry_price": entry_p,
                     "close_price": c,
-                    "current_atr": current_atr,
+                    "trail_price": trail_price,
+                    "signal_atr": signal_atr,
                     "atr_stop": atr_stop,
-                    "floor_stop": floor_stop,
                     "prev_stop_price": prev_sl_price,
                     "new_stop_price": new_stop,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
                     "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "dynamic_trail_price_source": cfg.dynamic_trail_price_source,
                     "price_moved_enough": price_moved_enough,
                     "stop_moved": True,
                     "lib_mode": True,
@@ -4129,29 +4137,35 @@ def backtest_atr_grinder_lib(
             and entry_price is not None
         ):
             c = float(df.at[t, "close"])
+            h = float(df.at[t, "high"])
+            l = float(df.at[t, "low"])
             side_str = "LONG" if position == 1 else "SHORT"
             prev_stop_price = stop_price
 
             if cfg.trailing_mode == "dynamic_atr":
-                # Dynamic ATR trailing - stop moves with ATR, floored at breakeven (0R)
-                current_atr = float(df.at[t, "atr"])
-                floor_stop = entry_price  # Floor at breakeven (0R), no negative stops
-                atr_stop = compute_dynamic_atr_stop(c, current_atr, cfg.dynamic_trail_atr_mult, position)
+                # Dynamic ATR trailing - stop moves with ATR
+                # Use signal_atr (trail_r_value) for consistent risk, not current bar's ATR
+                signal_atr_for_trail = trail_r_value if trail_r_value is not None else float(df.at[t, "atr"])
+                
+                # Select price source for trailing: high_low uses favorable extreme (high for LONG, low for SHORT)
+                if cfg.dynamic_trail_price_source == "high_low":
+                    trail_price = h if position == 1 else l
+                else:
+                    trail_price = c
+                atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr_for_trail, cfg.dynamic_trail_atr_mult, position)
 
-                # Apply floor (stop floored at breakeven, only ratchets in profitable direction)
-                if position == 1:  # LONG
-                    new_stop = max(atr_stop, floor_stop)  # floor is minimum
-                else:  # SHORT
-                    new_stop = min(atr_stop, floor_stop)  # floor is maximum
+                # FIX: No floor constraint - let ATR stop trail freely based on price
+                # The ratchet logic below ensures stop only moves in profitable direction
+                new_stop = atr_stop
 
                 # Only set stop if price has moved activation_r in our favor
-                activation_threshold = (trail_r_value if trail_r_value is not None else current_atr) * cfg.dynamic_trail_activation_r
+                activation_threshold = signal_atr_for_trail * cfg.dynamic_trail_activation_r
                 if position == 1:
                     price_moved_enough = c >= entry_price + activation_threshold
-                    should_set_stop = price_moved_enough and new_stop >= entry_price
+                    should_set_stop = price_moved_enough
                 else:
                     price_moved_enough = c <= entry_price - activation_threshold
-                    should_set_stop = price_moved_enough and new_stop <= entry_price
+                    should_set_stop = price_moved_enough
 
                 # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
                 if position == 1:  # LONG
@@ -4168,14 +4182,15 @@ def backtest_atr_grinder_lib(
                     "side": side_str,
                     "entry_price": entry_price,
                     "close_price": c,
-                    "current_atr": current_atr,
+                    "trail_price": trail_price,
+                    "signal_atr": signal_atr_for_trail,
                     "atr_stop": atr_stop,
-                    "floor_stop": floor_stop,
                     "prev_stop_price": prev_stop_price,
                     "new_stop_price": stop_price,
                     "trailing_mode": "dynamic_atr",
                     "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
                     "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
+                    "dynamic_trail_price_source": cfg.dynamic_trail_price_source,
                     "price_moved_enough": price_moved_enough,
                     "stop_moved": stop_moved,
                     "lib_mode": False,

@@ -200,9 +200,10 @@ def plot_trailing_stops(trailing_stops: pd.DataFrame, trades: pd.DataFrame, symb
         ax.plot(group["timestamp"], group["new_stop_price"], 
                 label="Trailing Stop", color="magenta", linewidth=2.5, alpha=0.95)
         
-        # Plot floor stop (breakeven)
-        ax.axhline(y=group["floor_stop"].iloc[0], color="cyan", linestyle="-.", 
-                   linewidth=1.5, label=f"Floor (BE): {group['floor_stop'].iloc[0]:.6f}", alpha=0.7)
+        # Plot floor stop (breakeven) - only if column exists (not used in dynamic_atr mode)
+        if "floor_stop" in group.columns and pd.notna(group["floor_stop"].iloc[0]):
+            ax.axhline(y=group["floor_stop"].iloc[0], color="cyan", linestyle="-.", 
+                       linewidth=1.5, label=f"Floor (BE): {group['floor_stop'].iloc[0]:.6f}", alpha=0.7)
         
         # Mark stop movement points
         stop_moved = group[group["stop_moved"] == True]
@@ -319,9 +320,10 @@ def plot_stop_levels_detail(trailing_stops: pd.DataFrame, trades: pd.DataFrame, 
         ax.axhline(y=trade["entry_price"], color="lime", linestyle="--", 
                    linewidth=2, label=f"Entry: {trade['entry_price']:.6f}", alpha=0.9)
         
-        # Plot floor stop (breakeven)
-        ax.axhline(y=group["floor_stop"].iloc[0], color="cyan", linestyle="-.", 
-                   linewidth=1.5, label=f"Floor (BE): {group['floor_stop'].iloc[0]:.6f}", alpha=0.7)
+        # Plot floor stop (breakeven) - only if column exists (not used in dynamic_atr mode)
+        if "floor_stop" in group.columns and pd.notna(group["floor_stop"].iloc[0]):
+            ax.axhline(y=group["floor_stop"].iloc[0], color="cyan", linestyle="-.", 
+                       linewidth=1.5, label=f"Floor (BE): {group['floor_stop'].iloc[0]:.6f}", alpha=0.7)
         
         # Mark stop movement points
         stop_moved = group[group["stop_moved"] == True]
