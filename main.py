@@ -88,6 +88,8 @@ from config import (
     save_config_snapshot,
     generate_trade_id,
 )
+
+FORCED_EXIT_REASON = "FORCED_EXIT_4H"
 from swing_levels import (
     build_swing_atr_signals,
     build_market_structure_signals,
@@ -397,6 +399,22 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     trades: List[Dict] = []
     trailing_stop_updates: List[Dict] = []
 
+    forced_exit_intervals_since_entry = 0
+    forced_exit_last_boundary_ts: Optional[pd.Timestamp] = None
+
+    def should_trigger_forced_exit(timestamp: pd.Timestamp) -> bool:
+        """Return True when the forced-exit limit on configured intervals is reached."""
+        nonlocal forced_exit_intervals_since_entry, forced_exit_last_boundary_ts
+        if not cfg.use_trailing_stop or cfg.forced_exit_interval_count <= 0:
+            return False
+        if not is_exit_check_boundary(timestamp, cfg.forced_exit_interval):
+            return False
+        is_new_boundary = forced_exit_last_boundary_ts is None or timestamp > forced_exit_last_boundary_ts
+        if is_new_boundary:
+            forced_exit_intervals_since_entry += 1
+            forced_exit_last_boundary_ts = timestamp
+        return forced_exit_intervals_since_entry >= cfg.forced_exit_interval_count
+
     idx = df.index.to_list()
     daily_date = idx[0].date() if idx else None
 
@@ -536,6 +554,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 active_margin = cfg.initial_capital
                 active_leverage = cfg.leverage
                 active_notional = active_margin * active_leverage
+                forced_exit_intervals_since_entry = 0
+                forced_exit_last_boundary_ts = None
 
         # --- Trailing stop update (candle close) ---
         # Note: stop_price may be None initially (no stop until breakeven)
@@ -726,6 +746,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                             )
 
                         position = side
+                        forced_exit_intervals_since_entry = 0
+                        forced_exit_last_boundary_ts = None
                         entry_time = t
                         entry_index = i
                         used_signal_atr = signal_atr_value
@@ -802,6 +824,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                                     )
 
                                 position = side
+                                forced_exit_intervals_since_entry = 0
+                                forced_exit_last_boundary_ts = None
                                 entry_time = t
                                 entry_index = i
                                 used_signal_atr = signal_atr_value
@@ -885,6 +909,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             "signal_atr": used_signal_atr,
             "stop_price": stop_price,
             "exit_reason": "END_OF_BACKTEST",
+            "forced_exit": False,
             "roi_net": roi_net,
             "pnl_net": pnl_net,
             "margin_used": active_margin,
@@ -3723,6 +3748,22 @@ def backtest_atr_grinder_lib(
     trades: List[Dict] = []
     trailing_stop_updates: List[Dict] = []
 
+    forced_exit_intervals_since_entry = 0
+    forced_exit_last_boundary_ts: Optional[pd.Timestamp] = None
+
+    def should_trigger_forced_exit(timestamp: pd.Timestamp) -> bool:
+        """Return True when the forced-exit limit on configured intervals is reached."""
+        nonlocal forced_exit_intervals_since_entry, forced_exit_last_boundary_ts
+        if not cfg.use_trailing_stop or cfg.forced_exit_interval_count <= 0:
+            return False
+        if not is_exit_check_boundary(timestamp, cfg.forced_exit_interval):
+            return False
+        is_new_boundary = forced_exit_last_boundary_ts is None or timestamp > forced_exit_last_boundary_ts
+        if is_new_boundary:
+            forced_exit_intervals_since_entry += 1
+            forced_exit_last_boundary_ts = timestamp
+        return forced_exit_intervals_since_entry >= cfg.forced_exit_interval_count
+
     idx = df.index.to_list()
     daily_date = idx[0].date() if idx else None
 
@@ -3765,65 +3806,62 @@ def backtest_atr_grinder_lib(
         use_trailing: bool,
     ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp]]:
         """Check for exit using candle closes at higher timeframe boundaries (e.g., 4h).
-        
+
         Note: sl_price may be None if no stop has been set yet (breakeven-only stops).
         Exit only triggers when a higher timeframe candle CLOSES beyond the stop.
         """
-        # If no stop price is set, no SL can be hit
-        if sl_price is None:
-            # Check only TP (if not using trailing and TP is set)
-            if not use_trailing and tp_price is not None:
-                for t_1s, candle_1s in df_1s_chunk.iterrows():
-                    # Only check on exit interval boundaries
-                    if not is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
-                        continue
-                    c = float(candle_1s["close"])
+        for t_1s, candle_1s in df_1s_chunk.iterrows():
+            # Only check exit on higher timeframe boundaries (e.g., 4h close)
+            if not is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
+                continue
+
+            forced_exit_limit_hit = should_trigger_forced_exit(t_1s)
+            c = float(candle_1s["close"])
+
+            if sl_price is None:
+                if not use_trailing and tp_price is not None:
                     if pos == 1 and c >= tp_price:
                         exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s
                     elif pos == -1 and c <= tp_price:
                         exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s
-            return False, None, None, None
+            else:
+                if pos == 1:  # LONG
+                    # Exit if candle CLOSES below stop
+                    sl_hit = c <= sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c >= tp_price
 
-        for t_1s, candle_1s in df_1s_chunk.iterrows():
-            # Only check exit on higher timeframe boundaries (e.g., 4h close)
-            if not is_exit_check_boundary(t_1s, cfg.trail_exit_check_interval):
-                continue
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s
 
-            c = float(candle_1s["close"])
+                else:  # SHORT
+                    # Exit if candle CLOSES above stop
+                    sl_hit = c >= sl_price
+                    tp_hit = (not use_trailing) and tp_price is not None and c <= tp_price
 
-            if pos == 1:  # LONG
-                # Exit if candle CLOSES below stop
-                sl_hit = c <= sl_price
-                tp_hit = (not use_trailing) and tp_price is not None and c >= tp_price
+                    if sl_hit and tp_hit:
+                        # Both hit - conservative: use SL
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    elif sl_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "SL", exit_price, t_1s
+                    elif tp_hit:
+                        exit_price = apply_slippage(c, pos, is_entry=False)
+                        return True, "TP", exit_price, t_1s
 
-                if sl_hit and tp_hit:
-                    # Both hit - conservative: use SL
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-                elif sl_hit:
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-                elif tp_hit:
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "TP", exit_price, t_1s
-
-            else:  # SHORT
-                # Exit if candle CLOSES above stop
-                sl_hit = c >= sl_price
-                tp_hit = (not use_trailing) and tp_price is not None and c <= tp_price
-
-                if sl_hit and tp_hit:
-                    # Both hit - conservative: use SL
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-                elif sl_hit:
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "SL", exit_price, t_1s
-                elif tp_hit:
-                    exit_price = apply_slippage(c, pos, is_entry=False)
-                    return True, "TP", exit_price, t_1s
+            if forced_exit_limit_hit:
+                exit_price = apply_slippage(c, pos, is_entry=False)
+                return True, FORCED_EXIT_REASON, exit_price, t_1s
 
         return False, None, None, None
 
@@ -3930,6 +3968,7 @@ def backtest_atr_grinder_lib(
             h = float(candle_1s["high"])
             l = float(candle_1s["low"])
             c = float(candle_1s["close"])
+            forced_exit_limit_hit = should_trigger_forced_exit(t_1s)
 
             # Step 1: Update trailing stop based on close
             close_r = compute_close_r(entry_p, c, pos, r_value)
@@ -4008,6 +4047,10 @@ def backtest_atr_grinder_lib(
                     elif tp_hit:
                         exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
+
+            if forced_exit_limit_hit:
+                exit_price = apply_slippage(c, pos, is_entry=False)
+                return True, FORCED_EXIT_REASON, exit_price, t_1s, current_sl_price, current_best_r, current_stop_r
 
         # No exit triggered
         return False, None, None, None, current_sl_price, current_best_r, current_stop_r
@@ -4149,6 +4192,7 @@ def backtest_atr_grinder_lib(
             h = float(candle_1s["high"])
             l = float(candle_1s["low"])
             c = float(candle_1s["close"])
+            forced_exit_limit_hit = should_trigger_forced_exit(t_1s)
 
             # Accumulate high/low for the current period
             if period_high is None or h > period_high:
@@ -4249,6 +4293,10 @@ def backtest_atr_grinder_lib(
                         exit_price = apply_slippage(c, pos, is_entry=False)
                         return True, "TP", exit_price, t_1s, current_sl_price
 
+            if forced_exit_limit_hit:
+                exit_price = apply_slippage(c, pos, is_entry=False)
+                return True, FORCED_EXIT_REASON, exit_price, t_1s, current_sl_price
+
         # No exit triggered
         return False, None, None, None, current_sl_price
 
@@ -4348,6 +4396,7 @@ def backtest_atr_grinder_lib(
                     "signal_atr": used_signal_atr,
                     "stop_price": stop_price,
                     "exit_reason": exit_reason,
+                    "forced_exit": exit_reason == FORCED_EXIT_REASON,
                     "roi_net": roi_net,
                     "pnl_net": pnl_net,
                     "margin_used": active_margin,
@@ -4551,6 +4600,8 @@ def backtest_atr_grinder_lib(
                             )
 
                         position = side
+                        forced_exit_intervals_since_entry = 0
+                        forced_exit_last_boundary_ts = None
                         entry_time = fill_time if has_1m_data else t
                         entry_index = i
                         used_signal_atr = signal_atr_value
@@ -4579,6 +4630,10 @@ def backtest_atr_grinder_lib(
                                         "signal_atr": used_signal_atr,
                                         "stop_price": stop_price,
                                         "exit_reason": exit_reason,
+                                        "forced_exit": exit_reason == FORCED_EXIT_REASON,
+                                        "forced_exit": exit_reason == FORCED_EXIT_REASON,
+                                        "forced_exit": exit_reason == FORCED_EXIT_REASON,
+                                        "forced_exit": exit_reason == FORCED_EXIT_REASON,
                                         "roi_net": roi_net,
                                         "pnl_net": pnl_net,
                                         "margin_used": active_margin,
@@ -4597,6 +4652,18 @@ def backtest_atr_grinder_lib(
                                     entry_time = None
                                     entry_index = None
                                     used_signal_atr = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
+                                    forced_exit_intervals_since_entry = 0
+                                    forced_exit_last_boundary_ts = None
                             elif cfg.trailing_mode == "dynamic_atr" and used_signal_atr is not None:
                                 exited, exit_reason, exit_price_check, exit_time_check, stop_price = process_trailing_and_exit_dynamic_atr_lib(
                                     position, entry_price, used_signal_atr, stop_price,
@@ -4730,6 +4797,8 @@ def backtest_atr_grinder_lib(
                                                 "signal_atr": used_signal_atr,
                                                 "stop_price": stop_price,
                                                 "exit_reason": exit_reason,
+                                                "forced_exit": exit_reason == FORCED_EXIT_REASON,
+                                                "forced_exit": exit_reason == FORCED_EXIT_REASON,
                                                 "roi_net": roi_net,
                                                 "pnl_net": pnl_net,
                                                 "margin_used": active_margin,
