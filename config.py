@@ -328,7 +328,7 @@ class LiveConfig:
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
     trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
-    trail_exit_check_interval: str = "1m"  # interval for exit check (exit immediately on 1m close when stop hit)
+    trail_exit_check_interval: str = "4h"  # interval for exit check (exit immediately on 1m close when stop hit)
 
     # Multi-position settings
     max_open_positions: int = 0  # max concurrent positions (<= 0 means unlimited)
