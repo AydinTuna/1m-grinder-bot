@@ -1,6 +1,24 @@
 {
   "versions": [
     {
+      "version": "1.1.0",
+      "date": "2026-01-23",
+      "changes": [
+        "Invert bos_long signal direction to SHORT",
+        "Allow dynamic ATR trailing stop to move in both directions after activation"
+      ],
+      "signal_directions": {
+        "hh_breakout": "SHORT",
+        "ll_breakdown": "LONG",
+        "hh_rejection": "SHORT",
+        "ll_bounce": "LONG",
+        "bos_long": "SHORT",
+        "bos_short": "LONG",
+        "lh_rejection": "SHORT",
+        "hl_bounce": "LONG"
+      }
+    },
+    {
       "version": "1.0.0",
       "date": "2026-01-22",
       "changes": [

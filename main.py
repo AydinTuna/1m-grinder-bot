@@ -617,10 +617,9 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                         price_moved_enough = c <= entry_price - activation_threshold
                         should_set_stop = price_moved_enough
 
-                    if position == 1:
-                        stop_moved = should_set_stop and (pos["stop_price"] is None or new_stop > pos["stop_price"])
-                    else:
-                        stop_moved = should_set_stop and (pos["stop_price"] is None or new_stop < pos["stop_price"])
+                    stop_moved = should_set_stop and (
+                        pos["stop_price"] is None or new_stop != pos["stop_price"]
+                    )
                     if stop_moved:
                         pos["stop_price"] = new_stop
 
@@ -3889,7 +3888,7 @@ def backtest_atr_grinder_lib(
     ) -> Tuple[Optional[float], float, int]:
         """Update trailing stop using 1s closes (R-ladder mode).
         
-        Only sets stops at breakeven (0R) or better - no negative stops.
+        Only sets stops once activation threshold is reached; stop can move in either direction.
         """
         nonlocal trailing_stop_updates
         current_best_r = best_close_r
@@ -4080,7 +4079,7 @@ def backtest_atr_grinder_lib(
     ) -> Optional[float]:
         """Update trailing stop using dynamic ATR at trail_check_interval boundaries.
         
-        Only sets stops at breakeven (0R) or better - no negative stops.
+        Only sets stops once activation threshold is reached; stop can move in either direction.
         Uses signal_atr from entry for consistent risk management.
         Updates occur at trail_check_interval boundaries (e.g., 4h) using accumulated high/low.
         """
@@ -4119,8 +4118,7 @@ def backtest_atr_grinder_lib(
                 trail_price = period_close
             atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr, cfg.dynamic_trail_atr_mult, pos)
 
-            # FIX: No floor constraint - let ATR stop trail freely based on price
-            # The ratchet logic below ensures stop only moves in profitable direction
+            # Allow ATR stop to move in either direction once activated.
             new_stop = atr_stop
 
             # Only set stop if price has moved activation_r in our favor
@@ -4132,11 +4130,7 @@ def backtest_atr_grinder_lib(
                 price_moved_enough = period_close <= entry_p - activation_threshold
                 should_set_stop = price_moved_enough
 
-            # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
-            if pos == 1:  # LONG
-                stop_moved = should_set_stop and (current_sl_price is None or new_stop > current_sl_price)
-            else:  # SHORT
-                stop_moved = should_set_stop and (current_sl_price is None or new_stop < current_sl_price)
+            stop_moved = should_set_stop and (current_sl_price is None or new_stop != current_sl_price)
             if stop_moved:
                 trailing_stop_updates.append({
                     "timestamp": t_1s,
@@ -4225,8 +4219,7 @@ def backtest_atr_grinder_lib(
                     trail_price = period_close
                 atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr, cfg.dynamic_trail_atr_mult, pos)
 
-                # FIX: No floor constraint - let ATR stop trail freely based on price
-                # The ratchet logic below ensures stop only moves in profitable direction
+                # Allow ATR stop to move in either direction once activated.
                 new_stop = atr_stop
 
                 # Only set stop if price has moved activation_r in our favor
@@ -4238,11 +4231,7 @@ def backtest_atr_grinder_lib(
                     price_moved_enough = period_close <= entry_p - activation_threshold
                     should_set_stop = price_moved_enough
 
-                # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
-                if pos == 1:  # LONG
-                    stop_moved = should_set_stop and (current_sl_price is None or new_stop > current_sl_price)
-                else:  # SHORT
-                    stop_moved = should_set_stop and (current_sl_price is None or new_stop < current_sl_price)
+                stop_moved = should_set_stop and (current_sl_price is None or new_stop != current_sl_price)
 
                 if stop_moved:
                     trailing_stop_updates.append({
@@ -4533,10 +4522,9 @@ def backtest_atr_grinder_lib(
                         price_moved_enough = c <= entry_price - activation_threshold
                         should_set_stop = price_moved_enough
 
-                    if position == 1:
-                        stop_moved = should_set_stop and (pos["stop_price"] is None or new_stop > pos["stop_price"])
-                    else:
-                        stop_moved = should_set_stop and (pos["stop_price"] is None or new_stop < pos["stop_price"])
+                    stop_moved = should_set_stop and (
+                        pos["stop_price"] is None or new_stop != pos["stop_price"]
+                    )
                     if stop_moved:
                         pos["stop_price"] = new_stop
 
@@ -5202,13 +5190,7 @@ def run_live(cfg: LiveConfig) -> None:
             if not price_moved_enough:
                 return
             
-            # Only allow stop to ratchet in profitable direction (up for LONG, down for SHORT)
-            if side_sign == 1:  # LONG
-                stop_improved = pos_state.sl_price is None or atr_stop > pos_state.sl_price
-            else:  # SHORT
-                stop_improved = pos_state.sl_price is None or atr_stop < pos_state.sl_price
-            
-            if not stop_improved:
+            if pos_state.sl_price is not None and atr_stop == pos_state.sl_price:
                 return
             
             next_sl_price = atr_stop

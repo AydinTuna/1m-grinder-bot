@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.0.0"
+STRATEGY_VERSION: str = "1.2.0"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "Initial baseline - market structure signals with dynamic ATR trailing"
+STRATEGY_VERSION_NOTE: str = "Set hh_breakout_long and bos_long signals to LONG"
 
 
 # =============================================================================
@@ -289,7 +289,7 @@ class BacktestConfig:
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
     trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
-    trail_exit_check_interval: str = "1m"  # interval for exit check (only exit on 4h candle close)
+    trail_exit_check_interval: str = "4h"  # interval for exit check (only exit on 4h candle close)
     forced_exit_interval: str = "1d"  # boundary used to count forced-close intervals
     forced_exit_interval_count: int = 3  # close after surviving this many forced intervals
 

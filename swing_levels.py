@@ -98,8 +98,7 @@ def is_liquidity_sweep(
     Detect if a candle is likely a liquidity sweep.
     
     Conditions:
-    - Body >= ATR (significant move)
-    - Wick > Body (large wick relative to body)
+    - Wick > ATR * 0.60 (large wick relative to ATR)
     
     Args:
         candle_open, candle_high, candle_low, candle_close: OHLC values
@@ -123,8 +122,8 @@ def is_liquidity_sweep(
     
     max_wick = max(upper_wick, lower_wick)
     
-    # Liquidity sweep: big body AND wick larger than body
-    return body >= atr_value and max_wick > body
+    # Liquidity sweep: wick larger than ATR * 0.60
+    return max_wick > atr_value * 0.60
 
 
 def classify_market_structure(
@@ -142,7 +141,7 @@ def classify_market_structure(
     - HL (Higher Low): current swing low's close >= previous swing low's low
     
     Liquidity Sweep Filter:
-    - If body >= ATR AND wick > body, it's likely a liquidity sweep
+    - If wick > ATR * 0.60, it's likely a liquidity sweep
     - In this case, use the next candle's close instead of the swing candle's close
     
     Args:
@@ -815,7 +814,7 @@ def build_market_structure_signals(
 
     # 2. Near HH in uptrend + green big body + close > HH → SHORT (fade breakout)
     hh_breakout_long = in_uptrend & near_hh & big_body & is_green & (df["close"] > last_hh)
-    signal[hh_breakout_long] = -1
+    signal[hh_breakout_long] = 1
     entry_price[hh_breakout_long] = mid_body[hh_breakout_long]
     signal_reason[hh_breakout_long] = "hh_breakout_long"
 
@@ -854,7 +853,7 @@ def build_market_structure_signals(
     signal[bos_short] = 1
     signal_reason[bos_short] = "bos_short"
 
-    # BOS Long: In downtrend, price closes above recent LH with big green body
+    # BOS Long: In downtrend, price closes above recent LH with big green body (inverted to SHORT)
     bos_long = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
     signal[bos_long] = 1
     signal_reason[bos_long] = "bos_long"
