@@ -851,7 +851,7 @@ def build_market_structure_signals(
     
     # BOS Short: In uptrend, price closes below recent HL with big red body
     bos_short = in_uptrend & big_body & is_red & last_hl.notna() & (df["close"] < last_hl)
-    signal[bos_short] = -1
+    signal[bos_short] = 1
     signal_reason[bos_short] = "bos_short"
 
     # BOS Long: In downtrend, price closes above recent LH with big green body

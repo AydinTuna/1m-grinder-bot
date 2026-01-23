@@ -290,11 +290,11 @@ class BacktestConfig:
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
     trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
     trail_exit_check_interval: str = "1m"  # interval for exit check (only exit on 4h candle close)
-    forced_exit_interval: str = "4h"  # boundary used to count forced-close intervals
+    forced_exit_interval: str = "1d"  # boundary used to count forced-close intervals
     forced_exit_interval_count: int = 3  # close after surviving this many forced intervals
 
     # Multi-position settings
-    max_open_positions: int = 3  # max concurrent positions
+    max_open_positions: int = 0  # max concurrent positions (<= 0 means unlimited)
 
 
 @dataclass
@@ -331,7 +331,7 @@ class LiveConfig:
     trail_exit_check_interval: str = "1m"  # interval for exit check (exit immediately on 1m close when stop hit)
 
     # Multi-position settings
-    max_open_positions: int = 3  # max concurrent positions
+    max_open_positions: int = 0  # max concurrent positions (<= 0 means unlimited)
 
     # Entry time window (only enter positions within X minutes after daily candle close at 00:00 UTC)
     # Set to 0 to disable this check and allow entries anytime

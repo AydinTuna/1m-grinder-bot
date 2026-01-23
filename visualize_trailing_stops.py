@@ -10,13 +10,35 @@ import requests
 from datetime import datetime, timedelta
 import time
 
-from config import get_output_path
+from config import get_output_path, get_backtest_stats_dir, get_backtest_trades_dir
 
 
-def load_data():
-    """Load trailing stops and trades data from output folder."""
-    trailing_stops = pd.read_csv(get_output_path("trailing_stops.csv"), parse_dates=["timestamp", "entry_time"])
-    trades = pd.read_csv(get_output_path("trades.csv"), parse_dates=["entry_time", "exit_time"])
+def _latest_csv(dir_path: Path, pattern: str) -> Path:
+    candidates = sorted(dir_path.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No files matching {pattern} in {dir_path}")
+    return candidates[0]
+
+
+def load_data(trailing_path: str | None = None, trades_path: str | None = None):
+    """Load trailing stops and trades data from versioned backtest folders."""
+    stats_dir = get_backtest_stats_dir()
+    trades_dir = get_backtest_trades_dir()
+
+    if trailing_path:
+        trailing_file = Path(trailing_path)
+    else:
+        trailing_file = _latest_csv(stats_dir, "trailing_stops_*.csv")
+
+    if trades_path:
+        trades_file = Path(trades_path)
+    else:
+        suffix = trailing_file.name.replace("trailing_stops_", "").replace(".csv", "")
+        candidate = trades_dir / f"trades_{suffix}.csv"
+        trades_file = candidate if candidate.exists() else _latest_csv(trades_dir, "trades_*.csv")
+
+    trailing_stops = pd.read_csv(trailing_file, parse_dates=["timestamp", "entry_time"])
+    trades = pd.read_csv(trades_file, parse_dates=["entry_time", "exit_time"])
     return trailing_stops, trades
 
 
