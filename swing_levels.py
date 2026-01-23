@@ -98,7 +98,7 @@ def is_liquidity_sweep(
     Detect if a candle is likely a liquidity sweep.
     
     Conditions:
-    - Wick > ATR * 0.60 (large wick relative to ATR)
+    - Wick > ATR * 0.70 (large wick relative to ATR)
     
     Args:
         candle_open, candle_high, candle_low, candle_close: OHLC values
@@ -122,8 +122,8 @@ def is_liquidity_sweep(
     
     max_wick = max(upper_wick, lower_wick)
     
-    # Liquidity sweep: wick larger than ATR * 0.60
-    return max_wick > atr_value * 0.60
+    # Liquidity sweep: wick larger than ATR * 0.70
+    return max_wick > atr_value * 0.70
 
 
 def classify_market_structure(
@@ -141,7 +141,7 @@ def classify_market_structure(
     - HL (Higher Low): current swing low's close >= previous swing low's low
     
     Liquidity Sweep Filter:
-    - If wick > ATR * 0.60, it's likely a liquidity sweep
+    - If wick > ATR * 0.70, it's likely a liquidity sweep
     - In this case, use the next candle's close instead of the swing candle's close
     
     Args:

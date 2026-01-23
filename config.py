@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.2.0"
+STRATEGY_VERSION: str = "1.2.1"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "Set hh_breakout_long and bos_long signals to LONG"
+STRATEGY_VERSION_NOTE: str = "Update swing level detection logic"
 
 
 # =============================================================================
