@@ -348,7 +348,7 @@ class LiveConfig:
     spread_max_pct: float = 1.0  # disabled (set to 0.0001 for 0.01% filter)
     atr_offset_mult: float = 0.02
     poll_interval_seconds: float = 60.0  # check every minute for trailing
-    entry_order_timeout_seconds: float = 55.0
+    entry_order_timeout_seconds: float = 60 * 30  # 30 minutes
     log_path: str = "output/trade_log.jsonl"
     live_trades_csv: str = "output/live_trades.csv"
     live_signals_csv: str = "output/live_signals.csv"

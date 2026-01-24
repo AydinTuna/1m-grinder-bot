@@ -15,7 +15,7 @@ Rules:
   - No initial stop until price reaches first ladder step (trail_gap_r, default 1.25R).
   - When price reaches 1.25R, first stop is placed at breakeven (0R).
   - Trailing stop is a ladder based on 1m candle close in R units (gap = trail_gap_r, buffer = trail_buffer_r).
-  - Stop execution via STOP_MARKET orders (guaranteed fills).
+  - Stop execution via Binance algo conditional orders.
   - Positions can go negative without being stopped - relies on strategy edge.
 
 Live trading:
@@ -2108,7 +2108,7 @@ def algo_stop_limit_order(
     side: str,
     quantity: str,
     trigger_price: str,
-    price: str,
+    price: Optional[str],
     client: BinanceUMFuturesREST,
     *,
     client_order_id: Optional[str] = None,
@@ -2116,19 +2116,27 @@ def algo_stop_limit_order(
     working_type: str = "CONTRACT_PRICE",
     price_protect: bool = False,
     reduce_only: bool = True,
+    order_type: str = "STOP",
 ) -> Optional[Dict[str, object]]:
+    order_type_clean = str(order_type or "STOP").upper()
+    if order_type_clean not in {"STOP", "STOP_MARKET"}:
+        order_type_clean = "STOP"
     base_params: Dict[str, object] = {
         "symbol": symbol,
         "side": side,
         "algoType": algo_type,
-        "type": "STOP",
+        "type": order_type_clean,
         "quantity": quantity,
         "triggerPrice": trigger_price,
-        "price": price,
-        "timeInForce": "GTC",
         "workingType": working_type,
         "priceProtect": _bool_to_binance_flag(price_protect),
     }
+    if order_type_clean != "STOP_MARKET":
+        if price is None:
+            logging.error("Algo STOP order missing price for STOP type. symbol=%s", symbol)
+            return None
+        base_params["price"] = price
+        base_params["timeInForce"] = "GTC"
     if reduce_only:
         base_params["reduceOnly"] = True
 
@@ -5083,7 +5091,7 @@ def run_live(cfg: LiveConfig) -> None:
     - 1d candles for signal generation
     - 1m candles for trailing stop updates (Look In Bar mode)
     - Trailing stop only (no TP/SL on entry)
-    - Market orders for stop execution (guaranteed fills)
+    - Algo conditional stop orders for trailing exits
     - Static position sizing (margin_usd x leverage)
     """
     if load_dotenv is not None:
@@ -5288,46 +5296,50 @@ def run_live(cfg: LiveConfig) -> None:
             pos_state.sl_algo_id = None
             pos_state.sl_algo_client_order_id = None
         
-        # Place trailing stop as STOP_MARKET order (market execution on trigger)
+        # Place trailing stop as an algo conditional STOP_MARKET order
         sl_side = "SELL" if side_sign == 1 else "BUY"
         sl_client_id = f"ATR_SL_T_{close_time_ms}"
-        
-        try:
-            # Use STOP_MARKET for guaranteed fill
-            sl_order = client.new_order(
-                symbol=symbol,
-                side=sl_side,
-                type="STOP_MARKET",
-                stopPrice=next_sl_price_str,
-                quantity=qty_str,
-                reduceOnly="true",
-                newClientOrderId=sl_client_id,
-            )
-            pos_state.sl_algo_id = sl_order.get("orderId")
-            pos_state.sl_algo_client_order_id = sl_client_id
-            pos_state.sl_price = next_sl_price_rounded
-            if candidate_stop_r is not None:
-                pos_state.trail_stop_r = candidate_stop_r
-            
-            # Get tick_size for proper price precision in log
-            sl_tick_size = filters.get("tick_size", 0.00000001)
-            log_event(cfg.log_path, {
-                "event": "sl_trail_update",
-                "symbol": symbol,
-                "side": "LONG" if side_sign == 1 else "SHORT",
-                "sl_price": format_price_for_logging(next_sl_price_rounded, sl_tick_size),
-                "trailing_mode": cfg.trailing_mode,
-                "trail_price": format_price_for_logging(high_price if side_sign == 1 else low_price, sl_tick_size) if cfg.trailing_mode == "dynamic_atr" else None,
-                "stop_r": candidate_stop_r,
-                "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
-                "order_id": pos_state.sl_algo_id,
-            })
-        except ClientError as exc:
+        sl_order = algo_stop_limit_order(
+            symbol=symbol,
+            side=sl_side,
+            quantity=qty_str,
+            trigger_price=next_sl_price_str,
+            price=None,
+            client=client,
+            client_order_id=sl_client_id,
+            algo_type=cfg.algo_type,
+            working_type=cfg.algo_working_type,
+            price_protect=cfg.algo_price_protect,
+            reduce_only=True,
+            order_type="STOP_MARKET",
+        )
+        if not sl_order:
             log_event(cfg.log_path, {
                 "event": "sl_trail_order_failed",
                 "symbol": symbol,
-                "error": str(exc),
+                "error": "Algo STOP order failed (see logs)",
             })
+            return
+
+        pos_state.sl_algo_id = _extract_int(sl_order, ("algoId", "algoOrderId", "orderId", "id"))
+        pos_state.sl_algo_client_order_id = sl_client_id
+        pos_state.sl_price = next_sl_price_rounded
+        if candidate_stop_r is not None:
+            pos_state.trail_stop_r = candidate_stop_r
+        
+        # Get tick_size for proper price precision in log
+        sl_tick_size = filters.get("tick_size", 0.00000001)
+        log_event(cfg.log_path, {
+            "event": "sl_trail_update",
+            "symbol": symbol,
+            "side": "LONG" if side_sign == 1 else "SHORT",
+            "sl_price": format_price_for_logging(next_sl_price_rounded, sl_tick_size),
+            "trailing_mode": cfg.trailing_mode,
+            "trail_price": format_price_for_logging(high_price if side_sign == 1 else low_price, sl_tick_size) if cfg.trailing_mode == "dynamic_atr" else None,
+            "stop_r": candidate_stop_r,
+            "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
+            "order_id": pos_state.sl_algo_id,
+        })
 
     # -----------------------------------------------------------------
     # Helper: Check for entry signal on a symbol using 1d candle
