@@ -80,6 +80,11 @@ def get_live_logs_dir() -> Path:
     return get_versioned_output_dir("live") / "logs"
 
 
+def get_live_swing_levels_dir() -> Path:
+    """Get directory for live swing level JSON files."""
+    return get_versioned_output_dir("live") / "swing_levels"
+
+
 def get_data_klines_dir() -> Path:
     """Get directory for cached kline data."""
     return get_versioned_output_dir("data") / "klines"
@@ -95,6 +100,26 @@ def get_comparison_dir() -> Path:
     return OUTPUT_DIR / "backtest" / "comparison"
 
 
+def get_live_signals_path() -> Path:
+    """Get file path for live signals CSV."""
+    return get_live_signals_dir() / "signals.csv"
+
+
+def get_live_trades_path() -> Path:
+    """Get file path for live trades CSV."""
+    return get_live_trades_dir() / "trades.csv"
+
+
+def get_live_log_path() -> Path:
+    """Get file path for live trading log."""
+    return get_live_logs_dir() / "trade_log.jsonl"
+
+
+def get_live_swing_levels_path() -> Path:
+    """Get file path for live swing levels JSON."""
+    return get_live_swing_levels_dir() / "swing_levels_live.json"
+
+
 def ensure_output_dirs() -> None:
     """Create all output subdirectories if they don't exist."""
     dirs = [
@@ -105,6 +130,7 @@ def ensure_output_dirs() -> None:
         get_live_signals_dir(),
         get_live_trades_dir(),
         get_live_logs_dir(),
+        get_live_swing_levels_dir(),
         get_data_klines_dir(),
         get_data_swing_levels_dir(),
         get_comparison_dir(),
@@ -335,7 +361,7 @@ class LiveConfig:
 
     # Entry time window (only enter positions within X minutes after daily candle close at 00:00 UTC)
     # Set to 0 to disable this check and allow entries anytime
-    entry_window_minutes: int = 60
+    entry_window_minutes: int = 30
 
     # Algo order controls
     algo_type: str = "CONDITIONAL"
@@ -347,11 +373,12 @@ class LiveConfig:
     entry_delay_max_seconds: float = 0.01
     spread_max_pct: float = 1.0  # disabled (set to 0.0001 for 0.01% filter)
     atr_offset_mult: float = 0.02
+    entry_signal_workers: int = 15  # concurrent workers for entry signal scanning
     poll_interval_seconds: float = 60.0  # check every minute for trailing
     entry_order_timeout_seconds: float = 60 * 30  # 30 minutes
-    log_path: str = "output/trade_log.jsonl"
-    live_trades_csv: str = "output/live_trades.csv"
-    live_signals_csv: str = "output/live_signals.csv"
-    live_swing_levels_file: str = "output/swing_levels_live.json"  # detected swing levels for live trading
+    log_path: str = str(get_live_log_path())
+    live_trades_csv: str = str(get_live_trades_path())
+    live_signals_csv: str = str(get_live_signals_path())
+    live_swing_levels_file: str = str(get_live_swing_levels_path())  # detected swing levels for live trading
     post_only: bool = True
     use_testnet: bool = False

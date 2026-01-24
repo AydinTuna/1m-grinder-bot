@@ -33,6 +33,7 @@ Implementation details:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import datetime as dt
 import hashlib
@@ -5100,6 +5101,8 @@ def run_live(cfg: LiveConfig) -> None:
     if getenv("LIVE_TRADING") != "1":
         raise RuntimeError("Set LIVE_TRADING=1 to enable live trading.")
 
+    ensure_output_dirs()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     
     # Initialize Binance client
@@ -5115,6 +5118,103 @@ def run_live(cfg: LiveConfig) -> None:
     
     # Track ATR values per symbol for trailing stop R calculation
     last_atr_by_symbol: Dict[str, Optional[float]] = {}
+
+    def safe_float(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def fetch_latest_atr(symbol: str) -> Optional[float]:
+        cached = last_atr_by_symbol.get(symbol)
+        if cached is not None and cached > 0:
+            return cached
+        history = max(cfg.atr_history_bars, cfg.atr_len + 2)
+        if history > 1000:
+            history = 1000
+        try:
+            klines = client.klines(symbol=symbol, interval=cfg.signal_interval, limit=history)
+        except ClientError as exc:
+            logging.warning("ATR klines fetch failed. symbol=%s error=%s", symbol, exc)
+            return None
+        if len(klines) < 2:
+            return None
+        df = klines_to_df(klines[:-1])
+        if df.empty:
+            return None
+        atr = atr_ema(df, cfg.atr_len)
+        if atr.empty:
+            return None
+        atr_val = float(atr.iloc[-1])
+        if math.isnan(atr_val):
+            return None
+        last_atr_by_symbol[symbol] = atr_val
+        return atr_val
+
+    def restore_open_positions_from_exchange() -> int:
+        try:
+            raw_positions = client.get_position_risk()
+        except ClientError as exc:
+            logging.warning("Position restore failed. error=%s", exc)
+            log_event(cfg.log_path, {"event": "position_restore_failed", "error": str(exc)})
+            return 0
+
+        positions = raw_positions if isinstance(raw_positions, list) else [raw_positions]
+        restored = 0
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "")
+            if not symbol or symbol not in filters_by_symbol:
+                continue
+            amt = safe_float(pos.get("positionAmt"), 0.0)
+            if amt == 0.0:
+                continue
+            if state.has_position(symbol):
+                continue
+
+            entry_price = safe_float(pos.get("entryPrice"), 0.0)
+            if entry_price <= 0:
+                entry_price = safe_float(pos.get("markPrice"), 0.0)
+            if entry_price <= 0:
+                continue
+
+            side = 1 if amt > 0 else -1
+            qty = abs(amt)
+            entry_atr = fetch_latest_atr(symbol) or 0.0
+            leverage = int(safe_float(pos.get("leverage"), cfg.leverage))
+            if leverage <= 0:
+                leverage = cfg.leverage
+            margin_usd = cfg.margin_usd
+            if entry_price > 0 and leverage > 0:
+                margin_usd = (qty * entry_price) / leverage
+
+            pos_state = PositionState(
+                symbol=symbol,
+                entry_price=entry_price,
+                entry_side=side,
+                entry_qty=qty,
+                entry_atr=entry_atr,
+                trail_r_value=entry_atr,
+                trail_best_close_r=0.0,
+                trail_stop_r=cfg.trail_initial_stop_r,
+                entry_time_iso=_utc_now_iso(),
+                entry_close_ms=int(time.time() * 1000),
+                entry_margin_usd=margin_usd,
+                entry_leverage=leverage,
+            )
+            state.positions[symbol] = pos_state
+            restored += 1
+
+            tick_size = filters_by_symbol.get(symbol, {}).get("tick_size", 0.00000001)
+            log_event(cfg.log_path, {
+                "event": "position_restored",
+                "symbol": symbol,
+                "side": "LONG" if side == 1 else "SHORT",
+                "entry_price": format_price_for_logging(entry_price, tick_size),
+                "quantity": format_float_2(qty),
+                "entry_atr": format_price_for_logging(entry_atr, tick_size) if entry_atr > 0 else "",
+            })
+
+        return restored
     
     log_event(cfg.log_path, {
         "event": "startup",
@@ -5124,7 +5224,29 @@ def run_live(cfg: LiveConfig) -> None:
         "leverage": cfg.leverage,
         "margin_usd": format_float_2(cfg.margin_usd),
         "max_open_positions": cfg.max_open_positions,
+        "entry_signal_workers": cfg.entry_signal_workers,
     })
+
+    restored_positions = restore_open_positions_from_exchange()
+    if restored_positions:
+        log_event(cfg.log_path, {
+            "event": "positions_restored",
+            "count": restored_positions,
+            "symbols": list(state.positions.keys()),
+        })
+
+    signal_workers = max(1, int(cfg.entry_signal_workers))
+    signal_log_lock = threading.Lock()
+    swing_levels_lock = threading.Lock()
+
+    def chunk_symbols(symbols: List[str], worker_count: int) -> List[List[str]]:
+        if not symbols:
+            return []
+        if worker_count <= 1:
+            return [list(symbols)]
+        worker_count = min(worker_count, len(symbols))
+        chunk_size = int(math.ceil(len(symbols) / worker_count))
+        return [list(symbols[i:i + chunk_size]) for i in range(0, len(symbols), chunk_size)]
 
     # -----------------------------------------------------------------
     # Helper: Update trailing stop for a position using candle data
@@ -5384,15 +5506,16 @@ def run_live(cfg: LiveConfig) -> None:
         last_atr_by_symbol[symbol] = atr_value
         
         # Save detected swing levels to JSON file
-        save_live_swing_levels(
-            cfg.live_swing_levels_file,
-            symbol,
-            df,
-            cfg.swing_timeframe,
-            cfg.swing_left,
-            cfg.swing_right,
-            cfg.swing_resample_rule,
-        )
+        with swing_levels_lock:
+            save_live_swing_levels(
+                cfg.live_swing_levels_file,
+                symbol,
+                df,
+                cfg.swing_timeframe,
+                cfg.swing_left,
+                cfg.swing_right,
+                cfg.swing_resample_rule,
+            )
         
         candle = df.iloc[-1]
         body = abs(float(candle["close"]) - float(candle["open"]))
@@ -5401,24 +5524,61 @@ def run_live(cfg: LiveConfig) -> None:
         symbol_filters = filters_by_symbol.get(symbol, {})
         tick_size = symbol_filters.get("tick_size", 0.00000001)
         
-        log_event(cfg.log_path, {
-            "event": "signal_candle_close",
-            "symbol": symbol,
-            "close_time_ms": close_time_ms,
-            "open": format_price_for_logging(candle["open"], tick_size),
-            "high": format_price_for_logging(candle["high"], tick_size),
-            "low": format_price_for_logging(candle["low"], tick_size),
-            "close": format_price_for_logging(candle["close"], tick_size),
-            "body": format_price_for_logging(body, tick_size),
-            "atr": format_price_for_logging(atr_value, tick_size),
-            "signal": signal,
-            "signal_reason": signal_reason,
-        })
+        with signal_log_lock:
+            log_event(cfg.log_path, {
+                "event": "signal_candle_close",
+                "symbol": symbol,
+                "close_time_ms": close_time_ms,
+                "open": format_price_for_logging(candle["open"], tick_size),
+                "high": format_price_for_logging(candle["high"], tick_size),
+                "low": format_price_for_logging(candle["low"], tick_size),
+                "close": format_price_for_logging(candle["close"], tick_size),
+                "body": format_price_for_logging(body, tick_size),
+                "atr": format_price_for_logging(atr_value, tick_size),
+                "signal": signal,
+                "signal_reason": signal_reason,
+            })
         
         if signal == 0 or signal_atr is None or atr_value is None:
             return None
         
         return (signal, signal_atr, atr_value, signal_entry_price, signal_reason)
+
+    def scan_entry_signal_chunk(
+        symbols_chunk: List[str],
+    ) -> List[Tuple[str, Tuple[int, float, float, Optional[float], Optional[str]]]]:
+        results: List[Tuple[str, Tuple[int, float, float, Optional[float], Optional[str]]]] = []
+        for sym in symbols_chunk:
+            if sym not in filters_by_symbol:
+                continue
+            try:
+                signal_result = check_entry_signal(sym)
+            except Exception as exc:
+                logging.warning("Signal check failed. symbol=%s error=%s", sym, exc)
+                continue
+            if signal_result is None:
+                continue
+            results.append((sym, signal_result))
+        return results
+
+    async def scan_entry_signals(
+        symbols: List[str],
+    ) -> Dict[str, Tuple[int, float, float, Optional[float], Optional[str]]]:
+        if not symbols:
+            return {}
+        worker_count = min(signal_workers, len(symbols))
+        chunks = chunk_symbols(symbols, worker_count)
+        loop = asyncio.get_running_loop()
+        results: Dict[str, Tuple[int, float, float, Optional[float], Optional[str]]] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            tasks = [
+                loop.run_in_executor(executor, scan_entry_signal_chunk, chunk)
+                for chunk in chunks
+            ]
+            for chunk_results in await asyncio.gather(*tasks):
+                for sym, signal_result in chunk_results:
+                    results[sym] = signal_result
+        return results
 
     # -----------------------------------------------------------------
     # Helper: Place entry order for a symbol
@@ -5715,14 +5875,18 @@ def run_live(cfg: LiveConfig) -> None:
                 update_trailing_stop(symbol, pos_state)
             
             # --- Step 4: Check for new entry signals ---
-            # Scan all symbols for entry signals (log all signals, even if skipped)
-            for symbol in all_symbols:
-                # Skip if no filters available
-                if symbol not in filters_by_symbol:
-                    continue
-                
-                # Check for entry signal
-                signal_result = check_entry_signal(symbol)
+            # Scan all symbols for entry signals concurrently (log all signals, even if skipped)
+            eligible_symbols = [sym for sym in all_symbols if sym in filters_by_symbol]
+            signal_results: Dict[str, Tuple[int, float, float, Optional[float], Optional[str]]] = {}
+            if eligible_symbols:
+                try:
+                    signal_results = asyncio.run(scan_entry_signals(eligible_symbols))
+                except Exception as exc:
+                    logging.warning("Entry signal scan failed: %s", exc)
+                    signal_results = {}
+
+            for symbol in eligible_symbols:
+                signal_result = signal_results.get(symbol)
                 if signal_result is None:
                     continue
                 
