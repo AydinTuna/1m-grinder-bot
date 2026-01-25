@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.2.1"
+STRATEGY_VERSION: str = "1.3.2"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "Update swing level detection logic"
+STRATEGY_VERSION_NOTE: str = "Swing level detection update, sweep liq refactor, bugfixes, visualizer added"
 
 
 # =============================================================================
@@ -65,6 +65,11 @@ def get_backtest_charts_dir() -> Path:
     return get_versioned_output_dir("backtest") / "charts"
 
 
+def get_backtest_swing_levels_dir() -> Path:
+    """Get directory for backtest swing level JSON files."""
+    return get_versioned_output_dir("backtest") / "swing_levels"
+
+
 def get_live_signals_dir() -> Path:
     """Get directory for live signals CSV files."""
     return get_versioned_output_dir("live") / "signals"
@@ -83,6 +88,16 @@ def get_live_logs_dir() -> Path:
 def get_live_swing_levels_dir() -> Path:
     """Get directory for live swing level JSON files."""
     return get_versioned_output_dir("live") / "swing_levels"
+
+
+def get_live_trailing_stop_updates_dir() -> Path:
+    """Get directory for live trailing stop update logs."""
+    return get_versioned_output_dir("live") / "trailing_stop_updates"
+
+
+def get_live_trailing_stop_realtime_dir() -> Path:
+    """Get directory for live trailing stop snapshot files."""
+    return get_versioned_output_dir("live") / "trailing_stop_realtime"
 
 
 def get_data_klines_dir() -> Path:
@@ -120,6 +135,16 @@ def get_live_swing_levels_path() -> Path:
     return get_live_swing_levels_dir() / "swing_levels_live.json"
 
 
+def get_live_trailing_stop_updates_path() -> Path:
+    """Get file path for live trailing stop updates JSONL."""
+    return get_live_trailing_stop_updates_dir() / "trailing_stop_updates.jsonl"
+
+
+def get_live_trailing_stop_realtime_path() -> Path:
+    """Get file path for live trailing stop snapshot JSON."""
+    return get_live_trailing_stop_realtime_dir() / "trailing_stop_levels.json"
+
+
 def ensure_output_dirs() -> None:
     """Create all output subdirectories if they don't exist."""
     dirs = [
@@ -127,10 +152,13 @@ def ensure_output_dirs() -> None:
         get_backtest_trades_dir(),
         get_backtest_stats_dir(),
         get_backtest_charts_dir(),
+        get_backtest_swing_levels_dir(),
         get_live_signals_dir(),
         get_live_trades_dir(),
         get_live_logs_dir(),
         get_live_swing_levels_dir(),
+        get_live_trailing_stop_updates_dir(),
+        get_live_trailing_stop_realtime_dir(),
         get_data_klines_dir(),
         get_data_swing_levels_dir(),
         get_comparison_dir(),
@@ -293,7 +321,7 @@ class BacktestConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 5.0  # fixed leverage for static sizing
+    leverage: float = 20.0  # fixed leverage for static sizing
     initial_capital: float = 5.0  # starting equity (margin cap per trade)
     margin_usd: float = 5.0  # static margin per trade
 
@@ -337,7 +365,7 @@ class LiveConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
-    leverage: int = 20  # fixed leverage for static sizing
+    leverage: int = 5  # fixed leverage for static sizing
     margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
@@ -380,5 +408,7 @@ class LiveConfig:
     live_trades_csv: str = str(get_live_trades_path())
     live_signals_csv: str = str(get_live_signals_path())
     live_swing_levels_file: str = str(get_live_swing_levels_path())  # detected swing levels for live trading
+    live_trailing_stop_updates_file: str = str(get_live_trailing_stop_updates_path())
+    live_trailing_stop_realtime_file: str = str(get_live_trailing_stop_realtime_path())
     post_only: bool = True
     use_testnet: bool = False

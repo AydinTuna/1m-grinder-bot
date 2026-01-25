@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -30,6 +30,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 SwingKind = Literal["swing_high", "swing_low"]
 StructureKind = Literal["HH", "HL", "LL", "LH"]
+SMALL_BODY_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -65,11 +66,11 @@ class MarketStructurePoint:
     """
     Represents a classified market structure point (HH, HL, LL, LH).
     
-    Market Structure Rules:
-    - HH (Higher High): current swing high's close > previous swing high's high
-    - LH (Lower High): current swing high's close <= previous swing high's high
-    - LL (Lower Low): current swing low's close < previous swing low's low
-    - HL (Higher Low): current swing low's close >= previous swing low's low
+    Market Structure Rules (sequence + close filters):
+    - HH: swing high close > last HH AND > last LH
+    - LL: swing low close < last LL AND < last HL
+    - HL: after HH (if last high was LH, a swing low defaults to LL to keep downtrend sequence)
+    - LH: after LL, swing high close between last LL and last HH AND below previous LH
     """
     structure_kind: StructureKind  # "HH", "HL", "LL", "LH"
     swing_point: SwingPoint  # The underlying swing point
@@ -92,144 +93,181 @@ def is_liquidity_sweep(
     candle_high: float,
     candle_low: float,
     candle_close: float,
-    atr_value: float,
 ) -> bool:
     """
     Detect if a candle is likely a liquidity sweep.
     
     Conditions:
-    - Wick > ATR * 0.70 (large wick relative to ATR)
+    - Meaningful body (body / range > SMALL_BODY_RATIO)
+    - Wick dominance:
+        - Bearish candle: lower wick > body
+        - Bullish candle: upper wick > body
     
     Args:
         candle_open, candle_high, candle_low, candle_close: OHLC values
-        atr_value: ATR value at this candle
     
     Returns:
         True if the candle appears to be a liquidity sweep
     """
-    if atr_value is None or np.isnan(atr_value) or atr_value <= 0:
+    values = (candle_open, candle_high, candle_low, candle_close)
+    if any(v is None for v in values):
         return False
-    
+    if any(np.isnan(v) for v in values):
+        return False
+
+    candle_range = candle_high - candle_low
+    if candle_range <= 0:
+        return False
+
     body = abs(candle_close - candle_open)
-    
-    # Calculate wicks
-    if candle_close >= candle_open:  # Green candle
-        upper_wick = candle_high - candle_close
-        lower_wick = candle_open - candle_low
-    else:  # Red candle
-        upper_wick = candle_high - candle_open
-        lower_wick = candle_close - candle_low
-    
-    max_wick = max(upper_wick, lower_wick)
-    
-    # Liquidity sweep: wick larger than ATR * 0.70
-    return max_wick > atr_value * 0.70
+    upper_wick = candle_high - max(candle_open, candle_close)
+    lower_wick = min(candle_open, candle_close) - candle_low
+    body_ratio = body / candle_range
+
+    is_meaningful_body = body_ratio > SMALL_BODY_RATIO
+    if not is_meaningful_body:
+        return False
+
+    if candle_close < candle_open:  # Bearish candle
+        return lower_wick > body
+    if candle_close > candle_open:  # Bullish candle
+        return upper_wick > body
+    return False
 
 
 def classify_market_structure(
     swings: List[SwingPoint],
     df: pd.DataFrame,
-    atr: pd.Series,
 ) -> List[MarketStructurePoint]:
-    """
-    Classify swing points into HH/HL/LL/LH market structure levels.
-    
-    Market Structure Rules:
-    - HH (Higher High): current swing high's close > previous swing high's high
-    - LH (Lower High): current swing high's close <= previous swing high's high
-    - LL (Lower Low): current swing low's close < previous swing low's low
-    - HL (Higher Low): current swing low's close >= previous swing low's low
-    
-    Liquidity Sweep Filter:
-    - If wick > ATR * 0.70, it's likely a liquidity sweep
-    - In this case, use the next candle's close instead of the swing candle's close
-    
-    Args:
-        swings: List of detected swing points
-        df: DataFrame with OHLC data
-        atr: ATR series aligned with df
-    
-    Returns:
-        List of MarketStructurePoint with HH/HL/LL/LH classification
-    """
     if not swings:
         return []
-    
+
+    swings_sorted = sorted(swings, key=lambda s: (s.bar_index, 0 if s.kind == "swing_low" else 1))
+    by_idx: Dict[int, List[SwingPoint]] = {}
+    for sp in swings_sorted:
+        by_idx.setdefault(sp.bar_index, []).append(sp)
+
+    trend_bias = 0  # +1 up, -1 down, 0 unknown
+
+    def pick_outside_bar(pivots: List[SwingPoint]) -> SwingPoint:
+        kinds = {p.kind for p in pivots}
+        if kinds == {"swing_high", "swing_low"}:
+            if trend_bias > 0:
+                return next(p for p in pivots if p.kind == "swing_low")
+            if trend_bias < 0:
+                return next(p for p in pivots if p.kind == "swing_high")
+            row = df.iloc[pivots[0].bar_index]
+            o = float(row["open"]); c = float(row["close"])
+            if c >= o:
+                return next(p for p in pivots if p.kind == "swing_low")
+            return next(p for p in pivots if p.kind == "swing_high")
+
+        if pivots[0].kind == "swing_high":
+            return max(pivots, key=lambda p: p.high)
+        return min(pivots, key=lambda p: p.low)
+
+    # --- clean alternating swings ---
+    clean: List[SwingPoint] = []
+    for idx in sorted(by_idx.keys()):
+        pivots = by_idx[idx]
+        sp = pick_outside_bar(pivots) if len(pivots) > 1 else pivots[0]
+
+        if not clean:
+            clean.append(sp)
+            continue
+
+        last = clean[-1]
+        if sp.kind != last.kind:
+            clean.append(sp)
+            continue
+
+        if sp.kind == "swing_high":
+            if sp.high >= last.high:
+                clean[-1] = sp
+        else:
+            if sp.low <= last.low:
+                clean[-1] = sp
+
     structure_points: List[MarketStructurePoint] = []
-    
-    # Track the last swing high and low for comparison
-    last_swing_high: Optional[SwingPoint] = None
-    last_swing_low: Optional[SwingPoint] = None
-    
-    for swing in swings:
+
+    prev_high: Optional[SwingPoint] = None
+    prev_low: Optional[SwingPoint] = None
+    last_structure_kind: Optional[StructureKind] = None
+
+    for swing in clean:
         bar_idx = swing.bar_index
-        
-        # Get ATR value at this bar
-        atr_val = atr.iloc[bar_idx] if bar_idx < len(atr) else None
-        
-        # Check if this candle is a liquidity sweep
-        sweep = is_liquidity_sweep(
-            swing.open, swing.high, swing.low, swing.close, atr_val
-        )
-        
-        # Determine effective close for comparison
-        effective_close = swing.close
-        
+
+        # sweep -> use next candle close for comparisons
+        sweep = is_liquidity_sweep(swing.open, swing.high, swing.low, swing.close)
+
+        effective_close = float(swing.close)
+        effective_swing = swing
+
         if sweep:
-            # Use next candle's close if available
             next_idx = bar_idx + 1
             if next_idx < len(df):
-                next_candle = df.iloc[next_idx]
-                effective_close = float(next_candle["close"])
-        
+                nxt = df.iloc[next_idx]
+                effective_close = float(nxt["close"])
+
+                # keep your optional "move level to next candle extreme"
+                if swing.kind == "swing_high":
+                    nh = float(nxt["high"])
+                    effective_swing = replace(swing, high=nh, level=nh)
+                else:
+                    nl = float(nxt["low"])
+                    effective_swing = replace(swing, low=nl, level=nl)
+
         if swing.kind == "swing_high":
-            if last_swing_high is not None:
-                # Compare: current effective close vs previous swing high's HIGH (wick)
-                ref_level = last_swing_high.high
-                
-                if effective_close > ref_level:
-                    kind: StructureKind = "HH"
-                else:
-                    kind = "LH"
-                
-                structure_points.append(MarketStructurePoint(
-                    structure_kind=kind,
-                    swing_point=swing,
-                    reference_level=ref_level,
-                    effective_close=effective_close,
-                    is_liquidity_sweep=sweep,
-                ))
-            
-            # Update last swing high
-            last_swing_high = swing
-            
-        elif swing.kind == "swing_low":
-            if last_swing_low is not None:
-                # Compare: current effective close vs previous swing low's LOW (wick)
-                ref_level = last_swing_low.low
-                
-                if effective_close < ref_level:
-                    kind = "LL"
-                else:
-                    kind = "HL"
-                
-                structure_points.append(MarketStructurePoint(
-                    structure_kind=kind,
-                    swing_point=swing,
-                    reference_level=ref_level,
-                    effective_close=effective_close,
-                    is_liquidity_sweep=sweep,
-                ))
-            
-            # Update last swing low
-            last_swing_low = swing
-    
+            if prev_high is None:
+                prev_high = effective_swing
+                continue
+
+            # ✅ CLOSE-BASED: HH if close breaks above previous swing high level else LH
+            kind: StructureKind = "HH" if effective_close > float(prev_high.high) else "LH"
+            ref_level = float(prev_high.high)
+
+            structure_points.append(MarketStructurePoint(
+                structure_kind=kind,
+                swing_point=effective_swing,
+                reference_level=ref_level,
+                effective_close=effective_close,
+                is_liquidity_sweep=sweep,
+            ))
+
+            prev_high = effective_swing
+            trend_bias = 1 if kind == "HH" else -1
+            last_structure_kind = kind
+
+        else:  # swing_low
+            if prev_low is None:
+                prev_low = effective_swing
+                continue
+
+            # ✅ CLOSE-BASED: LL if close breaks below previous swing low level else HL
+            kind: StructureKind = "LL" if effective_close < float(prev_low.low) else "HL"
+            if kind == "HL" and last_structure_kind == "LH":
+                # Enforce sequence: only allow HL after a HH swing high.
+                kind = "LL"
+            ref_level = float(prev_low.low)
+
+            structure_points.append(MarketStructurePoint(
+                structure_kind=kind,
+                swing_point=effective_swing,
+                reference_level=ref_level,
+                effective_close=effective_close,
+                is_liquidity_sweep=sweep,
+            ))
+
+            prev_low = effective_swing
+            trend_bias = -1 if kind == "LL" else 1
+            last_structure_kind = kind
+
     return structure_points
+
 
 
 def compute_market_structure_levels(
     df: pd.DataFrame,
-    atr: pd.Series,
     *,
     swing_timeframe: str = "1d",
     left: int = 2,
@@ -256,18 +294,11 @@ def compute_market_structure_levels(
     else:
         df_tf = resample_ohlcv(df, rule=resample_rule)
     
-    # Resample ATR to match timeframe
-    if len(df_tf) != len(df):
-        # Need to align ATR with resampled df
-        atr_tf = atr.resample(resample_rule).last().reindex(df_tf.index, method="ffill")
-    else:
-        atr_tf = atr
-    
     # Detect raw swing points
     swings = detect_swings(df_tf, timeframe=swing_timeframe, left=left, right=right)
     
     # Classify into market structure
-    structure_points = classify_market_structure(swings, df_tf, atr_tf)
+    structure_points = classify_market_structure(swings, df_tf)
     
     # Build forward-filled series for each structure type
     def levels_for_structure(kind: StructureKind) -> pd.Series:
@@ -454,7 +485,7 @@ def compute_confirmed_swing_levels(
 
     Notes:
       - Swings are detected on the requested timeframe (default: 15m resample),
-        but returned as 1m-aligned series (forward-filled from confirm time).
+        but returned as 1m-aligned series (forward-filled from pivot time).
       - Values are NaN until a swing of that kind is confirmed.
     """
     if df_1m.empty:
@@ -681,12 +712,12 @@ def build_market_structure_signals(
     In UPTREND (bullish bias):
     - Near HL level + green candle with big body → LONG (trend continuation)
     - Near HH level + green candle closing above HH → LONG (breakout)
-    - Near HH level + red candle with big body → Potential reversal, no signal
+    - Near HH level + red candle closing above HL → LONG
     
     In DOWNTREND (bearish bias):
     - Near LH level + red candle with big body → SHORT (trend continuation)
     - Near LL level + red candle closing below LL → SHORT (breakdown)
-    - Near LL level + green candle with big body → Potential reversal, no signal
+    - Near LL level + green candle closing below LH → SHORT
     
     BREAK OF STRUCTURE (BOS) SIGNALS:
     - In uptrend, if price closes below recent HL → SHORT (BOS)
@@ -733,13 +764,13 @@ def build_market_structure_signals(
 
     mid_body = (df["open"] + df["close"]) / 2.0
 
-    # Build structure level series (forward-filled from confirm time)
+    # Build structure level series (forward-filled from pivot time)
     # We need: last HH, last HL, last LL, last LH levels at each bar
     last_hh = pd.Series(np.nan, index=df.index, dtype=float)
     last_hl = pd.Series(np.nan, index=df.index, dtype=float)
     last_ll = pd.Series(np.nan, index=df.index, dtype=float)
     last_lh = pd.Series(np.nan, index=df.index, dtype=float)
-    last_structure_kind = pd.Series("", index=df.index, dtype=str)
+    recent_kinds: List[str] = []
 
     for sp in structure_points:
         confirm_ts = pd.to_datetime(sp.swing_point.confirm_ts, utc=True)
@@ -750,27 +781,31 @@ def build_market_structure_signals(
                 continue
             confirm_ts = df.index[mask][0]
         
-        level = sp.effective_close
         kind = sp.structure_kind
+        if kind in ("HH", "LH"):
+            level = float(sp.swing_point.high)
+        else:
+            level = float(sp.swing_point.low)
         
         if kind == "HH":
             last_hh.loc[confirm_ts:] = level
-            last_structure_kind.loc[confirm_ts:] = "HH"
         elif kind == "HL":
             last_hl.loc[confirm_ts:] = level
-            last_structure_kind.loc[confirm_ts:] = "HL"
         elif kind == "LL":
             last_ll.loc[confirm_ts:] = level
-            last_structure_kind.loc[confirm_ts:] = "LL"
         elif kind == "LH":
             last_lh.loc[confirm_ts:] = level
-            last_structure_kind.loc[confirm_ts:] = "LH"
 
-    # Determine trend at each bar based on last structure
-    # Uptrend: last structure is HH or HL
-    # Downtrend: last structure is LL or LH
-    trend[(last_structure_kind == "HH") | (last_structure_kind == "HL")] = 1
-    trend[(last_structure_kind == "LL") | (last_structure_kind == "LH")] = -1
+        recent_kinds.append(kind)
+        if len(recent_kinds) > 3:
+            recent_kinds.pop(0)
+
+        if recent_kinds == ["HH", "HL", "HH"] or recent_kinds == ["HL", "HH", "HL"]:
+            trend.loc[confirm_ts:] = 1
+        elif recent_kinds == ["LL", "LH", "LL"] or recent_kinds == ["LH", "LL", "LH"]:
+            trend.loc[confirm_ts:] = -1
+        else:
+            trend.loc[confirm_ts:] = 0
 
     # Proximity detection
     proximity = atr * float(structure_proximity_atr_mult)
@@ -818,10 +853,10 @@ def build_market_structure_signals(
     entry_price[hh_breakout_long] = mid_body[hh_breakout_long]
     signal_reason[hh_breakout_long] = "hh_breakout_long"
 
-    # 3. Near HH in uptrend + red big body (rejection) → potential reversal, SHORT
-    hh_rejection_short = in_uptrend & near_hh & big_body & is_red
-    signal[hh_rejection_short] = -1
-    signal_reason[hh_rejection_short] = "hh_rejection_short"
+    # 3. Near HH in uptrend + red big body closing above HL → LONG
+    hh_red_above_hl_long = in_uptrend & near_hh & big_body & is_red & last_hl.notna() & (df["close"] > last_hl)
+    signal[hh_red_above_hl_long] = 1
+    signal_reason[hh_red_above_hl_long] = "hh_red_above_hl_long"
 
     # =========================================================================
     # DOWNTREND SIGNALS (trend == -1)
@@ -839,10 +874,10 @@ def build_market_structure_signals(
     entry_price[ll_breakdown_short] = mid_body[ll_breakdown_short]
     signal_reason[ll_breakdown_short] = "ll_breakdown_short"
 
-    # 3. Near LL in downtrend + green big body (rejection) → potential reversal, LONG
-    ll_rejection_long = in_downtrend & near_ll & big_body & is_green
-    signal[ll_rejection_long] = 1
-    signal_reason[ll_rejection_long] = "ll_rejection_long"
+    # 3. Near LL in downtrend + green big body closing below LH → SHORT
+    ll_green_below_lh_short = in_downtrend & near_ll & big_body & is_green & last_lh.notna() & (df["close"] < last_lh)
+    signal[ll_green_below_lh_short] = -1
+    signal_reason[ll_green_below_lh_short] = "ll_green_below_lh_short"
 
     # =========================================================================
     # BREAK OF STRUCTURE (BOS) SIGNALS
@@ -853,7 +888,7 @@ def build_market_structure_signals(
     signal[bos_short] = 1
     signal_reason[bos_short] = "bos_short"
 
-    # BOS Long: In downtrend, price closes above recent LH with big green body (inverted to SHORT)
+    # BOS Long: In downtrend, price closes above recent LH with big green body
     bos_long = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
     signal[bos_long] = 1
     signal_reason[bos_long] = "bos_long"

@@ -80,6 +80,7 @@ from config import (
     get_backtest_trades_dir,
     get_backtest_stats_dir,
     get_backtest_charts_dir,
+    get_backtest_swing_levels_dir,
     get_live_signals_dir,
     get_live_trades_dir,
     get_live_logs_dir,
@@ -334,7 +335,6 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     # Compute market structure (HH/HL/LL/LH) levels
     structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
         df,
-        df["atr"],
         swing_timeframe=cfg.swing_timeframe,
         left=cfg.swing_left,
         right=cfg.swing_right,
@@ -1105,6 +1105,16 @@ def log_event(log_path: str, event: Dict[str, object]) -> None:
         f.write("\n")
 
 
+def append_live_trailing_stop_update(file_path: str, update: Dict[str, object]) -> None:
+    if not file_path:
+        return
+    payload = dict(update)
+    payload["ts"] = _utc_now_iso()
+    with open(file_path, "a", encoding="ascii") as f:
+        json.dump(payload, f, ensure_ascii=True)
+        f.write("\n")
+
+
 def format_float_1(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
@@ -1179,6 +1189,13 @@ def format_price_for_logging(value: Optional[float], tick_size: Optional[float])
         return ""
 
 
+def format_price_optional(value: Optional[float], tick_size: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    formatted = format_price_for_logging(value, tick_size)
+    return formatted or None
+
+
 def format_float_2_str(value: Optional[float]) -> str:
     if value is None:
         return ""
@@ -1186,6 +1203,39 @@ def format_float_2_str(value: Optional[float]) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return ""
+
+
+def write_live_trailing_stop_snapshot(
+    file_path: str,
+    positions: Dict[str, "PositionState"],
+    filters_by_symbol: Dict[str, Dict[str, float]],
+    trailing_mode: str,
+) -> None:
+    if not file_path:
+        return
+    items: List[Dict[str, object]] = []
+    for symbol in sorted(positions.keys()):
+        pos_state = positions[symbol]
+        filters = filters_by_symbol.get(symbol, {})
+        tick_size = filters.get("tick_size", 0.00000001)
+        trailing_stop = None
+        trailing_stop_r = None
+        if pos_state.sl_price is not None:
+            trailing_stop = format_price_optional(pos_state.sl_price, tick_size)
+            if trailing_mode == "r_ladder":
+                trailing_stop_r = pos_state.trail_stop_r
+        items.append({
+            "symbol": symbol,
+            "side": "LONG" if pos_state.entry_side == 1 else "SHORT",
+            "trailing_stop": trailing_stop,
+            "trailing_stop_r": trailing_stop_r,
+        })
+    payload = {
+        "updated_at": _utc_now_iso(),
+        "positions": items,
+    }
+    with open(file_path, "w", encoding="ascii") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
 
 
 def interval_to_ms(interval: str) -> Optional[int]:
@@ -1535,6 +1585,9 @@ class BinanceUMFuturesREST:
 
     def cancel_open_orders(self, **kwargs: object) -> Any:
         return self._request("DELETE", "/fapi/v1/allOpenOrders", payload=dict(kwargs), signed=True)
+
+    def user_trades(self, **kwargs: object) -> Any:
+        return self._request("GET", "/fapi/v1/userTrades", payload=dict(kwargs), signed=True)
 
     # Algo orders (STOP/TP conditional style endpoints)
     def new_algo_order(self, **kwargs: object) -> Any:
@@ -2580,23 +2633,16 @@ def append_live_signal(csv_path: str, signal_data: Dict[str, object]) -> None:
         writer.writerow(row)
 
 
-def save_live_swing_levels(
-    file_path: str,
-    symbol: str,
+def build_swing_levels_entry(
     df: pd.DataFrame,
     swing_timeframe: str,
     swing_left: int,
     swing_right: int,
     resample_rule: str,
-) -> None:
-    """
-    Save detected swing levels and market structure (HH/HL/LL/LH) to a JSON file.
-    
-    Updates the file with swing levels for the given symbol, preserving data for other symbols.
-    """
-    if not file_path or df.empty:
-        return
-    
+) -> Dict[str, Any]:
+    if df.empty:
+        return {}
+
     # Detect swings on the specified timeframe
     if swing_timeframe == "1m":
         df_tf = df
@@ -2604,32 +2650,29 @@ def save_live_swing_levels(
     else:
         df_tf = resample_ohlcv(df, rule=resample_rule)
         tf = swing_timeframe
-    
+
     swings = detect_swings(df_tf, timeframe=tf, left=swing_left, right=swing_right)
-    
+
     # Get current swing high/low levels (last confirmed)
     swing_highs = [s for s in swings if s.kind == "swing_high"]
     swing_lows = [s for s in swings if s.kind == "swing_low"]
     current_swing_high = swing_highs[-1].level if swing_highs else None
     current_swing_low = swing_lows[-1].level if swing_lows else None
-    
-    # Compute ATR for market structure classification
-    atr = atr_ema(df_tf, length=14)
-    
+
     # Classify swings into market structure (HH/HL/LL/LH)
-    structure_points = classify_market_structure(swings, df_tf, atr)
-    
+    structure_points = classify_market_structure(swings, df_tf)
+
     # Get current market structure levels
     hh_points = [sp for sp in structure_points if sp.structure_kind == "HH"]
     hl_points = [sp for sp in structure_points if sp.structure_kind == "HL"]
     ll_points = [sp for sp in structure_points if sp.structure_kind == "LL"]
     lh_points = [sp for sp in structure_points if sp.structure_kind == "LH"]
-    
+
     current_hh = hh_points[-1].swing_point.high if hh_points else None
     current_hl = hl_points[-1].swing_point.low if hl_points else None
     current_ll = ll_points[-1].swing_point.low if ll_points else None
     current_lh = lh_points[-1].swing_point.high if lh_points else None
-    
+
     # Determine current trend based on last structure point
     current_trend = "UNDEFINED"
     if structure_points:
@@ -2638,18 +2681,8 @@ def save_live_swing_levels(
             current_trend = "UPTREND"
         elif last_structure in ("LL", "LH"):
             current_trend = "DOWNTREND"
-    
-    # Load existing data or create new
-    data: Dict[str, Any] = {}
-    if os.path.exists(file_path):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            data = {}
-    
-    # Update data for this symbol
-    data[symbol] = {
+
+    return {
         "updated_at": _utc_now_iso(),
         "params": {
             "timeframe": swing_timeframe,
@@ -2679,6 +2712,46 @@ def save_live_swing_levels(
         "swings": [s.to_dict() for s in swings],
         "structure_points": [sp.to_dict() for sp in structure_points],
     }
+
+
+def save_live_swing_levels(
+    file_path: str,
+    symbol: str,
+    df: pd.DataFrame,
+    swing_timeframe: str,
+    swing_left: int,
+    swing_right: int,
+    resample_rule: str,
+) -> None:
+    """
+    Save detected swing levels and market structure (HH/HL/LL/LH) to a JSON file.
+    
+    Updates the file with swing levels for the given symbol, preserving data for other symbols.
+    """
+    if not file_path or df.empty:
+        return
+
+    entry = build_swing_levels_entry(
+        df,
+        swing_timeframe,
+        swing_left,
+        swing_right,
+        resample_rule,
+    )
+    if not entry:
+        return
+
+    # Load existing data or create new
+    data: Dict[str, Any] = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    
+    # Update data for this symbol
+    data[symbol] = entry
     
     # Save back to file
     with open(file_path, "w", encoding="utf-8") as f:
@@ -3653,7 +3726,6 @@ def backtest_atr_grinder_lib(
     # Compute market structure (HH/HL/LL/LH) levels
     structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
         df,
-        df["atr"],
         swing_timeframe=cfg.swing_timeframe,
         left=cfg.swing_left,
         right=cfg.swing_right,
@@ -4838,7 +4910,6 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
     # Compute market structure (HH/HL/LL/LH) levels
     structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
         df,
-        atr,
         swing_timeframe=cfg.swing_timeframe,
         left=cfg.swing_left,
         right=cfg.swing_right,
@@ -5125,6 +5196,132 @@ def run_live(cfg: LiveConfig) -> None:
         except (TypeError, ValueError):
             return default
 
+    def _iso_to_epoch_ms(timestamp: str) -> Optional[int]:
+        if not timestamp:
+            return None
+        try:
+            cleaned = timestamp.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(cleaned).timestamp() * 1000)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_trade_list(raw: object) -> List[Dict[str, object]]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("data", "rows", "trades", "items", "list"):
+                candidate = raw.get(key)
+                if isinstance(candidate, list):
+                    return candidate
+        return []
+
+    def fetch_exit_fill_price(symbol: str, pos_state: PositionState) -> Tuple[Optional[float], str]:
+        start_ms = _iso_to_epoch_ms(pos_state.entry_time_iso)
+        params: Dict[str, object] = {"symbol": symbol, "limit": 50}
+        if start_ms is not None:
+            params["startTime"] = max(0, start_ms - 60_000)
+        try:
+            trades_raw = client.user_trades(**params)
+        except ClientError as exc:
+            logging.warning("User trades fetch failed. symbol=%s error=%s", symbol, exc)
+            return None, "user_trades_error"
+        trades = _extract_trade_list(trades_raw)
+        if not trades:
+            return None, "user_trades_empty"
+
+        exit_side = "SELL" if pos_state.entry_side == 1 else "BUY"
+        total_qty = 0.0
+        total_notional = 0.0
+        has_side = False
+        fallback_price = None
+        fallback_time = None
+
+        for trade in trades:
+            trade_time = int(safe_float(trade.get("time") or trade.get("timestamp"), 0.0))
+            if start_ms is not None and trade_time < start_ms:
+                continue
+            price = safe_float(trade.get("price"), 0.0)
+            qty = safe_float(trade.get("qty") or trade.get("quantity"), 0.0)
+            if price <= 0 or qty <= 0:
+                continue
+            side = str(trade.get("side") or "").upper()
+            if side:
+                has_side = True
+                if side != exit_side:
+                    continue
+                total_qty += qty
+                total_notional += price * qty
+            else:
+                if fallback_time is None or trade_time > fallback_time:
+                    fallback_time = trade_time
+                    fallback_price = price
+
+        if total_qty > 0:
+            return total_notional / total_qty, "user_trades"
+        if not has_side and fallback_price is not None:
+            return fallback_price, "user_trades_last"
+        return None, "user_trades_empty"
+
+    def determine_exit_reason(symbol: str, pos_state: PositionState) -> Tuple[str, Optional[str]]:
+        if pos_state.sl_algo_id is None:
+            return "manual", None
+        try:
+            order = query_algo_order(client, symbol, algo_id=pos_state.sl_algo_id)
+        except ClientError as exc:
+            logging.warning("Algo order query failed. symbol=%s error=%s", symbol, exc)
+            return "manual", None
+        status = algo_order_status(order)
+        if algo_order_executed(order):
+            return "trailing_sl", status
+        return "manual", status
+
+    def handle_position_exit(symbol: str, pos_state: PositionState, exit_time_iso: Optional[str] = None) -> None:
+        exit_time_iso = exit_time_iso or _utc_now_iso()
+        exit_reason, sl_status = determine_exit_reason(symbol, pos_state)
+        exit_price, exit_price_source = fetch_exit_fill_price(symbol, pos_state)
+        if exit_price is None:
+            if pos_state.sl_price is not None:
+                exit_price = pos_state.sl_price
+                exit_price_source = "stop_price"
+            else:
+                exit_price = 0.0
+                exit_price_source = exit_price_source or "unknown"
+
+        tick_size = filters_by_symbol.get(symbol, {}).get("tick_size", 0.00000001)
+        log_event(cfg.log_path, {
+            "event": "position_closed",
+            "symbol": symbol,
+            "exit_time": exit_time_iso,
+            "exit_reason": exit_reason,
+            "exit_price": format_price_for_logging(exit_price, tick_size),
+            "exit_price_source": exit_price_source,
+            "stop_price": format_price_optional(pos_state.sl_price, tick_size),
+            "sl_algo_id": pos_state.sl_algo_id,
+            "sl_algo_status": sl_status,
+        })
+
+        append_live_trade(cfg.live_trades_csv, {
+            "entry_time": pos_state.entry_time_iso,
+            "exit_time": exit_time_iso,
+            "symbol": symbol,
+            "side": "LONG" if pos_state.entry_side == 1 else "SHORT",
+            "entry_price": pos_state.entry_price,
+            "exit_price": exit_price,
+            "signal_atr": pos_state.entry_atr,
+            "stop_price": pos_state.sl_price or 0,
+            "exit_reason": exit_reason,
+            "margin_used": pos_state.entry_margin_usd,
+            "notional": pos_state.entry_margin_usd * pos_state.entry_leverage,
+            "trade_id": pos_state.trade_id,
+            "signal_reason": pos_state.signal_reason,
+            "strategy_version": STRATEGY_VERSION,
+        })
+
+        if pos_state.sl_algo_id:
+            cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
+        if symbol in state.positions:
+            del state.positions[symbol]
+
     def fetch_latest_atr(symbol: str) -> Optional[float]:
         cached = last_atr_by_symbol.get(symbol)
         if cached is not None and cached > 0:
@@ -5392,13 +5589,7 @@ def run_live(cfg: LiveConfig) -> None:
             return
         
         if position_amt == 0.0:
-            # Position was closed manually
-            log_event(cfg.log_path, {
-                "event": "position_closed_manually",
-                "symbol": symbol,
-            })
-            if symbol in state.positions:
-                del state.positions[symbol]
+            handle_position_exit(symbol, pos_state)
             return
         
         qty = abs(position_amt)
@@ -5443,6 +5634,8 @@ def run_live(cfg: LiveConfig) -> None:
             })
             return
 
+        prev_sl_price = pos_state.sl_price
+        prev_stop_r = pos_state.trail_stop_r if cfg.trailing_mode == "r_ladder" else None
         pos_state.sl_algo_id = _extract_int(sl_order, ("algoId", "algoOrderId", "orderId", "id"))
         pos_state.sl_algo_client_order_id = sl_client_id
         pos_state.sl_price = next_sl_price_rounded
@@ -5451,6 +5644,21 @@ def run_live(cfg: LiveConfig) -> None:
         
         # Get tick_size for proper price precision in log
         sl_tick_size = filters.get("tick_size", 0.00000001)
+        append_live_trailing_stop_update(cfg.live_trailing_stop_updates_file, {
+            "event": "trailing_stop_update",
+            "symbol": symbol,
+            "side": "LONG" if side_sign == 1 else "SHORT",
+            "trailing_mode": cfg.trailing_mode,
+            "close_time_ms": close_time_ms,
+            "prev_trailing_stop": format_price_optional(prev_sl_price, sl_tick_size),
+            "new_trailing_stop": format_price_optional(next_sl_price_rounded, sl_tick_size),
+            "prev_trailing_stop_r": prev_stop_r if prev_sl_price is not None else None,
+            "new_trailing_stop_r": candidate_stop_r if cfg.trailing_mode == "r_ladder" else None,
+            "trail_price": format_price_optional(high_price if side_sign == 1 else low_price, sl_tick_size)
+            if cfg.trailing_mode == "dynamic_atr" else None,
+            "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
+            "order_id": pos_state.sl_algo_id,
+        })
         log_event(cfg.log_path, {
             "event": "sl_trail_update",
             "symbol": symbol,
@@ -5839,40 +6047,18 @@ def run_live(cfg: LiveConfig) -> None:
                     position_amt = 0.0
                 
                 if position_amt == 0.0:
-                    # Position was closed (manually or by SL)
-                    log_event(cfg.log_path, {
-                        "event": "position_closed",
-                        "symbol": symbol,
-                        "exit_reason": "manual_or_sl",
-                    })
-                    
-                    # Record trade
-                    append_live_trade(cfg.live_trades_csv, {
-                        "entry_time": pos_state.entry_time_iso,
-                        "exit_time": _utc_now_iso(),
-                        "symbol": symbol,
-                        "side": "LONG" if pos_state.entry_side == 1 else "SHORT",
-                        "entry_price": pos_state.entry_price,
-                        "exit_price": pos_state.sl_price or 0,
-                        "signal_atr": pos_state.entry_atr,
-                        "stop_price": pos_state.sl_price or 0,
-                        "exit_reason": "trailing_sl",
-                        "margin_used": pos_state.entry_margin_usd,
-                        "notional": pos_state.entry_margin_usd * pos_state.entry_leverage,
-                        "trade_id": pos_state.trade_id,
-                        "signal_reason": pos_state.signal_reason,
-                        "strategy_version": STRATEGY_VERSION,
-                    })
-                    
-                    # Cancel any pending SL orders
-                    if pos_state.sl_algo_id:
-                        cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
-                    
-                    del state.positions[symbol]
+                    handle_position_exit(symbol, pos_state)
                     continue
                 
                 # Update trailing stop using 1m candles
                 update_trailing_stop(symbol, pos_state)
+
+            write_live_trailing_stop_snapshot(
+                cfg.live_trailing_stop_realtime_file,
+                state.positions,
+                filters_by_symbol,
+                cfg.trailing_mode,
+            )
             
             # --- Step 4: Check for new entry signals ---
             # Scan all symbols for entry signals concurrently (log all signals, even if skipped)
@@ -6033,9 +6219,9 @@ def run_backtest_single(
     market: str,
     cfg: BacktestConfig,
     verbose: bool = True,
-) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]:
+) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """
-    Run backtest for a single symbol. Returns (trades_df, stats_dict, signals_df).
+    Run backtest for a single symbol. Returns (trades_df, stats_dict, signals_df, trailing_df, swing_levels).
     """
     import time as time_module
     
@@ -6057,7 +6243,7 @@ def run_backtest_single(
         if df_1m.empty:
             if verbose:
                 print(f"  WARNING: No 1m data for {symbol}, skipping.")
-            return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
+            return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), {}
     
     if verbose:
         print(f"  Loading {signal_interval} data...")
@@ -6074,7 +6260,7 @@ def run_backtest_single(
     if df_signal.empty:
         if verbose:
             print(f"  WARNING: No signal data for {symbol}, skipping.")
-        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), {}
     
     if verbose:
         print(f"  Running backtest ({len(df_signal)} candles)...")
@@ -6117,8 +6303,16 @@ def run_backtest_single(
     # Add symbol column to trailing_df
     if not trailing_df.empty:
         trailing_df["symbol"] = symbol
-    
-    return trades, stats, signals_df, trailing_df
+
+    swing_levels_entry = build_swing_levels_entry(
+        df_bt,
+        cfg.swing_timeframe,
+        cfg.swing_left,
+        cfg.swing_right,
+        cfg.swing_resample_rule,
+    )
+
+    return trades, stats, signals_df, trailing_df, swing_levels_entry
 
 
 def run_backtest(
@@ -6195,6 +6389,7 @@ def run_backtest(
     all_stats: List[Dict[str, Any]] = []
     all_signals: List[pd.DataFrame] = []
     all_trailing: List[pd.DataFrame] = []
+    all_swing_levels: Dict[str, Any] = {}
     successful = 0
     failed = 0
     
@@ -6202,10 +6397,10 @@ def run_backtest(
     progress_lock = threading.Lock()
     completed_count = [0]  # Use list to allow mutation in nested function
     
-    def process_symbol(sym: str) -> Tuple[str, pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame, Optional[str]]:
+    def process_symbol(sym: str) -> Tuple[str, pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame, Dict[str, Any], Optional[str]]:
         """Process a single symbol and return results."""
         try:
-            trades, stats, signals, trailing = run_backtest_single(
+            trades, stats, signals, trailing, swing_levels = run_backtest_single(
                 symbol=sym,
                 start_date=start_date,
                 end_date=end_date,
@@ -6215,9 +6410,9 @@ def run_backtest(
                 cfg=cfg,
                 verbose=False,  # Disable verbose for concurrent mode
             )
-            return sym, trades, stats, signals, trailing, None
+            return sym, trades, stats, signals, trailing, swing_levels, None
         except Exception as e:
-            return sym, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), str(e)
+            return sym, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), {}, str(e)
     
     # Use concurrent processing for multiple symbols
     if all_symbols and len(symbols) > 1 and max_workers > 1:
@@ -6229,7 +6424,7 @@ def run_backtest(
             
             # Process results as they complete
             for future in as_completed(future_to_symbol):
-                sym, trades, stats, signals, trailing, error = future.result()
+                sym, trades, stats, signals, trailing, swing_levels, error = future.result()
                 
                 with progress_lock:
                     completed_count[0] += 1
@@ -6239,6 +6434,9 @@ def run_backtest(
                     failed += 1
                     print(f"[{progress}/{len(symbols)}] {sym}: ERROR - {error}")
                 else:
+                    if swing_levels:
+                        all_swing_levels[sym] = swing_levels
+
                     # Always collect signals even if no trades
                     if not signals.empty:
                         all_signals.append(signals)
@@ -6263,7 +6461,7 @@ def run_backtest(
         for i, sym in enumerate(symbols, 1):
             print(f"\n[{i}/{len(symbols)}] {sym}")
             try:
-                trades, stats, signals, trailing = run_backtest_single(
+                trades, stats, signals, trailing, swing_levels = run_backtest_single(
                     symbol=sym,
                     start_date=start_date,
                     end_date=end_date,
@@ -6273,6 +6471,8 @@ def run_backtest(
                     cfg=cfg,
                     verbose=True,
                 )
+                if swing_levels:
+                    all_swing_levels[sym] = swing_levels
                 # Always collect signals even if no trades
                 if not signals.empty:
                     all_signals.append(signals)
@@ -6301,6 +6501,9 @@ def run_backtest(
     print("\n" + "=" * 60)
     print("BACKTEST RESULTS (AGGREGATED)")
     print("=" * 60)
+
+    symbol_tag = "ALL" if all_symbols else symbol
+    filename_suffix = f"{symbol_tag}_{start_date}_{end_date}"
     
     if all_trades:
         combined_trades = pd.concat(all_trades, ignore_index=True)
@@ -6343,10 +6546,6 @@ def run_backtest(
         
         # Ensure versioned output directories exist
         ensure_output_dirs()
-        
-        # Build filename suffix based on symbols and date range
-        symbol_tag = "ALL" if all_symbols else symbol
-        filename_suffix = f"{symbol_tag}_{start_date}_{end_date}"
         
         # Save trades to versioned directory
         trades_dir = get_backtest_trades_dir()
@@ -6447,6 +6646,14 @@ def run_backtest(
         print("\n" + "-" * 60)
         print("SIGNALS GENERATED:")
         print("  No signals generated.")
+
+    if all_swing_levels:
+        swing_levels_dir = get_backtest_swing_levels_dir()
+        swing_levels_dir.mkdir(parents=True, exist_ok=True)
+        swing_levels_path = swing_levels_dir / f"swing_levels_{filename_suffix}.json"
+        with open(swing_levels_path, "w", encoding="utf-8") as f:
+            json.dump(all_swing_levels, f, indent=2, ensure_ascii=False)
+        print(f"\nSwing levels saved to: {swing_levels_path.relative_to(swing_levels_path.parent.parent.parent.parent)}")
     
     # Timing summary
     print("\n" + "-" * 60)
