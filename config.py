@@ -365,7 +365,7 @@ class LiveConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
-    leverage: int = 5  # fixed leverage for static sizing
+    leverage: int = 20  # fixed leverage for static sizing
     margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
