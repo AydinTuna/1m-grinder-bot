@@ -4937,7 +4937,12 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
     if entry_price_val is not None and not pd.isna(entry_price_val):
         entry_price = float(entry_price_val)
     else:
-        entry_price = None
+        last_open = df["open"].iloc[-1]
+        last_close = df["close"].iloc[-1]
+        if not (pd.isna(last_open) or pd.isna(last_close)):
+            entry_price = float((last_open + last_close) / 2.0)
+        else:
+            entry_price = None
     reason: Optional[str] = str(reason_val) if reason_val else None
     return signal_val, float(signal_atr_val), atr_val, entry_price, reason
 

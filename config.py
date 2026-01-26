@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.3.2"
+STRATEGY_VERSION: str = "1.4.2"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "Swing level detection update, sweep liq refactor, bugfixes, visualizer added"
+STRATEGY_VERSION_NOTE: str = "BOS long entry uses candle mid-body (limit) in live trading"
 
 
 # =============================================================================
