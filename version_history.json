@@ -1,6 +1,23 @@
 {
   "versions": [
     {
+      "version": "1.4.2",
+      "date": "2026-01-26",
+      "changes": [
+        "Use candle mid-body limit for BOS long live entries"
+      ],
+      "signal_directions": {
+        "hh_breakout": "LONG",
+        "ll_breakdown": "LONG",
+        "hh_rejection": "SHORT",
+        "ll_bounce": "LONG",
+        "bos_long": "LONG",
+        "bos_short": "LONG",
+        "lh_rejection": "SHORT",
+        "hl_bounce": "LONG"
+      }
+    },
+    {
       "version": "1.3.2",
       "date": "2026-01-25",
       "changes": [
