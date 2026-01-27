@@ -397,13 +397,24 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
     df["swing_low_level"] = swing_low
 
     # Generate signals based on market structure
-    df["signal"], df["signal_atr"], df["signal_entry_price"], df["signal_reason"], df["trend"] = build_market_structure_signals(
+    (
+        df["signal"],
+        df["signal_atr"],
+        df["signal_entry_price"],
+        df["signal_reason"],
+        df["trend"],
+        df["signal_fade_direction"],
+        df["signal_fade_entry"],
+        df["signal_fade_tp"],
+        df["signal_fade_sl"],
+    ) = build_market_structure_signals(
         df,
         df["atr"],
         structure_points,
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        fade_tp_body_pct=cfg.fade_tp_body_pct,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -414,6 +425,10 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         df.loc[warmup_idx, "signal_entry_price"] = np.nan
         df.loc[warmup_idx, "signal_reason"] = ""
         df.loc[warmup_idx, "trend"] = 0
+        df.loc[warmup_idx, "signal_fade_direction"] = 0
+        df.loc[warmup_idx, "signal_fade_entry"] = np.nan
+        df.loc[warmup_idx, "signal_fade_tp"] = np.nan
+        df.loc[warmup_idx, "signal_fade_sl"] = np.nan
 
     # Equity curve (USD)
     equity = cfg.initial_capital
@@ -422,6 +437,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
 
     positions: List[Dict[str, Any]] = []
     pending_entries: List[Dict[str, Any]] = []
+    fade_positions: List[Dict[str, Any]] = []  # Track active fade positions (bos_long)
 
     # Trade ID tracking for signal-trade linking
     trade_counter = 0
@@ -537,6 +553,51 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             "signal_reason": signal_reason,
         }
 
+    def create_fade_position(
+        fade_side: int,  # -1 for SHORT fade
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+        signal_atr_value: float,
+        entry_time: pd.Timestamp,
+        entry_index: int,
+        main_signal_entry_price: float,  # Entry price for main position after TP
+    ) -> Optional[Dict[str, Any]]:
+        """Create a fade position (for bos_long) with fixed TP/SL."""
+        nonlocal trade_counter
+        trade_margin, trade_leverage, _ = resolve_trade_sizing(
+            entry_price=entry_price,
+            atr_value=signal_atr_value,
+            sl_atr_mult=1.0,
+            margin_cap=cfg.initial_capital,
+            max_leverage=cfg.leverage,
+            min_leverage=cfg.leverage,
+            target_loss_usd=None,
+        )
+        if trade_margin is None or trade_leverage is None:
+            return None
+
+        trade_counter += 1
+        side_str = "LONG" if fade_side == 1 else "SHORT"
+        trade_id = generate_trade_id(df.attrs.get("symbol", "UNK"), str(entry_time), f"FADE_{side_str}")
+
+        return {
+            "position": fade_side,
+            "entry_price": entry_price,
+            "target_price": tp_price,
+            "stop_price": sl_price,
+            "entry_time": entry_time,
+            "entry_index": entry_index,
+            "used_signal_atr": signal_atr_value,
+            "active_margin": trade_margin,
+            "active_leverage": trade_leverage,
+            "active_notional": trade_margin * trade_leverage,
+            "trade_id": trade_id,
+            "signal_reason": "bos_long_fade",
+            "is_fade": True,
+            "main_signal_entry_price": main_signal_entry_price,
+        }
+
     for i in range(1, len(df)):
         t = idx[i]
         prev_t = idx[i - 1]
@@ -619,6 +680,80 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 })
 
                 positions.remove(pos)
+
+        # --- FADE POSITION EXIT logic (for bos_long fade trades) ---
+        for fade_pos in list(fade_positions):
+            fade_side = fade_pos["position"]
+            fade_entry = fade_pos["entry_price"]
+            fade_tp = fade_pos["target_price"]
+            fade_sl = fade_pos["stop_price"]
+            
+            if fade_entry is None:
+                continue
+            
+            c = float(df.at[t, "close"])
+            
+            fade_exited = False
+            fade_exit_reason = None
+            fade_exit_price = None
+            
+            if fade_side == -1:  # SHORT fade
+                tp_hit = l <= fade_tp
+                sl_hit = h >= fade_sl
+                
+                if tp_hit and sl_hit:
+                    fade_exit_reason = "SL"
+                    fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                    fade_exited = True
+                elif tp_hit:
+                    fade_exit_reason = "TP"
+                    fade_exit_price = apply_slippage(fade_tp, fade_side, is_entry=False)
+                    fade_exited = True
+                elif sl_hit:
+                    fade_exit_reason = "SL"
+                    fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                    fade_exited = True
+            
+            if fade_exited:
+                roi_net = net_roi_from_prices(fade_entry, fade_exit_price, fade_side, fade_pos["active_leverage"])
+                pnl_net = roi_net * fade_pos["active_margin"]
+                equity += pnl_net
+                
+                trades.append({
+                    "entry_time": fade_pos["entry_time"],
+                    "exit_time": t,
+                    "side": "LONG" if fade_side == 1 else "SHORT",
+                    "entry_price": fade_entry,
+                    "exit_price": fade_exit_price,
+                    "signal_atr": fade_pos["used_signal_atr"],
+                    "stop_price": fade_sl,
+                    "exit_reason": f"FADE_{fade_exit_reason}",
+                    "roi_net": roi_net,
+                    "pnl_net": pnl_net,
+                    "margin_used": fade_pos["active_margin"],
+                    "notional": fade_pos["active_notional"],
+                    "equity_after": equity,
+                    "bars_held": i - (fade_pos["entry_index"] if fade_pos["entry_index"] is not None else i),
+                    "trade_id": fade_pos["trade_id"],
+                    "signal_reason": fade_pos["signal_reason"],
+                    "strategy_version": STRATEGY_VERSION,
+                })
+                
+                fade_positions.remove(fade_pos)
+                
+                # On TP hit, create the main LONG position
+                if fade_exit_reason == "TP":
+                    main_entry_price = fade_pos["main_signal_entry_price"]
+                    main_pos = create_position(
+                        side=1,
+                        entry_price=apply_slippage(main_entry_price, 1, is_entry=True),
+                        signal_atr_value=fade_pos["used_signal_atr"],
+                        entry_time=t,
+                        entry_index=i,
+                        signal_reason="bos_long",
+                    )
+                    if main_pos is not None:
+                        positions.append(main_pos)
 
         # --- Trailing stop update (candle close) ---
         # Note: stop_price may be None initially (no stop until breakeven)
@@ -790,12 +925,43 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         prev_signal_atr = df.at[prev_t, "signal_atr"]
         prev_entry_price = df.at[prev_t, "signal_entry_price"]
         prev_signal_reason = df.at[prev_t, "signal_reason"] if "signal_reason" in df.columns else None
+        
+        # Get fade signal fields for bos_long
+        prev_fade_direction = int(df.at[prev_t, "signal_fade_direction"]) if "signal_fade_direction" in df.columns else 0
+        prev_fade_entry = df.at[prev_t, "signal_fade_entry"] if "signal_fade_entry" in df.columns else None
+        prev_fade_tp = df.at[prev_t, "signal_fade_tp"] if "signal_fade_tp" in df.columns else None
+        prev_fade_sl = df.at[prev_t, "signal_fade_sl"] if "signal_fade_sl" in df.columns else None
 
         if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
             side = prev_signal
             signal_atr_value = float(prev_signal_atr)
-
-            if prev_entry_price is not None and not (
+            
+            # Check if this is a bos_long signal with fade trade
+            if (
+                prev_signal_reason == "bos_long"
+                and prev_fade_direction == -1
+                and prev_fade_entry is not None
+                and not (isinstance(prev_fade_entry, float) and math.isnan(prev_fade_entry))
+                and prev_fade_tp is not None
+                and not (isinstance(prev_fade_tp, float) and math.isnan(prev_fade_tp))
+                and prev_fade_sl is not None
+                and not (isinstance(prev_fade_sl, float) and math.isnan(prev_fade_sl))
+            ):
+                # Create fade SHORT position
+                fade_entry_price = apply_slippage(float(prev_fade_entry), -1, is_entry=True)
+                fade_pos = create_fade_position(
+                    fade_side=-1,
+                    entry_price=fade_entry_price,
+                    tp_price=float(prev_fade_tp),
+                    sl_price=float(prev_fade_sl),
+                    signal_atr_value=signal_atr_value,
+                    entry_time=t,
+                    entry_index=i,
+                    main_signal_entry_price=float(prev_entry_price) if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)) else float(prev_fade_tp),
+                )
+                if fade_pos is not None:
+                    fade_positions.append(fade_pos)
+            elif prev_entry_price is not None and not (
                 isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)
             ):
                 fill_raw = maybe_fill_limit(side, float(prev_entry_price), o, h, l)
@@ -855,6 +1021,41 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 "strategy_version": STRATEGY_VERSION,
             })
             positions.remove(pos)
+
+    # Close open fade positions at end of backtest
+    if fade_positions:
+        last_close = float(df.iloc[-1]["close"])
+        for fade_pos in list(fade_positions):
+            fade_entry = fade_pos["entry_price"]
+            if fade_entry is None:
+                fade_positions.remove(fade_pos)
+                continue
+            exit_price = apply_slippage(last_close, fade_pos["position"], is_entry=False)
+            roi_net = net_roi_from_prices(fade_entry, exit_price, fade_pos["position"], fade_pos["active_leverage"])
+            pnl_net = roi_net * fade_pos["active_margin"]
+            equity += pnl_net
+
+            trades.append({
+                "entry_time": fade_pos["entry_time"],
+                "exit_time": df.index[-1],
+                "side": "LONG" if fade_pos["position"] == 1 else "SHORT",
+                "entry_price": fade_entry,
+                "exit_price": exit_price,
+                "signal_atr": fade_pos["used_signal_atr"],
+                "stop_price": fade_pos["stop_price"],
+                "exit_reason": "END_OF_BACKTEST_FADE",
+                "forced_exit": False,
+                "roi_net": roi_net,
+                "pnl_net": pnl_net,
+                "margin_used": fade_pos["active_margin"],
+                "notional": fade_pos["active_notional"],
+                "equity_after": equity,
+                "bars_held": len(df) - 1 - (fade_pos["entry_index"] if fade_pos["entry_index"] is not None else 0),
+                "trade_id": fade_pos["trade_id"],
+                "signal_reason": fade_pos["signal_reason"],
+                "strategy_version": STRATEGY_VERSION,
+            })
+            fade_positions.remove(fade_pos)
 
     df["equity"] = equity_series.ffill()
 
@@ -1051,6 +1252,11 @@ class PositionState:
     entry_leverage: float = 20.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this trade
+    # Fade trade fields (for bos_long_fade)
+    is_fade: bool = False  # True if this is a fade position (SHORT before LONG)
+    fade_tp_price: Optional[float] = None  # TP price for fade position
+    fade_sl_price: Optional[float] = None  # SL price for fade position
+    fade_main_entry_price: Optional[float] = None  # Entry price for main position after fade TP
 
 
 @dataclass 
@@ -1066,6 +1272,11 @@ class PendingEntry:
     entry_leverage: float = 0.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this entry
+    # Fade trade fields (for bos_long_fade)
+    is_fade: bool = False
+    fade_tp_price: Optional[float] = None
+    fade_sl_price: Optional[float] = None
+    fade_main_entry_price: Optional[float] = None
 
 
 @dataclass
@@ -1590,6 +1801,25 @@ class BinanceUMFuturesREST:
     def change_leverage(self, **kwargs: object) -> Any:
         return self._request("POST", "/fapi/v1/leverage", payload=dict(kwargs), signed=True)
 
+    def get_leverage_brackets(self, **kwargs: object) -> Any:
+        """
+        GET /fapi/v1/leverageBracket - Get leverage brackets for symbol(s).
+        
+        Parameters:
+            symbol (optional): If provided, returns brackets for that symbol only.
+            
+        Returns:
+            List of dicts with 'symbol', 'notionalCoef', and 'brackets' array.
+            Each bracket contains:
+                - bracket: bracket number
+                - initialLeverage: max leverage for this bracket
+                - notionalCap: max notional for this bracket
+                - notionalFloor: min notional for this bracket
+                - maintMarginRatio: maintenance margin ratio
+                - cum: cumulative maintenance margin
+        """
+        return self._request("GET", "/fapi/v1/leverageBracket", payload=dict(kwargs), signed=True)
+
     def new_order(self, **kwargs: object) -> Any:
         return self._request("POST", "/fapi/v1/order", payload=dict(kwargs), signed=True)
 
@@ -1817,6 +2047,71 @@ def get_all_usdt_perpetuals_with_filters(client: BinanceUMFuturesREST) -> Tuple[
                 filters_by_symbol[symbol] = filters
     
     return sorted(symbols), filters_by_symbol
+
+
+def fetch_leverage_brackets(client: BinanceUMFuturesREST) -> Dict[str, Dict[str, float]]:
+    """
+    Fetch leverage brackets for all symbols using /fapi/v1/leverageBracket.
+    
+    Returns dict mapping symbol -> {
+        'max_leverage': float,  # from first bracket's initialLeverage
+        'notional_cap': float,  # notional cap for max leverage bracket
+    }
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    try:
+        brackets_data = client.get_leverage_brackets()
+        if not isinstance(brackets_data, list):
+            logging.warning("Unexpected leverage brackets response type: %s", type(brackets_data))
+            return result
+        
+        for item in brackets_data:
+            symbol = item.get("symbol")
+            brackets = item.get("brackets", [])
+            if not symbol or not brackets:
+                continue
+            
+            # First bracket (lowest notional) has the highest allowed leverage
+            # Sort by bracket number to ensure we get bracket 1
+            brackets_sorted = sorted(brackets, key=lambda b: b.get("bracket", 0))
+            if brackets_sorted:
+                first_bracket = brackets_sorted[0]
+                max_lev = first_bracket.get("initialLeverage", 0)
+                notional_cap = first_bracket.get("notionalCap", 0)
+                try:
+                    result[symbol] = {
+                        "max_leverage": float(max_lev) if max_lev else 0.0,
+                        "notional_cap": float(notional_cap) if notional_cap else 0.0,
+                    }
+                except (TypeError, ValueError):
+                    pass
+        
+        logging.info("Fetched leverage brackets for %d symbols", len(result))
+    except ClientError as exc:
+        logging.warning("Failed to fetch leverage brackets: %s", exc)
+    except Exception as exc:
+        logging.warning("Unexpected error fetching leverage brackets: %s", exc)
+    
+    return result
+
+
+def merge_leverage_brackets_into_filters(
+    filters_by_symbol: Dict[str, Dict[str, float]],
+    leverage_brackets: Dict[str, Dict[str, float]],
+) -> None:
+    """
+    Merge leverage bracket data into filters_by_symbol dict (in-place).
+    Overwrites max_leverage with the value from leverage brackets endpoint.
+    """
+    for symbol, bracket_info in leverage_brackets.items():
+        if symbol in filters_by_symbol:
+            bracket_max_lev = bracket_info.get("max_leverage", 0.0)
+            if bracket_max_lev > 0:
+                # Overwrite with more accurate value from leverageBracket endpoint
+                filters_by_symbol[symbol]["max_leverage"] = bracket_max_lev
+            notional_cap = bracket_info.get("notional_cap", 0.0)
+            if notional_cap > 0:
+                filters_by_symbol[symbol]["notional_cap"] = notional_cap
 
 
 def get_book_ticker(client: BinanceUMFuturesREST, symbol: str) -> Tuple[float, float]:
@@ -3806,13 +4101,24 @@ def backtest_atr_grinder_lib(
     df["swing_low_level"] = swing_low
 
     # Generate signals based on market structure
-    df["signal"], df["signal_atr"], df["signal_entry_price"], df["signal_reason"], df["trend"] = build_market_structure_signals(
+    (
+        df["signal"],
+        df["signal_atr"],
+        df["signal_entry_price"],
+        df["signal_reason"],
+        df["trend"],
+        df["signal_fade_direction"],
+        df["signal_fade_entry"],
+        df["signal_fade_tp"],
+        df["signal_fade_sl"],
+    ) = build_market_structure_signals(
         df,
         df["atr"],
         structure_points,
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        fade_tp_body_pct=cfg.fade_tp_body_pct,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -3823,6 +4129,10 @@ def backtest_atr_grinder_lib(
         df.loc[warmup_idx, "signal_entry_price"] = np.nan
         df.loc[warmup_idx, "signal_reason"] = ""
         df.loc[warmup_idx, "trend"] = 0
+        df.loc[warmup_idx, "signal_fade_direction"] = 0
+        df.loc[warmup_idx, "signal_fade_entry"] = np.nan
+        df.loc[warmup_idx, "signal_fade_tp"] = np.nan
+        df.loc[warmup_idx, "signal_fade_sl"] = np.nan
 
     # Equity curve (USD)
     equity = cfg.initial_capital
@@ -3831,6 +4141,7 @@ def backtest_atr_grinder_lib(
 
     positions: List[Dict[str, Any]] = []
     pending_entries: List[Dict[str, Any]] = []
+    fade_positions: List[Dict[str, Any]] = []  # Track active fade positions (bos_long)
 
     # Trade ID tracking for signal-trade linking
     trade_counter = 0
@@ -3910,6 +4221,60 @@ def backtest_atr_grinder_lib(
             "signal_reason": signal_reason,
             "forced_exit_intervals_since_entry": 0,
             "forced_exit_last_boundary_ts": None,
+        }
+
+    def create_fade_position(
+        fade_side: int,  # -1 for SHORT fade
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+        signal_atr_value: float,
+        entry_time: pd.Timestamp,
+        entry_index: int,
+        main_signal_entry_price: float,  # Entry price for main position after TP
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a fade position (for bos_long) with fixed TP/SL.
+        
+        The fade position is a SHORT that:
+        - Enters at market (close price)
+        - TP at half body below close
+        - SL at close + 1 ATR
+        
+        On TP hit, the main LONG position will be created at the TP price.
+        """
+        nonlocal trade_counter
+        trade_margin, trade_leverage, _ = resolve_trade_sizing(
+            entry_price=entry_price,
+            atr_value=signal_atr_value,
+            sl_atr_mult=1.0,
+            margin_cap=cfg.initial_capital,
+            max_leverage=cfg.leverage,
+            min_leverage=cfg.leverage,
+            target_loss_usd=None,
+        )
+        if trade_margin is None or trade_leverage is None:
+            return None
+
+        trade_counter += 1
+        side_str = "LONG" if fade_side == 1 else "SHORT"
+        trade_id = generate_trade_id(df.attrs.get("symbol", "UNK"), str(entry_time), f"FADE_{side_str}")
+
+        return {
+            "position": fade_side,  # -1 for SHORT fade
+            "entry_price": entry_price,
+            "target_price": tp_price,  # Fixed TP for fade
+            "stop_price": sl_price,  # Fixed SL for fade
+            "entry_time": entry_time,
+            "entry_index": entry_index,
+            "used_signal_atr": signal_atr_value,
+            "active_margin": trade_margin,
+            "active_leverage": trade_leverage,
+            "active_notional": trade_margin * trade_leverage,
+            "trade_id": trade_id,
+            "signal_reason": "bos_long_fade",
+            "is_fade": True,  # Mark as fade position
+            "main_signal_entry_price": main_signal_entry_price,  # For creating main position after TP
         }
 
     idx = df.index.to_list()
@@ -4624,6 +4989,117 @@ def backtest_atr_grinder_lib(
 
                 positions.remove(pos)
 
+        # --- FADE POSITION EXIT logic (for bos_long fade trades) ---
+        for fade_pos in list(fade_positions):
+            fade_side = fade_pos["position"]  # -1 for SHORT fade
+            fade_entry = fade_pos["entry_price"]
+            fade_tp = fade_pos["target_price"]
+            fade_sl = fade_pos["stop_price"]
+            
+            if fade_entry is None:
+                continue
+            
+            fade_exited = False
+            fade_exit_reason = None
+            fade_exit_price = None
+            fade_exit_time = t
+            
+            if has_1m_data:
+                # Check 1m candles for TP/SL hit
+                for t_1m, candle_1m in df_1m_bar.iterrows():
+                    c = float(candle_1m["close"])
+                    h_1m = float(candle_1m["high"])
+                    l_1m = float(candle_1m["low"])
+                    
+                    if fade_side == -1:  # SHORT fade
+                        # TP hit: price goes down to TP level
+                        tp_hit = l_1m <= fade_tp
+                        # SL hit: price goes up to SL level
+                        sl_hit = h_1m >= fade_sl
+                        
+                        if tp_hit and sl_hit:
+                            # Both hit in same candle - assume SL first (conservative)
+                            fade_exit_reason = "SL"
+                            fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                            fade_exited = True
+                            fade_exit_time = t_1m
+                        elif tp_hit:
+                            fade_exit_reason = "TP"
+                            fade_exit_price = apply_slippage(fade_tp, fade_side, is_entry=False)
+                            fade_exited = True
+                            fade_exit_time = t_1m
+                        elif sl_hit:
+                            fade_exit_reason = "SL"
+                            fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                            fade_exited = True
+                            fade_exit_time = t_1m
+                    
+                    if fade_exited:
+                        break
+            else:
+                # Use daily candle data
+                c = float(df.at[t, "close"])
+                if fade_side == -1:  # SHORT fade
+                    tp_hit = l <= fade_tp
+                    sl_hit = h >= fade_sl
+                    
+                    if tp_hit and sl_hit:
+                        fade_exit_reason = "SL"
+                        fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                        fade_exited = True
+                    elif tp_hit:
+                        fade_exit_reason = "TP"
+                        fade_exit_price = apply_slippage(fade_tp, fade_side, is_entry=False)
+                        fade_exited = True
+                    elif sl_hit:
+                        fade_exit_reason = "SL"
+                        fade_exit_price = apply_slippage(fade_sl, fade_side, is_entry=False)
+                        fade_exited = True
+            
+            if fade_exited:
+                # Record fade trade
+                roi_net = net_roi_from_prices(fade_entry, fade_exit_price, fade_side, fade_pos["active_leverage"])
+                pnl_net = roi_net * fade_pos["active_margin"]
+                equity += pnl_net
+                
+                trades.append({
+                    "entry_time": fade_pos["entry_time"],
+                    "exit_time": fade_exit_time,
+                    "side": "LONG" if fade_side == 1 else "SHORT",
+                    "entry_price": fade_entry,
+                    "exit_price": fade_exit_price,
+                    "signal_atr": fade_pos["used_signal_atr"],
+                    "stop_price": fade_sl,
+                    "exit_reason": f"FADE_{fade_exit_reason}",
+                    "forced_exit": False,
+                    "roi_net": roi_net,
+                    "pnl_net": pnl_net,
+                    "margin_used": fade_pos["active_margin"],
+                    "notional": fade_pos["active_notional"],
+                    "equity_after": equity,
+                    "bars_held": i - (fade_pos["entry_index"] if fade_pos["entry_index"] is not None else i),
+                    "lib_mode": has_1m_data,
+                    "trade_id": fade_pos["trade_id"],
+                    "signal_reason": fade_pos["signal_reason"],
+                    "strategy_version": STRATEGY_VERSION,
+                })
+                
+                fade_positions.remove(fade_pos)
+                
+                # On TP hit, create the main LONG position
+                if fade_exit_reason == "TP":
+                    main_entry_price = fade_pos["main_signal_entry_price"]
+                    main_pos = create_position(
+                        side=1,  # LONG
+                        entry_price=apply_slippage(main_entry_price, 1, is_entry=True),
+                        signal_atr_value=fade_pos["used_signal_atr"],
+                        entry_time=fade_exit_time,
+                        entry_index=i,
+                        signal_reason="bos_long",
+                    )
+                    if main_pos is not None:
+                        positions.append(main_pos)
+
         # --- Trailing stop update for 1m close (if no 1m data or using 1m fallback) ---
         if not has_1m_data and cfg.use_trailing_stop:
             for pos in positions:
@@ -4810,12 +5286,45 @@ def backtest_atr_grinder_lib(
         prev_signal_atr = df.at[prev_t, "signal_atr"]
         prev_entry_price = df.at[prev_t, "signal_entry_price"]
         prev_signal_reason = df.at[prev_t, "signal_reason"] if "signal_reason" in df.columns else None
+        
+        # Get fade signal fields for bos_long
+        prev_fade_direction = int(df.at[prev_t, "signal_fade_direction"]) if "signal_fade_direction" in df.columns else 0
+        prev_fade_entry = df.at[prev_t, "signal_fade_entry"] if "signal_fade_entry" in df.columns else None
+        prev_fade_tp = df.at[prev_t, "signal_fade_tp"] if "signal_fade_tp" in df.columns else None
+        prev_fade_sl = df.at[prev_t, "signal_fade_sl"] if "signal_fade_sl" in df.columns else None
 
         if prev_signal != 0 and not (isinstance(prev_signal_atr, float) and math.isnan(prev_signal_atr)):
             side = prev_signal
             signal_atr_value = float(prev_signal_atr)
-
-            if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)):
+            
+            # Check if this is a bos_long signal with fade trade
+            if (
+                prev_signal_reason == "bos_long"
+                and prev_fade_direction == -1
+                and prev_fade_entry is not None
+                and not (isinstance(prev_fade_entry, float) and math.isnan(prev_fade_entry))
+                and prev_fade_tp is not None
+                and not (isinstance(prev_fade_tp, float) and math.isnan(prev_fade_tp))
+                and prev_fade_sl is not None
+                and not (isinstance(prev_fade_sl, float) and math.isnan(prev_fade_sl))
+            ):
+                # Create fade SHORT position (market entry at close price of signal candle)
+                fade_entry_price = apply_slippage(float(prev_fade_entry), -1, is_entry=True)  # SHORT
+                fade_pos = create_fade_position(
+                    fade_side=-1,  # SHORT fade
+                    entry_price=fade_entry_price,
+                    tp_price=float(prev_fade_tp),
+                    sl_price=float(prev_fade_sl),
+                    signal_atr_value=signal_atr_value,
+                    entry_time=t,
+                    entry_index=i,
+                    main_signal_entry_price=float(prev_entry_price) if prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)) else float(prev_fade_tp),
+                )
+                if fade_pos is not None:
+                    fade_positions.append(fade_pos)
+                # Skip regular position creation for bos_long - it will be created on fade TP
+                pass
+            elif prev_entry_price is not None and not (isinstance(prev_entry_price, float) and math.isnan(prev_entry_price)):
                 fill_raw = None
                 fill_time = t
                 if has_1m_data:
@@ -4951,6 +5460,41 @@ def backtest_atr_grinder_lib(
             })
             positions.remove(pos)
 
+    # Close open fade positions at end of backtest (mark-to-market)
+    if fade_positions:
+        last_close = float(df.iloc[-1]["close"])
+        for fade_pos in list(fade_positions):
+            fade_entry = fade_pos["entry_price"]
+            if fade_entry is None:
+                fade_positions.remove(fade_pos)
+                continue
+            exit_price = apply_slippage(last_close, fade_pos["position"], is_entry=False)
+            roi_net = net_roi_from_prices(fade_entry, exit_price, fade_pos["position"], fade_pos["active_leverage"])
+            pnl_net = roi_net * fade_pos["active_margin"]
+            equity += pnl_net
+
+            trades.append({
+                "entry_time": fade_pos["entry_time"],
+                "exit_time": df.index[-1],
+                "side": "LONG" if fade_pos["position"] == 1 else "SHORT",
+                "entry_price": fade_entry,
+                "exit_price": exit_price,
+                "signal_atr": fade_pos["used_signal_atr"],
+                "stop_price": fade_pos["stop_price"],
+                "exit_reason": "END_OF_BACKTEST_FADE",
+                "roi_net": roi_net,
+                "pnl_net": pnl_net,
+                "margin_used": fade_pos["active_margin"],
+                "notional": fade_pos["active_notional"],
+                "equity_after": equity,
+                "bars_held": len(df) - 1 - (fade_pos["entry_index"] if fade_pos["entry_index"] is not None else 0),
+                "lib_mode": True,
+                "trade_id": fade_pos["trade_id"],
+                "signal_reason": fade_pos["signal_reason"],
+                "strategy_version": STRATEGY_VERSION,
+            })
+            fade_positions.remove(fade_pos)
+
     trades_df = pd.DataFrame(trades)
     trailing_df = pd.DataFrame(trailing_stop_updates)
     stats = compute_stats(trades_df, df, cfg)
@@ -4958,7 +5502,28 @@ def backtest_atr_grinder_lib(
     return trades_df, df, stats, trailing_df
 
 
+@dataclass
+class LiveSignalResult:
+    """Result from compute_live_signal with all signal information."""
+    signal: int  # +1 long, -1 short, 0 none
+    signal_atr: Optional[float]
+    atr_value: Optional[float]
+    entry_price: Optional[float]
+    signal_reason: Optional[str]
+    # Fade signal fields (for bos_long)
+    fade_direction: int = 0  # -1 for SHORT fade before LONG, 0 for no fade
+    fade_entry: Optional[float] = None
+    fade_tp: Optional[float] = None
+    fade_sl: Optional[float] = None
+
+
 def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optional[float], Optional[float], Optional[float], Optional[str]]:
+    """
+    Compute entry signal for live trading.
+    
+    Returns:
+        Tuple of (signal, signal_atr, atr_value, entry_price, signal_reason)
+    """
     warmup = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
     if len(df) <= warmup:
         return 0, None, None, None, None
@@ -4975,13 +5540,24 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
     )
     
     # Generate signals based on market structure
-    signal, signal_atr, signal_entry_price, signal_reason, trend = build_market_structure_signals(
+    (
+        signal,
+        signal_atr,
+        signal_entry_price,
+        signal_reason,
+        trend,
+        signal_fade_direction,
+        signal_fade_entry,
+        signal_fade_tp,
+        signal_fade_sl,
+    ) = build_market_structure_signals(
         df,
         atr,
         structure_points,
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        fade_tp_body_pct=cfg.fade_tp_body_pct,
     )
 
     signal_val = int(signal.iloc[-1])
@@ -5003,6 +5579,99 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
             entry_price = None
     reason: Optional[str] = str(reason_val) if reason_val else None
     return signal_val, float(signal_atr_val), atr_val, entry_price, reason
+
+
+def compute_live_signal_extended(df: pd.DataFrame, cfg: LiveConfig) -> LiveSignalResult:
+    """
+    Compute entry signal for live trading with extended fade signal information.
+    
+    Returns:
+        LiveSignalResult with all signal fields including fade info for bos_long
+    """
+    warmup = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
+    if len(df) <= warmup:
+        return LiveSignalResult(signal=0, signal_atr=None, atr_value=None, entry_price=None, signal_reason=None)
+
+    atr = atr_ema(df, cfg.atr_len)
+    
+    # Compute market structure (HH/HL/LL/LH) levels
+    structure_points, hh_series, hl_series, ll_series, lh_series = compute_market_structure_levels(
+        df,
+        swing_timeframe=cfg.swing_timeframe,
+        left=cfg.swing_left,
+        right=cfg.swing_right,
+        resample_rule=cfg.swing_resample_rule,
+    )
+    
+    # Generate signals based on market structure
+    (
+        signal,
+        signal_atr_series,
+        signal_entry_price,
+        signal_reason,
+        trend,
+        signal_fade_direction,
+        signal_fade_entry,
+        signal_fade_tp,
+        signal_fade_sl,
+    ) = build_market_structure_signals(
+        df,
+        atr,
+        structure_points,
+        body_atr_mult=cfg.thr2,
+        structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
+        tolerance_pct=cfg.signal_atr_tolerance_pct,
+        fade_tp_body_pct=cfg.fade_tp_body_pct,
+    )
+
+    signal_val = int(signal.iloc[-1])
+    atr_val = float(atr.iloc[-1])
+    signal_atr_val = signal_atr_series.iloc[-1]
+    entry_price_val = signal_entry_price.iloc[-1]
+    reason_val = signal_reason.iloc[-1]
+    fade_dir_val = int(signal_fade_direction.iloc[-1])
+    fade_entry_val = signal_fade_entry.iloc[-1]
+    fade_tp_val = signal_fade_tp.iloc[-1]
+    fade_sl_val = signal_fade_sl.iloc[-1]
+    
+    if signal_val == 0 or pd.isna(signal_atr_val) or math.isnan(atr_val):
+        return LiveSignalResult(
+            signal=0,
+            signal_atr=None,
+            atr_value=atr_val if not math.isnan(atr_val) else None,
+            entry_price=None,
+            signal_reason=None,
+        )
+    
+    entry_price: Optional[float]
+    if entry_price_val is not None and not pd.isna(entry_price_val):
+        entry_price = float(entry_price_val)
+    else:
+        last_open = df["open"].iloc[-1]
+        last_close = df["close"].iloc[-1]
+        if not (pd.isna(last_open) or pd.isna(last_close)):
+            entry_price = float((last_open + last_close) / 2.0)
+        else:
+            entry_price = None
+    
+    reason: Optional[str] = str(reason_val) if reason_val else None
+    
+    # Extract fade values if present
+    fade_entry: Optional[float] = float(fade_entry_val) if fade_entry_val is not None and not pd.isna(fade_entry_val) else None
+    fade_tp: Optional[float] = float(fade_tp_val) if fade_tp_val is not None and not pd.isna(fade_tp_val) else None
+    fade_sl: Optional[float] = float(fade_sl_val) if fade_sl_val is not None and not pd.isna(fade_sl_val) else None
+    
+    return LiveSignalResult(
+        signal=signal_val,
+        signal_atr=float(signal_atr_val),
+        atr_value=atr_val,
+        entry_price=entry_price,
+        signal_reason=reason,
+        fade_direction=fade_dir_val,
+        fade_entry=fade_entry,
+        fade_tp=fade_tp,
+        fade_sl=fade_sl,
+    )
 
 
 # Backward compatibility functions for backtest code
@@ -5307,6 +5976,12 @@ def run_live(cfg: LiveConfig) -> None:
     all_symbols, filters_by_symbol = get_all_usdt_perpetuals_with_filters(client)
     logging.info("Found %d USDT perpetual symbols with filters", len(all_symbols))
     
+    # Fetch leverage brackets for accurate max leverage info
+    logging.info("Fetching leverage brackets for all symbols...")
+    leverage_brackets = fetch_leverage_brackets(client)
+    merge_leverage_brackets_into_filters(filters_by_symbol, leverage_brackets)
+    logging.info("Merged leverage brackets for %d symbols", len(leverage_brackets))
+    
     # Initialize state
     state = LiveState()
     
@@ -5411,6 +6086,19 @@ def run_live(cfg: LiveConfig) -> None:
                 exit_price_source = exit_price_source or "unknown"
 
         tick_size = filters_by_symbol.get(symbol, {}).get("tick_size", 0.00000001)
+        
+        # Check if this is a fade position that hit TP
+        fade_tp_hit = False
+        if pos_state.is_fade and pos_state.fade_tp_price is not None and exit_price > 0:
+            if pos_state.entry_side == -1:  # SHORT fade
+                # TP hit if exit price is close to or below the TP price
+                fade_tp_hit = exit_price <= pos_state.fade_tp_price * 1.01  # 1% tolerance
+            # Determine fade exit reason
+            if fade_tp_hit:
+                exit_reason = "FADE_TP"
+            else:
+                exit_reason = "FADE_SL"
+        
         log_event(cfg.log_path, {
             "event": "position_closed",
             "symbol": symbol,
@@ -5421,6 +6109,8 @@ def run_live(cfg: LiveConfig) -> None:
             "stop_price": format_price_optional(pos_state.sl_price, tick_size),
             "sl_algo_id": pos_state.sl_algo_id,
             "sl_algo_status": sl_status,
+            "is_fade": pos_state.is_fade,
+            "fade_tp_hit": fade_tp_hit,
         })
 
         append_live_trade(cfg.live_trades_csv, {
@@ -5444,6 +6134,29 @@ def run_live(cfg: LiveConfig) -> None:
             cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
         if symbol in state.positions:
             del state.positions[symbol]
+        
+        # If fade TP was hit, create the main LONG position
+        if fade_tp_hit and pos_state.fade_main_entry_price is not None:
+            log_event(cfg.log_path, {
+                "event": "fade_tp_hit_creating_long",
+                "symbol": symbol,
+                "fade_exit_price": format_price_for_logging(exit_price, tick_size),
+                "main_entry_price": format_price_for_logging(pos_state.fade_main_entry_price, tick_size),
+                "signal_atr": format_price_for_logging(pos_state.entry_atr, tick_size),
+            })
+            
+            # Place the main LONG position
+            main_trade_id = generate_trade_id(symbol, exit_time_iso, "LONG")
+            if place_entry_order(
+                symbol,
+                signal=1,  # LONG
+                signal_atr=pos_state.entry_atr,
+                atr_value=pos_state.entry_atr,
+                signal_entry_price=pos_state.fade_main_entry_price,
+                trade_id=main_trade_id,
+                signal_reason="bos_long",
+            ):
+                logging.info("Main LONG position placed after fade TP for %s", symbol)
 
     def fetch_latest_atr(symbol: str) -> Optional[float]:
         cached = last_atr_by_symbol.get(symbol)
@@ -5813,6 +6526,9 @@ def run_live(cfg: LiveConfig) -> None:
             "order_id": pos_state.sl_algo_id,
         })
 
+    # Track active fade positions (for bos_long)
+    fade_positions: Dict[str, Dict[str, Any]] = {}
+    
     # -----------------------------------------------------------------
     # Helper: Check for entry signal on a symbol using 1d candle
     # -----------------------------------------------------------------
@@ -5850,7 +6566,14 @@ def run_live(cfg: LiveConfig) -> None:
         state.last_signal_close_ms[symbol] = close_time_ms
         
         df = klines_to_df(closed_klines)
-        signal, signal_atr, atr_value, signal_entry_price, signal_reason = compute_live_signal(df, cfg)
+        
+        # Use extended signal with fade info
+        signal_result = compute_live_signal_extended(df, cfg)
+        signal = signal_result.signal
+        signal_atr = signal_result.signal_atr
+        atr_value = signal_result.atr_value
+        signal_entry_price = signal_result.entry_price
+        signal_reason = signal_result.signal_reason
         
         # Store ATR for trailing stop calculation
         last_atr_by_symbol[symbol] = atr_value
@@ -5887,10 +6610,29 @@ def run_live(cfg: LiveConfig) -> None:
                 "atr": format_price_for_logging(atr_value, tick_size),
                 "signal": signal,
                 "signal_reason": signal_reason,
+                "fade_direction": signal_result.fade_direction,
+                "fade_entry": format_price_for_logging(signal_result.fade_entry, tick_size) if signal_result.fade_entry else None,
+                "fade_tp": format_price_for_logging(signal_result.fade_tp, tick_size) if signal_result.fade_tp else None,
+                "fade_sl": format_price_for_logging(signal_result.fade_sl, tick_size) if signal_result.fade_sl else None,
             })
         
         if signal == 0 or signal_atr is None or atr_value is None:
             return None
+        
+        # For bos_long signals with fade, handle specially
+        if signal_reason == "bos_long" and signal_result.fade_direction == -1:
+            # Store fade info for later processing
+            fade_positions[symbol] = {
+                "fade_direction": signal_result.fade_direction,
+                "fade_entry": signal_result.fade_entry,
+                "fade_tp": signal_result.fade_tp,
+                "fade_sl": signal_result.fade_sl,
+                "signal_atr": signal_atr,
+                "main_entry_price": signal_entry_price,
+                "pending": True,  # Fade entry not yet placed
+            }
+            # Return -1 signal (SHORT) to trigger fade entry instead of LONG
+            return (-1, signal_atr, atr_value, signal_result.fade_entry, "bos_long_fade")
         
         return (signal, signal_atr, atr_value, signal_entry_price, signal_reason)
 
@@ -5941,9 +6683,19 @@ def run_live(cfg: LiveConfig) -> None:
         signal_entry_price: Optional[float],
         trade_id: Optional[str] = None,
         signal_reason: Optional[str] = None,
+        is_fade: bool = False,
+        fade_tp_price: Optional[float] = None,
+        fade_sl_price: Optional[float] = None,
+        fade_main_entry_price: Optional[float] = None,
     ) -> bool:
         """
         Place a limit entry order for the symbol.
+        
+        Args:
+            is_fade: If True, this is a fade position (SHORT before LONG for bos_long)
+            fade_tp_price: TP price for fade position
+            fade_sl_price: SL price for fade position
+            fade_main_entry_price: Entry price for main position after fade TP
         
         Returns:
             True if order was placed successfully, False otherwise.
@@ -6006,6 +6758,19 @@ def run_live(cfg: LiveConfig) -> None:
         )
         if abs(leverage_used - round(leverage_used)) < 1e-6:
             leverage_used = float(int(round(leverage_used)))
+
+        # Log when leverage is adjusted due to symbol limits
+        if leverage_used != cfg.leverage:
+            log_event(cfg.log_path, {
+                "event": "leverage_adjusted",
+                "symbol": symbol,
+                "requested_leverage": cfg.leverage,
+                "adjusted_leverage": leverage_used,
+                "max_leverage": max_leverage,
+                "base_margin_usd": format_float_2(cfg.margin_usd),
+                "adjusted_margin_usd": format_float_2(margin_usd_used),
+                "target_notional": format_float_2(target_notional),
+            })
 
         # Ensure leverage is set
         current_leverage = state.current_leverage_by_symbol.get(symbol)
@@ -6070,6 +6835,11 @@ def run_live(cfg: LiveConfig) -> None:
                 entry_leverage=leverage_used,
                 trade_id=trade_id,
                 signal_reason=signal_reason,
+                # Fade fields (for bos_long_fade)
+                is_fade=is_fade,
+                fade_tp_price=fade_tp_price,
+                fade_sl_price=fade_sl_price,
+                fade_main_entry_price=fade_main_entry_price,
             )
             state.pending_entries[symbol] = pending
             
@@ -6160,6 +6930,11 @@ def run_live(cfg: LiveConfig) -> None:
                             entry_leverage=pending.entry_leverage or cfg.leverage,
                             trade_id=pending.trade_id,
                             signal_reason=pending.signal_reason,
+                            # Fade fields (for bos_long_fade)
+                            is_fade=pending.is_fade,
+                            fade_tp_price=pending.fade_tp_price,
+                            fade_sl_price=pending.fade_sl_price,
+                            fade_main_entry_price=pending.fade_main_entry_price,
                         )
                         state.positions[symbol] = pos_state
                         
@@ -6307,10 +7082,25 @@ def run_live(cfg: LiveConfig) -> None:
                 
                 # Place entry order if conditions allow
                 if status == "ACTED":
-                    if place_entry_order(symbol, signal, signal_atr, atr_value, signal_entry_price, 
-                                        trade_id=live_trade_id, signal_reason=signal_reason):
+                    # Check if this is a bos_long_fade signal with fade info
+                    fade_info = fade_positions.get(symbol, {})
+                    is_fade = signal_reason == "bos_long_fade" and fade_info.get("pending", False)
+                    
+                    if place_entry_order(
+                        symbol, signal, signal_atr, atr_value, signal_entry_price, 
+                        trade_id=live_trade_id, 
+                        signal_reason=signal_reason,
+                        is_fade=is_fade,
+                        fade_tp_price=fade_info.get("fade_tp") if is_fade else None,
+                        fade_sl_price=fade_info.get("fade_sl") if is_fade else None,
+                        fade_main_entry_price=fade_info.get("main_entry_price") if is_fade else None,
+                    ):
                         # Successfully placed entry order
                         logging.info("Entry order placed for %s", symbol)
+                        
+                        # Clear fade info after placing the fade position
+                        if is_fade and symbol in fade_positions:
+                            fade_positions[symbol]["pending"] = False
                         
                         # Check if we've hit max positions
                         if not state.can_open_position(cfg.max_open_positions):

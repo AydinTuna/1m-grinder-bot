@@ -1,6 +1,28 @@
 {
   "versions": [
     {
+      "version": "1.5.3",
+      "date": "2026-01-27",
+      "changes": [
+        "BOS long fade trade: SHORT first at candle close",
+        "Fade TP at configurable % of candle body (fade_tp_body_pct, default 60%)",
+        "Fade SL at close + 1 ATR",
+        "On fade TP hit, flip to LONG with normal trailing stop",
+        "On fade SL hit, cancel trade (no LONG entry)"
+      ],
+      "signal_directions": {
+        "hh_breakout": "LONG",
+        "ll_breakdown": "LONG",
+        "hh_rejection": "SHORT",
+        "ll_bounce": "LONG",
+        "bos_long": "LONG",
+        "bos_long_fade": "SHORT",
+        "bos_short": "LONG",
+        "lh_rejection": "SHORT",
+        "hl_bounce": "LONG"
+      }
+    },
+    {
       "version": "1.4.2",
       "date": "2026-01-26",
       "changes": [

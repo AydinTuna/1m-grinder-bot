@@ -66,11 +66,19 @@ class MarketStructurePoint:
     """
     Represents a classified market structure point (HH, HL, LL, LH).
     
-    Market Structure Rules (sequence + close filters):
-    - HH: swing high close > last HH AND > last LH
-    - LL: swing low close < last LL AND < last HL
-    - HL: after HH (if last high was LH, a swing low defaults to LL to keep downtrend sequence)
-    - LH: after LL, swing high close between last LL and last HH AND below previous LH
+    STRUCTURE SEQUENCE RULES:
+    - Uptrend: HH → HL → HH → HL → ...
+    - Downtrend: LH → LL → LH → LL → ...
+    
+    VALID TRANSITIONS:
+    - After HH: HL (uptrend continues, close above prev low) or LL (reversal, close below prev low)
+    - After HL: HH (uptrend continues, close above prev high) or LH (reversal, close below prev high)
+    - After LH: LL only (downtrend continues, close below prev low); skip if close above
+    - After LL: LH (downtrend continues, close below prev high) or HH (reversal, close above prev high)
+    
+    KEY CONSTRAINT:
+    - HL can ONLY come after HH (not after LH!)
+    - After LH, if swing low doesn't break below, it's SKIPPED entirely
     """
     structure_kind: StructureKind  # "HH", "HL", "LL", "LH"
     swing_point: SwingPoint  # The underlying swing point
@@ -124,7 +132,7 @@ def is_liquidity_sweep(
     lower_wick = min(candle_open, candle_close) - candle_low
     body_ratio = body / candle_range
 
-    is_meaningful_body = body_ratio > SMALL_BODY_RATIO
+    is_meaningful_body = body_ratio * 0.15 > SMALL_BODY_RATIO
     if not is_meaningful_body:
         return False
 
@@ -222,9 +230,28 @@ def classify_market_structure(
                 prev_high = effective_swing
                 continue
 
-            # ✅ CLOSE-BASED: HH if close breaks above previous swing high level else LH
-            kind: StructureKind = "HH" if effective_close > float(prev_high.high) else "LH"
+            # ✅ ALTERNATION RULE: After a HIGH structure (HH/LH), next structure MUST be LOW (HL/LL)
+            # If last structure was already a HIGH, skip this swing_high entirely
+            if last_structure_kind in ("HH", "LH"):
+                prev_high = effective_swing
+                continue
+
+            # ✅ STRUCTURE-SPECIFIC classification:
+            # - LH is ONLY valid after LL (downtrend continuation)
+            # - HH is valid after HL (uptrend continuation) or after LL (trend reversal)
+            # - After HL, if close doesn't break above → LH (trend reversal to downtrend)
+            close_breaks_above = effective_close > float(prev_high.high)
             ref_level = float(prev_high.high)
+
+            if last_structure_kind == "LL":
+                # After LL: LH if doesn't break (downtrend), HH if breaks (reversal)
+                kind: StructureKind = "HH" if close_breaks_above else "LH"
+            elif last_structure_kind == "HL":
+                # After HL: HH if breaks (uptrend), LH if doesn't break (reversal)
+                kind: StructureKind = "HH" if close_breaks_above else "LH"
+            else:
+                # First structure or unknown - use close-based
+                kind: StructureKind = "HH" if close_breaks_above else "LH"
 
             structure_points.append(MarketStructurePoint(
                 structure_kind=kind,
@@ -243,12 +270,33 @@ def classify_market_structure(
                 prev_low = effective_swing
                 continue
 
-            # ✅ CLOSE-BASED: LL if close breaks below previous swing low level else HL
-            kind: StructureKind = "LL" if effective_close < float(prev_low.low) else "HL"
-            if kind == "HL" and last_structure_kind == "LH":
-                # Enforce sequence: only allow HL after a HH swing high.
-                kind = "LL"
+            # ✅ ALTERNATION RULE: After a LOW structure (HL/LL), next structure MUST be HIGH (HH/LH)
+            # If last structure was already a LOW, skip this swing_low entirely
+            if last_structure_kind in ("HL", "LL"):
+                prev_low = effective_swing
+                continue
+
+            # ✅ STRUCTURE-SPECIFIC classification:
+            # - HL is ONLY valid after HH (uptrend continuation)
+            # - LL is valid after LH (downtrend continuation) or after HH (trend reversal)
+            # - After LH, if close doesn't break below → SKIP (can't be HL!)
+            close_breaks_below = effective_close < float(prev_low.low)
             ref_level = float(prev_low.low)
+
+            if last_structure_kind == "HH":
+                # After HH: HL if doesn't break (uptrend), LL if breaks (reversal)
+                kind: StructureKind = "LL" if close_breaks_below else "HL"
+            elif last_structure_kind == "LH":
+                # After LH: LL if breaks (downtrend), SKIP if doesn't break
+                if close_breaks_below:
+                    kind: StructureKind = "LL"
+                else:
+                    # Can't assign HL after LH - skip this swing
+                    prev_low = effective_swing
+                    continue
+            else:
+                # First structure or unknown - use close-based
+                kind: StructureKind = "LL" if close_breaks_below else "HL"
 
             structure_points.append(MarketStructurePoint(
                 structure_kind=kind,
@@ -697,7 +745,8 @@ def build_market_structure_signals(
     body_atr_mult: float = 2.0,
     structure_proximity_atr_mult: float = 0.5,
     tolerance_pct: float = 0.0,
-) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    fade_tp_body_pct: float = 0.6,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """
     Generate trading signals based on market structure (HH/HL/LL/LH).
     
@@ -721,7 +770,13 @@ def build_market_structure_signals(
     
     BREAK OF STRUCTURE (BOS) SIGNALS:
     - In uptrend, if price closes below recent HL → SHORT (BOS)
-    - In downtrend, if price closes above recent LH → LONG (BOS)
+    - In downtrend, if price closes above recent LH → LONG (BOS) with fade trade first
+    
+    BOS_LONG FADE TRADE:
+    - Market SELL (SHORT) at signal candle close
+    - TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
+    - SL at close + 1 ATR (cancels trade if hit)
+    - On TP hit → Market BUY (LONG) at TP price, with normal trailing stop
     
     Returns:
         signal_dir: +1 long, -1 short, 0 none
@@ -729,12 +784,26 @@ def build_market_structure_signals(
         entry_price: NaN for market-on-next-bar, otherwise limit entry price
         signal_reason: string describing why signal was generated
         trend: +1 uptrend, -1 downtrend, 0 undefined
+        signal_fade_direction: -1 for SHORT fade before main signal, 0 for no fade
+        signal_fade_entry: Entry price for fade position (market at close)
+        signal_fade_tp: TP price for fade position
+        signal_fade_sl: SL price for fade position
     """
     if df.empty:
         empty_i = pd.Series(0, index=df.index, dtype=int)
         empty_f = pd.Series(np.nan, index=df.index, dtype=float)
         empty_s = pd.Series("", index=df.index, dtype=str)
-        return empty_i, empty_f, empty_f, empty_s, empty_i.copy()
+        return (
+            empty_i,          # signal
+            empty_f.copy(),   # signal_atr
+            empty_f.copy(),   # entry_price
+            empty_s,          # signal_reason
+            empty_i.copy(),   # trend
+            empty_i.copy(),   # signal_fade_direction
+            empty_f.copy(),   # signal_fade_entry
+            empty_f.copy(),   # signal_fade_tp
+            empty_f.copy(),   # signal_fade_sl
+        )
 
     required = ["open", "high", "low", "close"]
     missing = [c for c in required if c not in df.columns]
@@ -747,6 +816,12 @@ def build_market_structure_signals(
     entry_price = pd.Series(np.nan, index=df.index, dtype=float)
     signal_reason = pd.Series("", index=df.index, dtype=str)
     trend = pd.Series(0, index=df.index, dtype=int)
+    
+    # Fade signal series (for bos_long fade trade)
+    signal_fade_direction = pd.Series(0, index=df.index, dtype=int)
+    signal_fade_entry = pd.Series(np.nan, index=df.index, dtype=float)
+    signal_fade_tp = pd.Series(np.nan, index=df.index, dtype=float)
+    signal_fade_sl = pd.Series(np.nan, index=df.index, dtype=float)
 
     # Candle characteristics
     body = (df["close"] - df["open"]).abs()
@@ -889,10 +964,22 @@ def build_market_structure_signals(
     signal_reason[bos_short] = "bos_short"
 
     # BOS Long: In downtrend, price closes above recent LH with big green body
+    # This signal uses a FADE TRADE: SHORT first, then flip to LONG on TP
     bos_long = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
-    signal[bos_long] = 1
-    entry_price[bos_long] = df["close"] - (df["close"] - df["open"]).abs() * 0.5
+    signal[bos_long] = 1  # Final direction is LONG (after fade)
     signal_reason[bos_long] = "bos_long"
+    
+    # Fade trade setup for bos_long:
+    # 1. Market SELL (SHORT) at close
+    # 2. TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
+    # 3. SL at close + 1 ATR (cancels trade if hit)
+    # 4. On TP hit → entry_price becomes the LONG entry point
+    fade_tp_price = df["close"] - (df["close"] - df["open"]).abs() * fade_tp_body_pct
+    signal_fade_direction[bos_long] = -1  # SHORT fade first
+    signal_fade_entry[bos_long] = df["close"]  # Market entry at close
+    signal_fade_tp[bos_long] = fade_tp_price  # TP for SHORT fade
+    signal_fade_sl[bos_long] = df["close"] + atr  # SL at close + 1 ATR
+    entry_price[bos_long] = fade_tp_price  # LONG entry at fade TP price
 
     # =========================================================================
     # MOMENTUM SIGNALS (no clear structure nearby)
@@ -917,7 +1004,17 @@ def build_market_structure_signals(
     active = signal != 0
     signal_atr[active] = atr[active]
 
-    return signal, signal_atr, entry_price, signal_reason, trend
+    return (
+        signal,
+        signal_atr,
+        entry_price,
+        signal_reason,
+        trend,
+        signal_fade_direction,
+        signal_fade_entry,
+        signal_fade_tp,
+        signal_fade_sl,
+    )
 
 
 def build_log_payload(

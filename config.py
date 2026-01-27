@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.4.2"
+STRATEGY_VERSION: str = "1.5.3"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "BOS long entry uses candle mid-body (limit) in live trading"
+STRATEGY_VERSION_NOTE: str = "BOS long fade trade: SHORT first, TP at configurable % of body, then flip to LONG"
 
 
 # =============================================================================
@@ -316,8 +316,8 @@ class BacktestConfig:
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.1  # 0.1 = 10%
     swing_timeframe: str = "1d"
-    swing_left: int = 1
-    swing_right: int = 1
+    swing_left: int = 2
+    swing_right: int = 2
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
@@ -332,6 +332,10 @@ class BacktestConfig:
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
+    
+    # BOS Long fade trade settings
+    # When bos_long signal fires, SHORT first then flip to LONG on TP
+    fade_tp_body_pct: float = 0.6  # TP at this % of candle body below close (0.6 = 60%)
 
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
@@ -360,8 +364,8 @@ class LiveConfig:
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
     swing_timeframe: str = "1d"
-    swing_left: int = 1
-    swing_right: int = 1
+    swing_left: int = 2
+    swing_right: int = 2
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
@@ -371,6 +375,9 @@ class LiveConfig:
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
+    
+    # BOS Long fade trade settings
+    fade_tp_body_pct: float = 0.6  # TP at this % of candle body below close (0.6 = 60%)
 
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
@@ -397,7 +404,7 @@ class LiveConfig:
     entry_delay_max_seconds: float = 0.01
     spread_max_pct: float = 1.0  # disabled (set to 0.0001 for 0.01% filter)
     atr_offset_mult: float = 0.02
-    entry_signal_workers: int = 7  # concurrent workers for entry signal scanning
+    entry_signal_workers: int = 20  # concurrent workers for entry signal scanning
     poll_interval_seconds: float = 60.0  # check every minute for trailing
     log_path: str = str(get_live_log_path())
     live_trades_csv: str = str(get_live_trades_path())
