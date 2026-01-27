@@ -404,7 +404,7 @@ class LiveConfig:
     entry_delay_max_seconds: float = 0.01
     spread_max_pct: float = 1.0  # disabled (set to 0.0001 for 0.01% filter)
     atr_offset_mult: float = 0.02
-    entry_signal_workers: int = 20  # concurrent workers for entry signal scanning
+    entry_signal_workers: int = 5  # concurrent workers for entry signal scanning
     poll_interval_seconds: float = 60.0  # check every minute for trailing
     log_path: str = str(get_live_log_path())
     live_trades_csv: str = str(get_live_trades_path())
