@@ -261,7 +261,7 @@ LIVE_SIGNAL_FIELDS: List[str] = [
     "low",
     "close",
     "atr",
-    "status",            # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_PENDING", "SKIPPED_OUTSIDE_WINDOW"
+    "status",            # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_OPEN_POSITION", "SKIPPED_PENDING"
     "signal_reason",     # e.g. "swing_high_rejection_short", "momentum_long", etc.
     "trade_id",          # Unique ID if signal was acted upon (links to trade)
     "strategy_version",  # Version of strategy that generated this signal
@@ -387,10 +387,6 @@ class LiveConfig:
     # Multi-position settings
     max_open_positions: int = 0  # max concurrent positions (<= 0 means unlimited)
 
-    # Entry time window (only enter positions within X minutes after daily candle close at 00:00 UTC)
-    # Set to 0 to disable this check and allow entries anytime
-    entry_window_minutes: int = 30
-
     # Algo order controls
     algo_type: str = "CONDITIONAL"
     algo_working_type: str = "CONTRACT_PRICE"
@@ -403,7 +399,6 @@ class LiveConfig:
     atr_offset_mult: float = 0.02
     entry_signal_workers: int = 7  # concurrent workers for entry signal scanning
     poll_interval_seconds: float = 60.0  # check every minute for trailing
-    entry_order_timeout_seconds: float = 60 * 30  # 30 minutes
     log_path: str = str(get_live_log_path())
     live_trades_csv: str = str(get_live_trades_path())
     live_signals_csv: str = str(get_live_signals_path())

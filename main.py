@@ -57,7 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Iterable, Optional, Tuple, List, Dict, Any
@@ -133,6 +133,11 @@ def get_all_usdt_perpetuals_public() -> List[str]:
     Returns:
         List of symbol strings (e.g., ["BTCUSDT", "ETHUSDT", ...])
     """
+    symbols, _ = get_usdt_perpetuals_public_with_leverage()
+    return symbols
+
+
+def _fetch_exchange_info_public() -> Optional[Dict[str, Any]]:
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     try:
         req = urllib.request.Request(url)
@@ -141,22 +146,57 @@ def get_all_usdt_perpetuals_public() -> List[str]:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"ERROR: Failed to fetch exchange info: {e}")
-        return []
-    
-    symbols = []
+        return None
+
+
+def get_usdt_perpetuals_public_with_leverage() -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    """
+    Fetch all USDT perpetual symbols plus leverage limits (public API).
+    Returns (symbols, leverage_limits_by_symbol).
+    """
+    data = _fetch_exchange_info_public()
+    if not data:
+        return [], {}
+
+    symbols: List[str] = []
+    leverage_limits: Dict[str, Dict[str, float]] = {}
+
     for s in data.get("symbols", []):
-        # Only include PERPETUAL contracts with USDT as quote asset
-        if (s.get("contractType") == "PERPETUAL" 
+        if (s.get("contractType") == "PERPETUAL"
             and s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"):
             symbol = s.get("symbol")
-            if is_tradeable_symbol(symbol):
-                symbols.append(symbol)
-    
-    return sorted(symbols)
+            if not is_tradeable_symbol(symbol):
+                continue
+            symbols.append(symbol)
+
+            # Extract leverage limits if available
+            max_leverage = None
+            min_leverage = None
+            leverage_step = None
+            for f in s.get("filters", []):
+                if f.get("filterType") == "LEVERAGE_FILTER":
+                    try:
+                        max_leverage = float(f.get("maxLeverage", 0) or 0)
+                        min_leverage = float(f.get("minLeverage", 0) or 0)
+                        leverage_step = float(f.get("leverageStep", 0) or 0)
+                    except (TypeError, ValueError):
+                        max_leverage = None
+                        min_leverage = None
+                        leverage_step = None
+                    break
+
+            if max_leverage or min_leverage or leverage_step:
+                leverage_limits[symbol] = {
+                    "max_leverage": max_leverage or 0.0,
+                    "min_leverage": min_leverage or 0.0,
+                    "leverage_step": leverage_step or 0.0,
+                }
+
+    return sorted(symbols), leverage_limits
 
 
 # -----------------------------
@@ -1008,7 +1048,7 @@ class PositionState:
     entry_time_iso: str = ""
     entry_close_ms: int = 0
     entry_margin_usd: float = 0.0
-    entry_leverage: int = 20
+    entry_leverage: float = 20.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this trade
 
@@ -1022,6 +1062,8 @@ class PendingEntry:
     pending_atr: float
     pending_side: int  # +1 long, -1 short
     entry_close_ms: int
+    entry_margin_usd: float = 0.0
+    entry_leverage: float = 0.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this entry
 
@@ -1038,7 +1080,7 @@ class LiveState:
     # Last candle close times for trailing stop updates
     last_trail_close_ms: Dict[str, int] = None  # type: ignore
     # Leverage set per symbol
-    current_leverage_by_symbol: Dict[str, int] = None  # type: ignore
+    current_leverage_by_symbol: Dict[str, float] = None  # type: ignore
     
     def __post_init__(self) -> None:
         if self.positions is None:
@@ -1073,28 +1115,6 @@ class LiveState:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def is_within_entry_window(window_minutes: int) -> bool:
-    """
-    Check if current UTC time is within the entry window after daily candle close.
-    
-    Daily candle closes at 00:00 UTC. This function returns True if we're within
-    `window_minutes` after midnight UTC.
-    
-    Args:
-        window_minutes: Number of minutes after 00:00 UTC to allow entries.
-                       Set to 0 to disable this check (always returns True).
-    
-    Returns:
-        True if within the entry window or check is disabled, False otherwise.
-    """
-    if window_minutes <= 0:
-        return True  # Check disabled
-    
-    now = datetime.now(timezone.utc)
-    minutes_since_midnight = now.hour * 60 + now.minute
-    return minutes_since_midnight < window_minutes
 
 
 def log_event(log_path: str, event: Dict[str, object]) -> None:
@@ -1681,19 +1701,38 @@ def get_symbol_filters(client: BinanceUMFuturesREST, symbol: str) -> Dict[str, f
             tick_size = None
             step_size = None
             min_qty = None
+            max_leverage = None
+            min_leverage = None
+            leverage_step = None
             for f in s.get("filters", []):
                 if f.get("filterType") == "PRICE_FILTER":
                     tick_size = float(f["tickSize"])
                 elif f.get("filterType") == "LOT_SIZE":
                     step_size = float(f["stepSize"])
                     min_qty = float(f["minQty"])
+                elif f.get("filterType") == "LEVERAGE_FILTER":
+                    try:
+                        max_leverage = float(f.get("maxLeverage", 0) or 0)
+                        min_leverage = float(f.get("minLeverage", 0) or 0)
+                        leverage_step = float(f.get("leverageStep", 0) or 0)
+                    except (TypeError, ValueError):
+                        max_leverage = None
+                        min_leverage = None
+                        leverage_step = None
             if tick_size is None or step_size is None or min_qty is None:
                 raise RuntimeError(f"Missing filters for symbol: {symbol}")
-            return {
+            filters = {
                 "tick_size": tick_size,
                 "step_size": step_size,
                 "min_qty": min_qty,
             }
+            if max_leverage or min_leverage or leverage_step:
+                filters.update({
+                    "max_leverage": max_leverage or 0.0,
+                    "min_leverage": min_leverage or 0.0,
+                    "leverage_step": leverage_step or 0.0,
+                })
+            return filters
     raise RuntimeError(f"Symbol not found: {symbol}")
 
 
@@ -1744,19 +1783,38 @@ def get_all_usdt_perpetuals_with_filters(client: BinanceUMFuturesREST) -> Tuple[
             tick_size = None
             step_size = None
             min_qty = None
+            max_leverage = None
+            min_leverage = None
+            leverage_step = None
             for f in s.get("filters", []):
                 if f.get("filterType") == "PRICE_FILTER":
                     tick_size = float(f["tickSize"])
                 elif f.get("filterType") == "LOT_SIZE":
                     step_size = float(f["stepSize"])
                     min_qty = float(f["minQty"])
+                elif f.get("filterType") == "LEVERAGE_FILTER":
+                    try:
+                        max_leverage = float(f.get("maxLeverage", 0) or 0)
+                        min_leverage = float(f.get("minLeverage", 0) or 0)
+                        leverage_step = float(f.get("leverageStep", 0) or 0)
+                    except (TypeError, ValueError):
+                        max_leverage = None
+                        min_leverage = None
+                        leverage_step = None
             
             if tick_size is not None and step_size is not None and min_qty is not None:
-                filters_by_symbol[symbol] = {
+                filters = {
                     "tick_size": tick_size,
                     "step_size": step_size,
                     "min_qty": min_qty,
                 }
+                if max_leverage or min_leverage or leverage_step:
+                    filters.update({
+                        "max_leverage": max_leverage or 0.0,
+                        "min_leverage": min_leverage or 0.0,
+                        "leverage_step": leverage_step or 0.0,
+                    })
+                filters_by_symbol[symbol] = filters
     
     return sorted(symbols), filters_by_symbol
 
@@ -5136,7 +5194,7 @@ def is_exit_check_boundary(timestamp: pd.Timestamp, interval: str) -> bool:
 def compute_position_qty(
     entry_price: float,
     margin_usd: float,
-    leverage: int,
+    leverage: float,
     step_size: float,
 ) -> str:
     """
@@ -5156,6 +5214,66 @@ def compute_position_qty(
     notional = margin_usd * leverage
     qty = notional / entry_price
     return format_to_step(qty, step_size)
+
+
+def resolve_effective_leverage_and_margin(
+    base_leverage: float,
+    base_margin_usd: float,
+    symbol_filters: Optional[Dict[str, float]] = None,
+) -> Tuple[float, float, float, Optional[float]]:
+    """
+    Resolve leverage cap per symbol and adjust margin to keep target notional constant.
+
+    Returns (effective_leverage, effective_margin_usd, target_notional, max_leverage).
+    """
+    target_notional = base_margin_usd * base_leverage
+    if not symbol_filters:
+        return base_leverage, base_margin_usd, target_notional, None
+
+    max_leverage = float(symbol_filters.get("max_leverage") or 0.0)
+    min_leverage = float(symbol_filters.get("min_leverage") or 0.0)
+    leverage_step = float(symbol_filters.get("leverage_step") or 0.0)
+
+    leverage_used = float(base_leverage)
+    if max_leverage > 0:
+        leverage_used = min(leverage_used, max_leverage)
+    if min_leverage > 0:
+        leverage_used = max(leverage_used, min_leverage)
+    if leverage_step > 0:
+        leverage_used = math.floor(leverage_used / leverage_step) * leverage_step
+        if leverage_used <= 0:
+            leverage_used = leverage_step
+    if min_leverage > 0 and leverage_used < min_leverage:
+        leverage_used = min_leverage
+    if max_leverage > 0 and leverage_used > max_leverage:
+        leverage_used = max_leverage
+
+    if leverage_used <= 0:
+        leverage_used = float(base_leverage)
+
+    margin_usd_used = target_notional / leverage_used if leverage_used > 0 else base_margin_usd
+    return leverage_used, margin_usd_used, target_notional, (max_leverage or None)
+
+
+def adjust_backtest_config_for_symbol(
+    cfg: BacktestConfig,
+    symbol_filters: Optional[Dict[str, float]] = None,
+) -> BacktestConfig:
+    leverage_used, margin_usd_used, _, _ = resolve_effective_leverage_and_margin(
+        cfg.leverage,
+        cfg.margin_usd,
+        symbol_filters,
+    )
+    if abs(leverage_used - round(leverage_used)) < 1e-6:
+        leverage_used = float(int(round(leverage_used)))
+    if leverage_used == cfg.leverage and margin_usd_used == cfg.margin_usd:
+        return cfg
+    return replace(
+        cfg,
+        leverage=leverage_used,
+        margin_usd=margin_usd_used,
+        initial_capital=margin_usd_used,
+    )
 
 
 
@@ -5417,6 +5535,25 @@ def run_live(cfg: LiveConfig) -> None:
             })
 
         return restored
+
+    def get_open_position_symbols() -> set[str]:
+        try:
+            raw_positions = client.get_position_risk()
+        except ClientError as exc:
+            logging.warning("Position sync failed. error=%s", exc)
+            log_event(cfg.log_path, {"event": "position_sync_failed", "error": str(exc)})
+            return set()
+
+        positions = raw_positions if isinstance(raw_positions, list) else [raw_positions]
+        open_symbols: set[str] = set()
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "")
+            if not symbol:
+                continue
+            amt = safe_float(pos.get("positionAmt"), 0.0)
+            if amt != 0.0:
+                open_symbols.add(symbol)
+        return open_symbols
     
     log_event(cfg.log_path, {
         "event": "startup",
@@ -5861,23 +5998,34 @@ def run_live(cfg: LiveConfig) -> None:
         if limit_price <= 0:
             return False
         
-        # Static position sizing: margin_usd x leverage
+        # Static position sizing: margin_usd x leverage (adjust for symbol max leverage)
+        leverage_used, margin_usd_used, target_notional, max_leverage = resolve_effective_leverage_and_margin(
+            cfg.leverage,
+            cfg.margin_usd,
+            filters,
+        )
+        if abs(leverage_used - round(leverage_used)) < 1e-6:
+            leverage_used = float(int(round(leverage_used)))
+
         # Ensure leverage is set
         current_leverage = state.current_leverage_by_symbol.get(symbol)
-        if current_leverage != cfg.leverage:
+        if current_leverage != leverage_used:
             try:
-                client.change_leverage(symbol=symbol, leverage=cfg.leverage)
-                state.current_leverage_by_symbol[symbol] = cfg.leverage
-            except ClientError:
+                client.change_leverage(symbol=symbol, leverage=int(leverage_used))
+                state.current_leverage_by_symbol[symbol] = leverage_used
+            except ClientError as exc:
                 log_event(cfg.log_path, {
                     "event": "leverage_change_error",
                     "symbol": symbol,
-                    "leverage": cfg.leverage,
+                    "leverage": leverage_used,
+                    "base_leverage": cfg.leverage,
+                    "max_leverage": max_leverage,
+                    "error": str(exc),
                 })
                 return False
         
         # Calculate quantity
-        qty_str = compute_position_qty(limit_price, cfg.margin_usd, cfg.leverage, filters["step_size"])
+        qty_str = compute_position_qty(limit_price, margin_usd_used, leverage_used, filters["step_size"])
         try:
             qty_num = float(qty_str)
         except (TypeError, ValueError):
@@ -5888,6 +6036,8 @@ def run_live(cfg: LiveConfig) -> None:
                 "event": "skip_qty",
                 "symbol": symbol,
                 "quantity": qty_str,
+                "margin_usd": format_float_2(margin_usd_used),
+                "leverage": leverage_used,
             })
             return False
         
@@ -5916,6 +6066,8 @@ def run_live(cfg: LiveConfig) -> None:
                 pending_atr=signal_atr,
                 pending_side=1 if side == "BUY" else -1,
                 entry_close_ms=close_time_ms,
+                entry_margin_usd=margin_usd_used,
+                entry_leverage=leverage_used,
                 trade_id=trade_id,
                 signal_reason=signal_reason,
             )
@@ -5929,8 +6081,12 @@ def run_live(cfg: LiveConfig) -> None:
                 "limit_price": limit_price_str,
                 "quantity": qty_str,
                 "signal_atr": format_float_2(signal_atr),
-                "margin_usd": format_float_2(cfg.margin_usd),
-                "leverage": cfg.leverage,
+                "margin_usd": format_float_2(margin_usd_used),
+                "leverage": leverage_used,
+                "target_notional": format_float_2(target_notional),
+                "base_margin_usd": format_float_2(cfg.margin_usd),
+                "base_leverage": cfg.leverage,
+                "max_leverage": max_leverage,
             })
             return True
         return False
@@ -6000,8 +6156,8 @@ def run_live(cfg: LiveConfig) -> None:
                             trail_stop_r=cfg.trail_initial_stop_r,  # Initial stop R level from config
                             entry_time_iso=_utc_now_iso(),
                             entry_close_ms=pending.entry_close_ms,
-                            entry_margin_usd=cfg.margin_usd,
-                            entry_leverage=cfg.leverage,
+                            entry_margin_usd=pending.entry_margin_usd or cfg.margin_usd,
+                            entry_leverage=pending.entry_leverage or cfg.leverage,
                             trade_id=pending.trade_id,
                             signal_reason=pending.signal_reason,
                         )
@@ -6025,18 +6181,6 @@ def run_live(cfg: LiveConfig) -> None:
                         "event": "entry_order_inactive",
                         "symbol": symbol,
                         "status": status,
-                    })
-                    del state.pending_entries[symbol]
-                
-                elif time.time() - pending.order_time > cfg.entry_order_timeout_seconds:
-                    # Timeout - cancel order
-                    try:
-                        client.cancel_order(symbol=symbol, orderId=pending.order_id)
-                    except ClientError:
-                        pass
-                    log_event(cfg.log_path, {
-                        "event": "entry_order_timeout",
-                        "symbol": symbol,
                     })
                     del state.pending_entries[symbol]
             
@@ -6076,6 +6220,10 @@ def run_live(cfg: LiveConfig) -> None:
                     logging.warning("Entry signal scan failed: %s", exc)
                     signal_results = {}
 
+            exchange_open_symbols: set[str] = set()
+            if signal_results:
+                exchange_open_symbols = get_open_position_symbols()
+
             for symbol in eligible_symbols:
                 signal_result = signal_results.get(symbol)
                 if signal_result is None:
@@ -6101,12 +6249,12 @@ def run_live(cfg: LiveConfig) -> None:
                 # Determine signal status
                 if state.has_position(symbol):
                     status = "SKIPPED_HAS_POS"
+                elif symbol in exchange_open_symbols:
+                    status = "SKIPPED_OPEN_POSITION"
                 elif state.has_pending_entry(symbol):
                     status = "SKIPPED_PENDING"
                 elif not state.can_open_position(cfg.max_open_positions):
                     status = "SKIPPED_MAX_POS"
-                elif not is_within_entry_window(cfg.entry_window_minutes):
-                    status = "SKIPPED_OUTSIDE_WINDOW"
                 else:
                     status = "ACTED"
                 
@@ -6355,12 +6503,16 @@ def run_backtest(
     cfg = BacktestConfig()
     signal_interval = cfg.signal_interval
     market_label = "Futures (Perpetual)" if market == "futures" else "Spot"
+    leverage_limits_by_symbol: Dict[str, Dict[str, float]] = {}
+    exchange_symbols: List[str] = []
+    if market == "futures":
+        exchange_symbols, leverage_limits_by_symbol = get_usdt_perpetuals_public_with_leverage()
     
     # Determine symbols to backtest
     if all_symbols:
         print("=" * 60)
         print("Fetching all USDT perpetual symbols...")
-        symbols = get_all_usdt_perpetuals_public()
+        symbols = exchange_symbols or get_all_usdt_perpetuals_public()
         if not symbols:
             print("ERROR: Could not fetch symbol list.")
             return
@@ -6405,6 +6557,7 @@ def run_backtest(
     def process_symbol(sym: str) -> Tuple[str, pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame, Dict[str, Any], Optional[str]]:
         """Process a single symbol and return results."""
         try:
+            cfg_symbol = adjust_backtest_config_for_symbol(cfg, leverage_limits_by_symbol.get(sym))
             trades, stats, signals, trailing, swing_levels = run_backtest_single(
                 symbol=sym,
                 start_date=start_date,
@@ -6412,7 +6565,7 @@ def run_backtest(
                 use_lib=use_lib,
                 force_refetch=force_refetch,
                 market=market,
-                cfg=cfg,
+                cfg=cfg_symbol,
                 verbose=False,  # Disable verbose for concurrent mode
             )
             return sym, trades, stats, signals, trailing, swing_levels, None
@@ -6466,6 +6619,7 @@ def run_backtest(
         for i, sym in enumerate(symbols, 1):
             print(f"\n[{i}/{len(symbols)}] {sym}")
             try:
+                cfg_symbol = adjust_backtest_config_for_symbol(cfg, leverage_limits_by_symbol.get(sym))
                 trades, stats, signals, trailing, swing_levels = run_backtest_single(
                     symbol=sym,
                     start_date=start_date,
@@ -6473,7 +6627,7 @@ def run_backtest(
                     use_lib=use_lib,
                     force_refetch=force_refetch,
                     market=market,
-                    cfg=cfg,
+                    cfg=cfg_symbol,
                     verbose=True,
                 )
                 if swing_levels:
