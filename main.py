@@ -6344,6 +6344,69 @@ def run_live(cfg: LiveConfig) -> None:
         side_sign = pos_state.entry_side
         signal_atr = pos_state.trail_r_value  # signal_atr is stored in trail_r_value
         
+        # --- Special handling for FADE positions (bos_long_fade) ---
+        # Fade positions have fixed TP/SL, not trailing stops
+        if pos_state.is_fade and pos_state.fade_tp_price is not None:
+            tick_size = filters.get("tick_size", 0.00000001)
+            
+            # Check if TP is hit
+            fade_tp_hit = False
+            if side_sign == -1:  # SHORT fade
+                # TP hit when price drops to or below TP level
+                fade_tp_hit = low_price <= pos_state.fade_tp_price
+            else:  # LONG fade (not currently used)
+                fade_tp_hit = high_price >= pos_state.fade_tp_price
+            
+            if fade_tp_hit:
+                log_event(cfg.log_path, {
+                    "event": "fade_tp_hit",
+                    "symbol": symbol,
+                    "side": "SHORT" if side_sign == -1 else "LONG",
+                    "fade_tp_price": format_price_for_logging(pos_state.fade_tp_price, tick_size),
+                    "candle_low": format_price_for_logging(low_price, tick_size),
+                    "candle_high": format_price_for_logging(high_price, tick_size),
+                })
+                
+                # Cancel the SL algo order before closing
+                if pos_state.sl_algo_id:
+                    cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
+                
+                # Close position via market order
+                try:
+                    pos_info = get_position_info(client, symbol)
+                    position_amt = float(pos_info.get("positionAmt", 0.0) or 0.0)
+                except Exception:
+                    position_amt = 0.0
+                
+                if position_amt != 0.0:
+                    close_side = "BUY" if side_sign == -1 else "SELL"
+                    close_qty = abs(position_amt)
+                    close_qty_str = format_to_step(close_qty, filters["step_size"])
+                    
+                    try:
+                        close_order = client.new_order(
+                            symbol=symbol,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=close_qty_str,
+                            reduceOnly="true",
+                        )
+                        log_event(cfg.log_path, {
+                            "event": "fade_tp_close_order",
+                            "symbol": symbol,
+                            "side": close_side,
+                            "quantity": close_qty_str,
+                            "order_id": close_order.get("orderId"),
+                        })
+                    except ClientError as exc:
+                        logging.warning("Fade TP close order failed. symbol=%s error=%s", symbol, exc)
+                
+                # Handle position exit (this will create the main LONG position if fade_tp_hit)
+                handle_position_exit(symbol, pos_state, _utc_now_iso())
+            
+            # Fade positions don't use normal trailing logic - return early
+            return
+        
         if signal_atr <= 0:
             return
         
@@ -6948,6 +7011,47 @@ def run_live(cfg: LiveConfig) -> None:
                             "quantity": format_float_2(qty),
                             "r_value": format_price_for_logging(r_value, entry_tick_size),
                         })
+                        
+                        # For fade positions, immediately place the fixed SL order
+                        if pos_state.is_fade and pos_state.fade_sl_price is not None:
+                            fade_sl_str = format_to_step(pos_state.fade_sl_price, filters["tick_size"])
+                            qty_str = format_to_step(qty, filters["step_size"])
+                            fade_sl_side = "BUY" if side == -1 else "SELL"  # Opposite of position
+                            fade_sl_client_id = f"ATR_FADE_SL_{int(time.time() * 1000)}"
+                            
+                            fade_sl_order = algo_stop_limit_order(
+                                symbol=symbol,
+                                side=fade_sl_side,
+                                quantity=qty_str,
+                                trigger_price=fade_sl_str,
+                                price=None,
+                                client=client,
+                                client_order_id=fade_sl_client_id,
+                                algo_type=cfg.algo_type,
+                                working_type=cfg.algo_working_type,
+                                price_protect=cfg.algo_price_protect,
+                                reduce_only=True,
+                                order_type="STOP_MARKET",
+                            )
+                            
+                            if fade_sl_order:
+                                pos_state.sl_algo_id = _extract_int(fade_sl_order, ("algoId", "algoOrderId", "orderId", "id"))
+                                pos_state.sl_algo_client_order_id = fade_sl_client_id
+                                pos_state.sl_price = pos_state.fade_sl_price
+                                log_event(cfg.log_path, {
+                                    "event": "fade_sl_placed",
+                                    "symbol": symbol,
+                                    "fade_sl_price": format_price_for_logging(pos_state.fade_sl_price, entry_tick_size),
+                                    "fade_tp_price": format_price_for_logging(pos_state.fade_tp_price, entry_tick_size) if pos_state.fade_tp_price else None,
+                                    "sl_algo_id": pos_state.sl_algo_id,
+                                })
+                            else:
+                                log_event(cfg.log_path, {
+                                    "event": "fade_sl_place_failed",
+                                    "symbol": symbol,
+                                    "fade_sl_price": format_price_for_logging(pos_state.fade_sl_price, entry_tick_size),
+                                    "error": "Algo STOP order failed (see logs)",
+                                })
                     
                     del state.pending_entries[symbol]
                 
