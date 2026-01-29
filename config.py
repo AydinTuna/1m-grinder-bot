@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.5.3"
+STRATEGY_VERSION: str = "1.6.4"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "BOS long fade trade: SHORT first, TP at configurable % of body, then flip to LONG"
+STRATEGY_VERSION_NOTE: str = "Version bump to 1.6.4 (no signal logic changes)"
 
 
 # =============================================================================
@@ -339,15 +339,15 @@ class BacktestConfig:
 
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
-    trailing_mode: str = "dynamic_atr"  # "r_ladder" (current) or "dynamic_atr" (new)
-    trail_initial_stop_r: int = -2  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
-    trail_gap_r: float = 1.25
+    trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trail_initial_stop_r: int = -1  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
+    trail_gap_r: float = 1.00
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 0.75  # ATR multiplier for dynamic trailing
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
     trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
-    trail_exit_check_interval: str = "4h"  # interval for exit check (only exit on 4h candle close)
+    trail_exit_check_interval: str = "1m"  # interval for exit check (only exit on 4h candle close)
     forced_exit_interval: str = "1d"  # boundary used to count forced-close intervals
     forced_exit_interval_count: int = 3  # close after surviving this many forced intervals
 
@@ -381,7 +381,7 @@ class LiveConfig:
 
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
-    trailing_mode: str = "dynamic_atr"  # "r_ladder" (current) or "dynamic_atr" (new)
+    trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_initial_stop_r: int = -1  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
     trail_gap_r: float = 1.25
     trail_buffer_r: float = 0.10

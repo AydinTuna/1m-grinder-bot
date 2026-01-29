@@ -770,9 +770,9 @@ def build_market_structure_signals(
     
     BREAK OF STRUCTURE (BOS) SIGNALS:
     - In uptrend, if price closes below recent HL → SHORT (BOS)
-    - In downtrend, if price closes above recent LH → LONG (BOS) with fade trade first
+    - In downtrend, if price closes above recent LH → BOS LONG fade setup (SHORT first)
     
-    BOS_LONG FADE TRADE:
+    BOS_LONG_FADE TRADE:
     - Market SELL (SHORT) at signal candle close
     - TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
     - SL at close + 1 ATR (cancels trade if hit)
@@ -949,11 +949,6 @@ def build_market_structure_signals(
     entry_price[ll_breakdown_short] = mid_body[ll_breakdown_short]
     signal_reason[ll_breakdown_short] = "ll_breakdown_short"
 
-    # 3. Near LL in downtrend + green big body closing below LH → SHORT
-    ll_green_below_lh_short = in_downtrend & near_ll & big_body & is_green & last_lh.notna() & (df["close"] < last_lh)
-    signal[ll_green_below_lh_short] = -1
-    signal_reason[ll_green_below_lh_short] = "ll_green_below_lh_short"
-
     # =========================================================================
     # BREAK OF STRUCTURE (BOS) SIGNALS
     # =========================================================================
@@ -963,42 +958,23 @@ def build_market_structure_signals(
     signal[bos_short] = 1
     signal_reason[bos_short] = "bos_short"
 
-    # BOS Long: In downtrend, price closes above recent LH with big green body
+    # BOS Long Fade: In downtrend, price closes above recent LH with big green body
     # This signal uses a FADE TRADE: SHORT first, then flip to LONG on TP
-    bos_long = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
-    signal[bos_long] = 1  # Final direction is LONG (after fade)
-    signal_reason[bos_long] = "bos_long"
-    
-    # Fade trade setup for bos_long:
+    bos_long_fade = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
+    signal[bos_long_fade] = -1  # Fade position is SHORT
+    signal_reason[bos_long_fade] = "bos_long_fade"
+
+    # Fade trade setup for bos_long_fade:
     # 1. Market SELL (SHORT) at close
     # 2. TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
     # 3. SL at close + 1 ATR (cancels trade if hit)
     # 4. On TP hit → entry_price becomes the LONG entry point
     fade_tp_price = df["close"] - (df["close"] - df["open"]).abs() * fade_tp_body_pct
-    signal_fade_direction[bos_long] = -1  # SHORT fade first
-    signal_fade_entry[bos_long] = df["close"]  # Market entry at close
-    signal_fade_tp[bos_long] = fade_tp_price  # TP for SHORT fade
-    signal_fade_sl[bos_long] = df["close"] + atr  # SL at close + 1 ATR
-    entry_price[bos_long] = fade_tp_price  # LONG entry at fade TP price
-
-    # =========================================================================
-    # MOMENTUM SIGNALS (no clear structure nearby)
-    # =========================================================================
-    no_structure_nearby = ~(near_hh | near_hl | near_ll | near_lh)
-    
-    # In uptrend, momentum long on big green candle
-    momentum_long = in_uptrend & no_structure_nearby & big_body & is_green
-    signal[momentum_long] = signal[momentum_long].where(signal[momentum_long] != 0, 1)
-    signal_reason[momentum_long] = signal_reason[momentum_long].where(
-        signal_reason[momentum_long] != "", "momentum_uptrend_long"
-    )
-
-    # In downtrend, momentum short on big red candle
-    momentum_short = in_downtrend & no_structure_nearby & big_body & is_red
-    signal[momentum_short] = signal[momentum_short].where(signal[momentum_short] != 0, -1)
-    signal_reason[momentum_short] = signal_reason[momentum_short].where(
-        signal_reason[momentum_short] != "", "momentum_downtrend_short"
-    )
+    signal_fade_direction[bos_long_fade] = -1  # SHORT fade first
+    signal_fade_entry[bos_long_fade] = df["close"]  # Market entry at close
+    signal_fade_tp[bos_long_fade] = fade_tp_price  # TP for SHORT fade
+    signal_fade_sl[bos_long_fade] = df["close"] + atr  # SL at close + 1 ATR
+    entry_price[bos_long_fade] = fade_tp_price  # LONG entry at fade TP price
 
     # Set signal ATR for active signals
     active = signal != 0
