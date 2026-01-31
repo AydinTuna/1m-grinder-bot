@@ -1663,7 +1663,7 @@ def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
     api_secret = getenv("BINANCE_API_SECRET")
     base_url = "https://fapi.binance.com"
     if cfg.use_testnet:
-        base_url = "https://testnet.binancefuture.com"
+        base_url = "https://demo-fapi.binance.com"
         api_key = getenv("BINANCE_TESTNET_API_KEY") or api_key
         api_secret = getenv("BINANCE_TESTNET_API_SECRET") or api_secret
     if not api_key or not api_secret:
