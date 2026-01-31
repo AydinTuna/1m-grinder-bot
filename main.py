@@ -1661,11 +1661,13 @@ def get_um_futures_client(cfg: LiveConfig) -> BinanceUMFuturesREST:
         load_dotenv()
     api_key = getenv("BINANCE_API_KEY")
     api_secret = getenv("BINANCE_API_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError("Missing BINANCE_API_KEY/BINANCE_API_SECRET in environment.")
     base_url = "https://fapi.binance.com"
     if cfg.use_testnet:
         base_url = "https://testnet.binancefuture.com"
+        api_key = getenv("BINANCE_TESTNET_API_KEY") or api_key
+        api_secret = getenv("BINANCE_TESTNET_API_SECRET") or api_secret
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing BINANCE_API_KEY/BINANCE_API_SECRET in environment.")
     ca_bundle_path = getenv("BINANCE_CA_BUNDLE") or getenv("SSL_CERT_FILE") or getenv("REQUESTS_CA_BUNDLE")
     ssl_verify_env = (getenv("BINANCE_SSL_VERIFY") or "").strip().lower()
     ssl_verify = True

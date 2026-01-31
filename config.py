@@ -330,8 +330,8 @@ class BacktestConfig:
     slippage: float = 0.0000    # price impact fraction applied on entry/exit
 
     # Strategy thresholds
-    thr1: float = 2.5
-    thr2: float = 2.5
+    thr1: float = 2.0
+    thr2: float = 2.0
     
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
@@ -364,17 +364,17 @@ class LiveConfig:
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
     leverage: int = 10  # fixed leverage for static sizing
-    margin_usd: float = 5.0  # static margin per trade
+    margin_usd: float = 100.0  # static margin per trade
 
     # Strategy thresholds
-    thr1: float = 2.5
-    thr2: float = 2.5
+    thr1: float = 2.0
+    thr2: float = 2.0
     
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
     trail_initial_stop_r: int = -1  # Initial stop R level (-1 = no stop until price reaches trail_gap_r profit)
-    trail_gap_r: float = 1.25
+    trail_gap_r: float = 1.00
     trail_buffer_r: float = 0.10
     dynamic_trail_atr_mult: float = 0.75  # ATR multiplier for dynamic trailing
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
@@ -402,4 +402,4 @@ class LiveConfig:
     live_trailing_stop_updates_file: str = str(get_live_trailing_stop_updates_path())
     live_trailing_stop_realtime_file: str = str(get_live_trailing_stop_realtime_path())
     post_only: bool = True
-    use_testnet: bool = False
+    use_testnet: bool = True
