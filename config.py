@@ -321,7 +321,7 @@ class BacktestConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
-    leverage: float = 20.0  # fixed leverage for static sizing
+    leverage: float = 10.0  # fixed leverage for static sizing
     initial_capital: float = 5.0  # starting equity (margin cap per trade)
     margin_usd: float = 5.0  # static margin per trade
 
@@ -330,13 +330,9 @@ class BacktestConfig:
     slippage: float = 0.0000    # price impact fraction applied on entry/exit
 
     # Strategy thresholds
-    thr1: float = 2.0
-    thr2: float = 2.0
+    thr1: float = 2.5
+    thr2: float = 2.5
     
-    # BOS Long fade trade settings
-    # When bos_long signal fires, SHORT first then flip to LONG on TP
-    fade_tp_body_pct: float = 0.6  # TP at this % of candle body below close (0.6 = 60%)
-
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
@@ -346,8 +342,6 @@ class BacktestConfig:
     dynamic_trail_atr_mult: float = 0.75  # ATR multiplier for dynamic trailing
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
-    trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
-    trail_exit_check_interval: str = "1m"  # interval for exit check (only exit on 4h candle close)
     forced_exit_interval: str = "1d"  # boundary used to count forced-close intervals
     forced_exit_interval_count: int = 3  # close after surviving this many forced intervals
 
@@ -358,7 +352,7 @@ class BacktestConfig:
 @dataclass
 class LiveConfig:
     # Timeframe for signal generation (ATR calculation, entry signals)
-    # Use "1d" for daily strategy. Trailing stop uses trail_check_interval.
+    # Use "1d" for daily strategy.
     signal_interval: str = "1d"
     atr_len: int = 14
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
@@ -369,16 +363,13 @@ class LiveConfig:
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
-    leverage: int = 20  # fixed leverage for static sizing
+    leverage: int = 10  # fixed leverage for static sizing
     margin_usd: float = 5.0  # static margin per trade
 
     # Strategy thresholds
-    thr1: float = 2.0
-    thr2: float = 2.0
+    thr1: float = 2.5
+    thr2: float = 2.5
     
-    # BOS Long fade trade settings
-    fade_tp_body_pct: float = 0.6  # TP at this % of candle body below close (0.6 = 60%)
-
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
@@ -388,8 +379,6 @@ class LiveConfig:
     dynamic_trail_atr_mult: float = 0.75  # ATR multiplier for dynamic trailing
     dynamic_trail_activation_r: float = 0.5  # R threshold before placing stop (0=immediate, 1=wait for 1R move)
     dynamic_trail_price_source: str = "high_low"  # "close" or "high_low" (high for LONG, low for SHORT)
-    trail_check_interval: str = "4h"  # interval for trailing stop updates (use 4h high/low)
-    trail_exit_check_interval: str = "4h"  # interval for exit check (exit immediately on 1m close when stop hit)
 
     # Multi-position settings
     max_open_positions: int = 0  # max concurrent positions (<= 0 means unlimited)

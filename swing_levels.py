@@ -579,12 +579,12 @@ def build_swing_atr_signals(
     If price is at/near swing high:
       1) Red candle body >= body_atr_mult*ATR => SHORT
       2) Green candle body >= body_atr_mult*ATR and close < swing high => SHORT
-      3) Green candle body >= body_atr_mult*ATR and close >= swing high => LONG (limit at mid-body)
+      3) Green candle body >= body_atr_mult*ATR and close >= swing high => LONG (market at close)
 
     If price is at/near swing low:
       1) Green candle body >= body_atr_mult*ATR => LONG
       2) Red candle body >= body_atr_mult*ATR and close > swing low => LONG
-      3) Red candle body >= body_atr_mult*ATR and close <= swing low => SHORT (limit at mid-body)
+      3) Red candle body >= body_atr_mult*ATR and close <= swing low => SHORT (market at close)
 
     Otherwise:
       - If candle body >= body_atr_mult*ATR => enter in same direction as candle
@@ -597,7 +597,7 @@ def build_swing_atr_signals(
     Returns:
       signal_dir: +1 long, -1 short, 0 none
       signal_atr: ATR on the signal candle (NaN if none)
-      entry_price: NaN for market-on-next-bar, otherwise limit entry price
+      entry_price: NaN for market-on-next-bar, otherwise entry price at signal close
       signal_reason: string describing why signal was generated (empty if no signal)
     """
     if df.empty:
@@ -654,8 +654,6 @@ def build_swing_atr_signals(
     entry_price = pd.Series(np.nan, index=df.index, dtype=float)
     signal_reason = pd.Series("", index=df.index, dtype=str)
 
-    mid_body = (df["open"] + df["close"]) / 2.0
-
     # Neither swing high nor swing low => same direction as candle (if big body)
     other = big_body & ~(near_high | near_low)
     signal[other] = candle_dir[other]
@@ -673,7 +671,7 @@ def build_swing_atr_signals(
 
     signal[short_red | short_failed] = -1
     signal[long_break] = 1
-    entry_price[long_break] = mid_body[long_break]
+    entry_price[long_break] = df["close"][long_break]
     # Set reasons for swing high signals
     signal_reason[short_red] = "swing_high_rejection_short"
     signal_reason[short_failed] = "swing_high_failed_breakout_short"
@@ -687,7 +685,7 @@ def build_swing_atr_signals(
 
     signal[long_green | long_failed] = 1
     signal[short_break] = -1
-    entry_price[short_break] = mid_body[short_break]
+    entry_price[short_break] = df["close"][short_break]
     # Set reasons for swing low signals
     signal_reason[long_green] = "swing_low_bounce_long"
     signal_reason[long_failed] = "swing_low_failed_breakdown_long"
@@ -745,7 +743,6 @@ def build_market_structure_signals(
     body_atr_mult: float = 2.0,
     structure_proximity_atr_mult: float = 0.5,
     tolerance_pct: float = 0.0,
-    fade_tp_body_pct: float = 0.6,
 ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """
     Generate trading signals based on market structure (HH/HL/LL/LH).
@@ -774,20 +771,20 @@ def build_market_structure_signals(
     
     BOS_LONG_FADE TRADE:
     - Market SELL (SHORT) at signal candle close
-    - TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
     - SL at close + 1 ATR (cancels trade if hit)
-    - On TP hit → Market BUY (LONG) at TP price, with normal trailing stop
+    - Exit uses trailing stop (classic trailing top)
+    - No long flip after exit
     
     Returns:
         signal_dir: +1 long, -1 short, 0 none
         signal_atr: ATR on the signal candle (NaN if none)
-        entry_price: NaN for market-on-next-bar, otherwise limit entry price
+        entry_price: NaN for market-on-next-bar, otherwise entry price at signal close
         signal_reason: string describing why signal was generated
         trend: +1 uptrend, -1 downtrend, 0 undefined
         signal_fade_direction: -1 for SHORT fade before main signal, 0 for no fade
         signal_fade_entry: Entry price for fade position (market at close)
-        signal_fade_tp: TP price for fade position
-        signal_fade_sl: SL price for fade position
+        signal_fade_tp: reserved (no fixed TP; NaN)
+        signal_fade_sl: reserved (no fixed SL; NaN)
     """
     if df.empty:
         empty_i = pd.Series(0, index=df.index, dtype=int)
@@ -836,8 +833,6 @@ def build_market_structure_signals(
     if tol > 0.0:
         target = target * (1.0 - tol)
     big_body = body >= target
-
-    mid_body = (df["open"] + df["close"]) / 2.0
 
     # Build structure level series (forward-filled from pivot time)
     # We need: last HH, last HL, last LL, last LH levels at each bar
@@ -925,7 +920,7 @@ def build_market_structure_signals(
     # 2. Near HH in uptrend + green big body + close > HH → SHORT (fade breakout)
     hh_breakout_long = in_uptrend & near_hh & big_body & is_green & (df["close"] > last_hh)
     signal[hh_breakout_long] = 1
-    entry_price[hh_breakout_long] = mid_body[hh_breakout_long]
+    entry_price[hh_breakout_long] = df["close"][hh_breakout_long]
     signal_reason[hh_breakout_long] = "hh_breakout_long"
 
     # 3. Near HH in uptrend + red big body closing above HL → LONG
@@ -946,7 +941,7 @@ def build_market_structure_signals(
     # 2. Near LL in downtrend + red big body + close < LL → LONG (fade breakdown)
     ll_breakdown_short = in_downtrend & near_ll & big_body & is_red & (df["close"] < last_ll)
     signal[ll_breakdown_short] = 1
-    entry_price[ll_breakdown_short] = mid_body[ll_breakdown_short]
+    entry_price[ll_breakdown_short] = df["close"][ll_breakdown_short]
     signal_reason[ll_breakdown_short] = "ll_breakdown_short"
 
     # =========================================================================
@@ -966,15 +961,9 @@ def build_market_structure_signals(
 
     # Fade trade setup for bos_long_fade:
     # 1. Market SELL (SHORT) at close
-    # 2. TP at close - abs(close - open) * fade_tp_body_pct (configurable % of body below close)
-    # 3. SL at close + 1 ATR (cancels trade if hit)
-    # 4. On TP hit → entry_price becomes the LONG entry point
-    fade_tp_price = df["close"] - (df["close"] - df["open"]).abs() * fade_tp_body_pct
+    # 3. No fixed SL; trailing stop manages exit
     signal_fade_direction[bos_long_fade] = -1  # SHORT fade first
     signal_fade_entry[bos_long_fade] = df["close"]  # Market entry at close
-    signal_fade_tp[bos_long_fade] = fade_tp_price  # TP for SHORT fade
-    signal_fade_sl[bos_long_fade] = df["close"] + atr  # SL at close + 1 ATR
-    entry_price[bos_long_fade] = fade_tp_price  # LONG entry at fade TP price
 
     # Set signal ATR for active signals
     active = signal != 0
