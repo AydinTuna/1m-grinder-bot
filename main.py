@@ -508,28 +508,16 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             margin_cap=cfg.initial_capital,
             max_leverage=cfg.leverage,
             min_leverage=cfg.leverage,
-            target_loss_usd=None,
+            target_loss_usd=cfg.target_loss_usd,
         )
         if trade_margin is None or trade_leverage is None:
             return None
 
-        if cfg.use_trailing_stop:
-            target_price = None
-            trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
-            trail_best_close_r = 0.0
-            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
-            stop_price = None  # No stop until price reaches breakeven
-        else:
-            target_price, stop_price = compute_tp_sl_prices(
-                entry_price,
-                side,
-                signal_atr_value,
-                2.0,  # tp_atr_mult (not used with trailing)
-                1.0,  # sl_atr_mult
-            )
-            trail_r_value = None
-            trail_best_close_r = None
-            trail_stop_r = None
+        target_price = None
+        entry_atr = float(signal_atr_value)
+        stop_price = compute_sl_price(entry_price, side, entry_atr, sl_atr_mult=1.0)
+        trail_best_move_atr = 0.0
+        next_scale_atr = 1.0
 
         trade_counter += 1
         side_str = "LONG" if side == 1 else "SHORT"
@@ -540,9 +528,11 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
             "entry_price": entry_price,
             "target_price": target_price,
             "stop_price": stop_price,
-            "trail_r_value": trail_r_value,
-            "trail_best_close_r": trail_best_close_r,
-            "trail_stop_r": trail_stop_r,
+            "entry_atr": entry_atr,
+            "base_entry_price": entry_price,
+            "trail_best_move_atr": trail_best_move_atr,
+            "next_scale_atr": next_scale_atr,
+            "scale_increment_usd": float(cfg.target_loss_usd or 0.0),
             "entry_time": entry_time,
             "entry_index": entry_index,
             "used_signal_atr": signal_atr_value,
@@ -568,49 +558,71 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         l = float(df.at[t, "low"])
         c = float(df.at[t, "close"])
 
-        # --- EXIT logic ---
-        # Exit only on candle CLOSE (not intra-candle high/low) for consistency
-        # with higher timeframe close exit behavior
+        # --- EXIT logic (new ATR-based SL + trailing) ---
+        # Exit only on candle CLOSE (not intra-candle high/low)
         for pos in list(positions):
             position = pos["position"]
             entry_price = pos["entry_price"]
-            stop_price = pos["stop_price"]
-            target_price = pos["target_price"]
-
-            if entry_price is None or stop_price is None:
+            entry_atr = pos.get("entry_atr", 0.0)
+            base_entry_price = pos.get("base_entry_price", entry_price)
+            if entry_price is None or entry_atr <= 0:
                 continue
 
-            sl_hit = (c <= stop_price) if position == 1 else (c >= stop_price)
+            prev_stop_price = pos.get("stop_price")
+            side_str = "LONG" if position == 1 else "SHORT"
 
-            exited = False
-            exit_reason = None
-            exit_price = None
+            # Scale in: add margin every +1 ATR in favor, starting at +1 ATR
+            move_atr_for_scale = compute_move_atr(base_entry_price, c, position, entry_atr)
+            while move_atr_for_scale is not None and move_atr_for_scale >= pos.get("next_scale_atr", 1.0):
+                add_margin = float(pos.get("scale_increment_usd") or 0.0)
+                if add_margin > 0:
+                    add_notional = add_margin * pos["active_leverage"]
+                    pos["entry_price"] = compute_weighted_entry_price(
+                        pos["entry_price"], pos["active_notional"], c, add_notional
+                    )
+                    pos["active_margin"] += add_margin
+                    pos["active_notional"] += add_notional
+                pos["next_scale_atr"] = pos.get("next_scale_atr", 1.0) + 1.0
+                move_atr_for_scale = compute_move_atr(base_entry_price, c, position, entry_atr)
 
-            if cfg.use_trailing_stop:
-                if sl_hit:
-                    exit_reason = "SL"
-                    exit_price = apply_slippage(c, position, is_entry=False)
-                    exited = True
+            # Update trailing stop state
+            move_atr_current = compute_move_atr(pos["entry_price"], c, position, entry_atr)
+            if move_atr_current is not None:
+                pos["trail_best_move_atr"] = max(pos.get("trail_best_move_atr", 0.0), move_atr_current)
+
+            initial_sl = compute_sl_price(pos["entry_price"], position, entry_atr, sl_atr_mult=1.0)
+            trailing_sl = compute_trailing_stop_atr(
+                pos["entry_price"],
+                position,
+                entry_atr,
+                pos.get("trail_best_move_atr", 0.0),
+                gap_atr=1.0,
+                start_atr=3.0,
+            )
+            if trailing_sl is None:
+                effective_stop = initial_sl
             else:
-                if target_price is not None:
-                    tp_hit = (c >= target_price) if position == 1 else (c <= target_price)
-                else:
-                    tp_hit = False
+                effective_stop = max(initial_sl, trailing_sl) if position == 1 else min(initial_sl, trailing_sl)
+            pos["stop_price"] = effective_stop
 
-                if sl_hit and tp_hit:
-                    exit_reason = "SL"
-                    exit_price = apply_slippage(c, position, is_entry=False)
-                    exited = True
-                elif tp_hit:
-                    exit_reason = "TP"
-                    exit_price = apply_slippage(c, position, is_entry=False)
-                    exited = True
-                elif sl_hit:
-                    exit_reason = "SL"
-                    exit_price = apply_slippage(c, position, is_entry=False)
-                    exited = True
+            if prev_stop_price is None or effective_stop != prev_stop_price:
+                trailing_stop_updates.append({
+                    "timestamp": t,
+                    "entry_time": pos["entry_time"],
+                    "side": side_str,
+                    "entry_price": pos["entry_price"],
+                    "close_price": c,
+                    "prev_stop_price": prev_stop_price,
+                    "new_stop_price": effective_stop,
+                    "best_move_atr": pos.get("trail_best_move_atr", 0.0),
+                    "trailing_mode": "atr_gap",
+                    "stop_moved": True,
+                })
 
-            if exited:
+            entry_price = pos["entry_price"]
+            sl_hit = (c <= pos["stop_price"]) if position == 1 else (c >= pos["stop_price"])
+            if sl_hit:
+                exit_price = apply_slippage(c, position, is_entry=False)
                 roi_net = net_roi_from_prices(entry_price, exit_price, position, pos["active_leverage"])
                 pnl_net = roi_net * pos["active_margin"]
                 equity += pnl_net
@@ -622,8 +634,8 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "signal_atr": pos["used_signal_atr"],
-                    "stop_price": stop_price,
-                    "exit_reason": exit_reason,
+                    "stop_price": pos["stop_price"],
+                    "exit_reason": "SL",
                     "roi_net": roi_net,
                     "pnl_net": pnl_net,
                     "margin_used": pos["active_margin"],
@@ -636,141 +648,6 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
                 })
 
                 positions.remove(pos)
-
-        # --- Trailing stop update (candle close) ---
-        # Note: stop_price may be None initially (no stop until breakeven)
-        if cfg.use_trailing_stop:
-            for pos in positions:
-                position = pos["position"]
-                entry_price = pos["entry_price"]
-                if entry_price is None:
-                    continue
-
-                c = float(df.at[t, "close"])
-                h = float(df.at[t, "high"])
-                l = float(df.at[t, "low"])
-                side_str = "LONG" if position == 1 else "SHORT"
-                prev_stop_price = pos["stop_price"]
-
-                if cfg.trailing_mode == "dynamic_atr":
-                    signal_atr_for_trail = (
-                        pos["trail_r_value"] if pos["trail_r_value"] is not None else float(df.at[t, "atr"])
-                    )
-
-                    if cfg.dynamic_trail_price_source == "high_low":
-                        trail_price = h if position == 1 else l
-                    else:
-                        trail_price = c
-                    atr_stop = compute_dynamic_atr_stop(
-                        trail_price, signal_atr_for_trail, cfg.dynamic_trail_atr_mult, position
-                    )
-
-                    new_stop = atr_stop
-
-                    activation_threshold = signal_atr_for_trail * cfg.dynamic_trail_activation_r
-                    if position == 1:
-                        price_moved_enough = c >= entry_price + activation_threshold
-                        should_set_stop = price_moved_enough
-                    else:
-                        price_moved_enough = c <= entry_price - activation_threshold
-                        should_set_stop = price_moved_enough
-
-                    stop_moved = should_set_stop and (
-                        pos["stop_price"] is None or new_stop != pos["stop_price"]
-                    )
-                    if stop_moved:
-                        pos["stop_price"] = new_stop
-
-                    trailing_stop_updates.append({
-                        "timestamp": t,
-                        "entry_time": pos["entry_time"],
-                        "side": side_str,
-                        "entry_price": entry_price,
-                        "close_price": c,
-                        "trail_price": trail_price,
-                        "signal_atr": signal_atr_for_trail,
-                        "atr_stop": atr_stop,
-                        "prev_stop_price": prev_stop_price,
-                        "new_stop_price": pos["stop_price"],
-                        "trailing_mode": "dynamic_atr",
-                        "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
-                        "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
-                        "dynamic_trail_price_source": cfg.dynamic_trail_price_source,
-                        "price_moved_enough": price_moved_enough,
-                        "stop_moved": stop_moved,
-                    })
-
-                elif (
-                    cfg.trailing_mode == "r_ladder"
-                    and pos["trail_r_value"] is not None
-                    and pos["trail_best_close_r"] is not None
-                    and pos["trail_stop_r"] is not None
-                ):
-                    close_r = compute_close_r(entry_price, c, position, pos["trail_r_value"])
-                    if close_r is not None:
-                        prev_best_r = pos["trail_best_close_r"]
-                        prev_stop_r = pos["trail_stop_r"]
-
-                        pos["trail_best_close_r"] = max(pos["trail_best_close_r"], close_r)
-                        next_stop_r = compute_trailing_stop_r(
-                            pos["trail_best_close_r"], pos["trail_stop_r"], cfg.trail_gap_r
-                        )
-
-                        should_place_stop = (
-                            (pos["stop_price"] is None and next_stop_r >= 0) or
-                            (next_stop_r > pos["trail_stop_r"] and next_stop_r >= 0)
-                        )
-                        if should_place_stop:
-                            new_stop_price = compute_trailing_sl_price(
-                                entry_price,
-                                position,
-                                pos["trail_r_value"],
-                                next_stop_r,
-                                cfg.trail_buffer_r,
-                            )
-
-                            trailing_stop_updates.append({
-                                "timestamp": t,
-                                "entry_time": pos["entry_time"],
-                                "side": side_str,
-                                "entry_price": entry_price,
-                                "close_price": c,
-                                "close_r": close_r,
-                                "prev_best_r": prev_best_r,
-                                "new_best_r": pos["trail_best_close_r"],
-                                "prev_stop_r": prev_stop_r,
-                                "new_stop_r": next_stop_r,
-                                "prev_stop_price": prev_stop_price,
-                                "new_stop_price": new_stop_price,
-                                "r_value": pos["trail_r_value"],
-                                "trail_gap_r": cfg.trail_gap_r,
-                                "trail_buffer_r": cfg.trail_buffer_r,
-                                "trailing_mode": "r_ladder",
-                                "stop_moved": True,
-                            })
-
-                            pos["trail_stop_r"] = next_stop_r
-                            pos["stop_price"] = new_stop_price
-                        else:
-                            trailing_stop_updates.append({
-                                "timestamp": t,
-                                "entry_time": pos["entry_time"],
-                                "side": side_str,
-                                "entry_price": entry_price,
-                                "close_price": c,
-                                "close_r": close_r,
-                                "prev_best_r": pos["trail_best_close_r"],
-                                "new_best_r": pos["trail_best_close_r"],
-                                "prev_stop_r": pos["trail_stop_r"],
-                                "new_stop_r": pos["trail_stop_r"],
-                                "prev_stop_price": pos["stop_price"],
-                                "new_stop_price": pos["stop_price"],
-                                "r_value": pos["trail_r_value"],
-                                "trail_gap_r": cfg.trail_gap_r,
-                                "trail_buffer_r": cfg.trail_buffer_r,
-                                "trailing_mode": "r_ladder",
-                                "stop_moved": False,
-                            })
 
         # --- ENTRY logic (signal on prev candle; market-only) ---
 
@@ -1030,12 +907,14 @@ class PositionState:
     """Per-position state for a single symbol tracked by the strategy."""
     symbol: str
     entry_price: float
+    base_entry_price: float
     entry_side: int  # +1 long, -1 short
     entry_qty: float
     entry_atr: float  # ATR at entry (frozen for R-based trailing)
     trail_r_value: float  # R value = entry_atr (for trailing stop calculation)
-    trail_best_close_r: float = 0.0  # best close in R units
-    trail_stop_r: int = -1  # current trailing stop level in R (-1 = no stop until 1R profit)
+    trail_best_move_atr: float = 0.0  # best move in ATR units
+    next_scale_atr: float = 1.0  # next ATR level to scale in
+    scale_increment_usd: float = 20.0  # margin add per ATR step
     sl_algo_id: Optional[int] = None
     sl_algo_client_order_id: Optional[str] = None
     sl_price: Optional[float] = None
@@ -1043,6 +922,8 @@ class PositionState:
     entry_close_ms: int = 0
     entry_margin_usd: float = 0.0
     entry_leverage: float = 20.0
+    total_margin_usd: float = 0.0
+    total_notional_usd: float = 0.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this trade
     # Fade trade fields (for bos_long_fade)
@@ -1065,6 +946,7 @@ class PendingEntry:
     entry_close_ms: int
     entry_margin_usd: float = 0.0
     entry_leverage: float = 0.0
+    scale_increment_usd: float = 20.0
     trade_id: Optional[str] = None  # Unique trade ID for signal-trade linking
     signal_reason: Optional[str] = None  # Signal type that triggered this entry
     # Fade trade fields (for bos_long_fade)
@@ -1250,8 +1132,7 @@ def write_live_trailing_stop_snapshot(
         trailing_stop_r = None
         if pos_state.sl_price is not None:
             trailing_stop = format_price_optional(pos_state.sl_price, tick_size)
-            if trailing_mode == "r_ladder":
-                trailing_stop_r = pos_state.trail_stop_r
+            trailing_stop_r = format_float_2(pos_state.trail_best_move_atr)
         items.append({
             "symbol": symbol,
             "side": "LONG" if pos_state.entry_side == 1 else "SHORT",
@@ -4050,24 +3931,16 @@ def backtest_atr_grinder_lib(
             margin_cap=cfg.initial_capital,
             max_leverage=cfg.leverage,
             min_leverage=cfg.leverage,
-            target_loss_usd=None,
+            target_loss_usd=cfg.target_loss_usd,
         )
         if trade_margin is None or trade_leverage is None:
             return None
 
-        if cfg.use_trailing_stop:
-            target_price = None
-            trail_r_value = signal_atr_value * 1.0  # R = 1x ATR
-            trail_best_close_r = 0.0
-            trail_stop_r = cfg.trail_initial_stop_r  # Initial stop R level from config
-            stop_price = None  # No stop until price reaches breakeven
-        else:
-            target_price, stop_price = compute_tp_sl_prices(
-                entry_price, side, signal_atr_value, 2.0, 1.0
-            )
-            trail_r_value = None
-            trail_best_close_r = None
-            trail_stop_r = None
+        target_price = None
+        entry_atr = float(signal_atr_value)
+        stop_price = compute_sl_price(entry_price, side, entry_atr, sl_atr_mult=1.0)
+        trail_best_move_atr = 0.0
+        next_scale_atr = 1.0
 
         trade_counter += 1
         side_str = "LONG" if side == 1 else "SHORT"
@@ -4078,9 +3951,11 @@ def backtest_atr_grinder_lib(
             "entry_price": entry_price,
             "target_price": target_price,
             "stop_price": stop_price,
-            "trail_r_value": trail_r_value,
-            "trail_best_close_r": trail_best_close_r,
-            "trail_stop_r": trail_stop_r,
+            "entry_atr": entry_atr,
+            "base_entry_price": entry_price,
+            "trail_best_move_atr": trail_best_move_atr,
+            "next_scale_atr": next_scale_atr,
+            "scale_increment_usd": float(cfg.target_loss_usd or 0.0),
             "entry_time": entry_time,
             "entry_index": entry_index,
             "used_signal_atr": signal_atr_value,
@@ -4622,6 +4497,88 @@ def backtest_atr_grinder_lib(
         # No exit triggered
         return False, None, None, None, current_sl_price
 
+    def process_atr_trailing_and_exit_lib(
+        pos: Dict[str, Any],
+        df_1m_chunk: pd.DataFrame,
+        entry_t: pd.Timestamp,
+        side_str: str,
+        forced_exit_state: Dict[str, Any],
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp]]:
+        """
+        Process 1m candles sequentially: scale in, update ATR trailing, then check exit.
+        """
+        nonlocal trailing_stop_updates
+        position = pos["position"]
+        entry_atr = pos.get("entry_atr", 0.0)
+        base_entry = pos.get("base_entry_price", pos.get("entry_price"))
+        if entry_atr <= 0 or base_entry is None:
+            return False, None, None, None
+
+        for t_1m, candle_1m in df_1m_chunk.iterrows():
+            c = float(candle_1m["close"])
+            forced_exit_limit_hit = should_trigger_forced_exit(forced_exit_state, t_1m)
+
+            # Scale in at each +1 ATR (starting at +1)
+            move_atr_for_scale = compute_move_atr(base_entry, c, position, entry_atr)
+            while move_atr_for_scale is not None and move_atr_for_scale >= pos.get("next_scale_atr", 1.0):
+                add_margin = float(pos.get("scale_increment_usd") or 0.0)
+                if add_margin > 0:
+                    add_notional = add_margin * pos["active_leverage"]
+                    pos["entry_price"] = compute_weighted_entry_price(
+                        pos["entry_price"], pos["active_notional"], c, add_notional
+                    )
+                    pos["active_margin"] += add_margin
+                    pos["active_notional"] += add_notional
+                pos["next_scale_atr"] = pos.get("next_scale_atr", 1.0) + 1.0
+                move_atr_for_scale = compute_move_atr(base_entry, c, position, entry_atr)
+
+            # Update trailing stop state
+            move_atr_current = compute_move_atr(pos["entry_price"], c, position, entry_atr)
+            if move_atr_current is not None:
+                pos["trail_best_move_atr"] = max(pos.get("trail_best_move_atr", 0.0), move_atr_current)
+
+            initial_sl = compute_sl_price(pos["entry_price"], position, entry_atr, sl_atr_mult=1.0)
+            trailing_sl = compute_trailing_stop_atr(
+                pos["entry_price"],
+                position,
+                entry_atr,
+                pos.get("trail_best_move_atr", 0.0),
+                gap_atr=1.0,
+                start_atr=3.0,
+            )
+            if trailing_sl is None:
+                effective_stop = initial_sl
+            else:
+                effective_stop = max(initial_sl, trailing_sl) if position == 1 else min(initial_sl, trailing_sl)
+
+            prev_stop_price = pos.get("stop_price")
+            pos["stop_price"] = effective_stop
+            if prev_stop_price is None or effective_stop != prev_stop_price:
+                trailing_stop_updates.append({
+                    "timestamp": t_1m,
+                    "entry_time": entry_t,
+                    "side": side_str,
+                    "entry_price": pos["entry_price"],
+                    "close_price": c,
+                    "prev_stop_price": prev_stop_price,
+                    "new_stop_price": effective_stop,
+                    "best_move_atr": pos.get("trail_best_move_atr", 0.0),
+                    "trailing_mode": "atr_gap",
+                    "stop_moved": True,
+                    "lib_mode": True,
+                })
+
+            sl_hit = (c <= pos["stop_price"]) if position == 1 else (c >= pos["stop_price"])
+            if sl_hit:
+                exit_price = apply_slippage(c, position, is_entry=False)
+                return True, "SL", exit_price, t_1m
+
+            if forced_exit_limit_hit:
+                exit_price = apply_slippage(c, position, is_entry=False)
+                return True, FORCED_EXIT_REASON, exit_price, t_1m
+
+        return False, None, None, None
+
     limit_timeout_bars = max(1, int(cfg.entry_limit_timeout_bars))
 
     # Pre-index 1m data by minute for O(1) lookups (HUGE performance improvement)
@@ -4634,46 +4591,10 @@ def backtest_atr_grinder_lib(
         df_1m_bar: pd.DataFrame,
         signal_t: pd.Timestamp,
     ) -> Tuple[bool, Optional[str], Optional[float], Optional[pd.Timestamp]]:
-        if df_1m_bar.empty or not cfg.use_trailing_stop or pos["trail_r_value"] is None:
+        if df_1m_bar.empty or not cfg.use_trailing_stop:
             return False, None, None, None
         side_str = "LONG" if pos["position"] == 1 else "SHORT"
-        if cfg.trailing_mode == "r_ladder" and pos["trail_best_close_r"] is not None and pos["trail_stop_r"] is not None:
-            exited, exit_reason, exit_price_check, exit_time_check, stop_price, best_r, stop_r = process_trailing_and_exit_lib(
-                pos["position"],
-                pos["entry_price"],
-                pos["trail_r_value"],
-                pos["trail_best_close_r"],
-                pos["trail_stop_r"],
-                pos["stop_price"],
-                pos["target_price"],
-                df_1m_bar,
-                pos["entry_time"],
-                side_str,
-                cfg.use_trailing_stop,
-                pos,
-            )
-            pos["stop_price"] = stop_price
-            pos["trail_best_close_r"] = best_r
-            pos["trail_stop_r"] = stop_r
-            return exited, exit_reason, exit_price_check, exit_time_check
-        if cfg.trailing_mode == "dynamic_atr" and pos["used_signal_atr"] is not None:
-            exited, exit_reason, exit_price_check, exit_time_check, stop_price = process_trailing_and_exit_dynamic_atr_lib(
-                pos["position"],
-                pos["entry_price"],
-                pos["used_signal_atr"],
-                pos["stop_price"],
-                pos["target_price"],
-                df_1m_bar,
-                df,
-                signal_t,
-                pos["entry_time"],
-                side_str,
-                cfg.use_trailing_stop,
-                pos,
-            )
-            pos["stop_price"] = stop_price
-            return exited, exit_reason, exit_price_check, exit_time_check
-        return False, None, None, None
+        return process_atr_trailing_and_exit_lib(pos, df_1m_bar, pos["entry_time"], side_str, pos)
 
     for i in range(1, len(df)):
         t = idx[i]
@@ -4706,77 +4627,58 @@ def backtest_atr_grinder_lib(
                 continue
 
             if has_1m_data:
-                if cfg.use_trailing_stop:
-                    side_str = "LONG" if position == 1 else "SHORT"
-                    if cfg.trailing_mode == "dynamic_atr" and pos["used_signal_atr"] is not None:
-                        pos["stop_price"] = update_trailing_stop_dynamic_atr_lib(
-                            position,
-                            entry_price,
-                            pos["used_signal_atr"],
-                            pos["stop_price"],
-                            df_1m_bar,
-                            df,
-                            t,
-                            pos["entry_time"],
-                            side_str,
-                        )
-                    elif (
-                        cfg.trailing_mode == "r_ladder"
-                        and pos["trail_r_value"] is not None
-                        and pos["trail_best_close_r"] is not None
-                        and pos["trail_stop_r"] is not None
-                    ):
-                        pos["stop_price"], pos["trail_best_close_r"], pos["trail_stop_r"] = update_trailing_stop_lib(
-                            position,
-                            entry_price,
-                            pos["trail_r_value"],
-                            pos["trail_best_close_r"],
-                            pos["trail_stop_r"],
-                            pos["stop_price"],
-                            df_1m_bar,
-                            pos["entry_time"],
-                            side_str,
-                        )
-
-                exited, exit_reason, exit_price, exit_time = check_exit_lib(
-                    position,
-                    pos["stop_price"],
-                    target_price,
+                side_str = "LONG" if position == 1 else "SHORT"
+                exited, exit_reason, exit_price, exit_time = process_atr_trailing_and_exit_lib(
+                    pos,
                     df_1m_bar,
-                    cfg.use_trailing_stop,
+                    pos["entry_time"],
+                    side_str,
                     pos,
                 )
             else:
                 c = float(df.at[t, "close"])
-                sl_hit = False
-                if pos["stop_price"] is not None:
-                    sl_hit = (c <= pos["stop_price"]) if position == 1 else (c >= pos["stop_price"])
+                entry_atr = pos.get("entry_atr", 0.0)
+                base_entry = pos.get("base_entry_price", pos.get("entry_price"))
+                if entry_atr > 0 and base_entry is not None:
+                    move_atr_for_scale = compute_move_atr(base_entry, c, position, entry_atr)
+                    while move_atr_for_scale is not None and move_atr_for_scale >= pos.get("next_scale_atr", 1.0):
+                        add_margin = float(pos.get("scale_increment_usd") or 0.0)
+                        if add_margin > 0:
+                            add_notional = add_margin * pos["active_leverage"]
+                            pos["entry_price"] = compute_weighted_entry_price(
+                                pos["entry_price"], pos["active_notional"], c, add_notional
+                            )
+                            pos["active_margin"] += add_margin
+                            pos["active_notional"] += add_notional
+                        pos["next_scale_atr"] = pos.get("next_scale_atr", 1.0) + 1.0
+                        move_atr_for_scale = compute_move_atr(base_entry, c, position, entry_atr)
 
-                if cfg.use_trailing_stop:
-                    if sl_hit:
-                        exit_reason = "SL"
-                        exit_price = apply_slippage(c, position, is_entry=False)
-                        exited = True
-                else:
-                    if target_price is not None:
-                        tp_hit = (c >= target_price) if position == 1 else (c <= target_price)
+                    move_atr_current = compute_move_atr(pos["entry_price"], c, position, entry_atr)
+                    if move_atr_current is not None:
+                        pos["trail_best_move_atr"] = max(pos.get("trail_best_move_atr", 0.0), move_atr_current)
+
+                    initial_sl = compute_sl_price(pos["entry_price"], position, entry_atr, sl_atr_mult=1.0)
+                    trailing_sl = compute_trailing_stop_atr(
+                        pos["entry_price"],
+                        position,
+                        entry_atr,
+                        pos.get("trail_best_move_atr", 0.0),
+                        gap_atr=1.0,
+                        start_atr=3.0,
+                    )
+                    if trailing_sl is None:
+                        pos["stop_price"] = initial_sl
                     else:
-                        tp_hit = False
+                        pos["stop_price"] = max(initial_sl, trailing_sl) if position == 1 else min(initial_sl, trailing_sl)
 
-                    if sl_hit and tp_hit:
-                        exit_reason = "SL"
-                        exit_price = apply_slippage(c, position, is_entry=False)
-                        exited = True
-                    elif tp_hit:
-                        exit_reason = "TP"
-                        exit_price = apply_slippage(c, position, is_entry=False)
-                        exited = True
-                    elif sl_hit:
-                        exit_reason = "SL"
-                        exit_price = apply_slippage(c, position, is_entry=False)
-                        exited = True
+                sl_hit = (c <= pos["stop_price"]) if position == 1 else (c >= pos["stop_price"])
+                if sl_hit:
+                    exit_reason = "SL"
+                    exit_price = apply_slippage(c, position, is_entry=False)
+                    exited = True
 
             if exited:
+                entry_price = pos["entry_price"]
                 roi_net = net_roi_from_prices(entry_price, exit_price, position, pos["active_leverage"])
                 pnl_net = roi_net * pos["active_margin"]
                 equity += pnl_net
@@ -4805,115 +4707,7 @@ def backtest_atr_grinder_lib(
 
                 positions.remove(pos)
 
-        # --- Trailing stop update for 1m close (if no 1m data or using 1m fallback) ---
-        if not has_1m_data and cfg.use_trailing_stop:
-            for pos in positions:
-                position = pos["position"]
-                entry_price = pos["entry_price"]
-                if entry_price is None:
-                    continue
-
-                c = float(df.at[t, "close"])
-                h = float(df.at[t, "high"])
-                l = float(df.at[t, "low"])
-                side_str = "LONG" if position == 1 else "SHORT"
-                prev_stop_price = pos["stop_price"]
-
-                if cfg.trailing_mode == "dynamic_atr":
-                    signal_atr_for_trail = (
-                        pos["trail_r_value"] if pos["trail_r_value"] is not None else float(df.at[t, "atr"])
-                    )
-
-                    if cfg.dynamic_trail_price_source == "high_low":
-                        trail_price = h if position == 1 else l
-                    else:
-                        trail_price = c
-                    atr_stop = compute_dynamic_atr_stop(
-                        trail_price, signal_atr_for_trail, cfg.dynamic_trail_atr_mult, position
-                    )
-
-                    new_stop = atr_stop
-
-                    activation_threshold = signal_atr_for_trail * cfg.dynamic_trail_activation_r
-                    if position == 1:
-                        price_moved_enough = c >= entry_price + activation_threshold
-                        should_set_stop = price_moved_enough
-                    else:
-                        price_moved_enough = c <= entry_price - activation_threshold
-                        should_set_stop = price_moved_enough
-
-                    stop_moved = should_set_stop and (
-                        pos["stop_price"] is None or new_stop != pos["stop_price"]
-                    )
-                    if stop_moved:
-                        pos["stop_price"] = new_stop
-
-                    trailing_stop_updates.append({
-                        "timestamp": t,
-                        "entry_time": pos["entry_time"],
-                        "side": side_str,
-                        "entry_price": entry_price,
-                        "close_price": c,
-                        "trail_price": trail_price,
-                        "signal_atr": signal_atr_for_trail,
-                        "atr_stop": atr_stop,
-                        "prev_stop_price": prev_stop_price,
-                        "new_stop_price": pos["stop_price"],
-                        "trailing_mode": "dynamic_atr",
-                        "dynamic_trail_atr_mult": cfg.dynamic_trail_atr_mult,
-                        "dynamic_trail_activation_r": cfg.dynamic_trail_activation_r,
-                        "dynamic_trail_price_source": cfg.dynamic_trail_price_source,
-                        "price_moved_enough": price_moved_enough,
-                        "stop_moved": stop_moved,
-                        "lib_mode": False,
-                    })
-
-                elif (
-                    cfg.trailing_mode == "r_ladder"
-                    and pos["trail_r_value"] is not None
-                    and pos["trail_best_close_r"] is not None
-                    and pos["trail_stop_r"] is not None
-                ):
-                    close_r = compute_close_r(entry_price, c, position, pos["trail_r_value"])
-                    if close_r is not None:
-                        prev_best_r = pos["trail_best_close_r"]
-                        prev_stop_r = pos["trail_stop_r"]
-
-                        pos["trail_best_close_r"] = max(pos["trail_best_close_r"], close_r)
-                        next_stop_r = compute_trailing_stop_r(
-                            pos["trail_best_close_r"], pos["trail_stop_r"], cfg.trail_gap_r
-                        )
-
-                        should_place_stop = (
-                            (pos["stop_price"] is None and next_stop_r >= 0) or
-                            (next_stop_r > pos["trail_stop_r"] and next_stop_r >= 0)
-                        )
-                        if should_place_stop:
-                            new_stop_price = compute_trailing_sl_price(
-                                entry_price, position, pos["trail_r_value"], next_stop_r, cfg.trail_buffer_r
-                            )
-                            trailing_stop_updates.append({
-                                "timestamp": t,
-                                "entry_time": pos["entry_time"],
-                                "side": side_str,
-                                "entry_price": entry_price,
-                                "close_price": c,
-                                "close_r": close_r,
-                                "prev_best_r": prev_best_r,
-                                "new_best_r": pos["trail_best_close_r"],
-                                "prev_stop_r": prev_stop_r,
-                                "new_stop_r": next_stop_r,
-                                "prev_stop_price": prev_stop_price,
-                                "new_stop_price": new_stop_price,
-                                "r_value": pos["trail_r_value"],
-                                "trail_gap_r": cfg.trail_gap_r,
-                                "trail_buffer_r": cfg.trail_buffer_r,
-                                "trailing_mode": "r_ladder",
-                                "stop_moved": True,
-                                "lib_mode": False,
-                            })
-                            pos["trail_stop_r"] = next_stop_r
-                            pos["stop_price"] = new_stop_price
+        # Trailing updates for no-1m-data paths are handled in the exit block above.
 
         # --- ENTRY logic (market-only) ---
 
@@ -5330,23 +5124,16 @@ def resolve_trade_sizing(
     target_loss_usd: Optional[float],
     leverage_step: float = 0.0,
 ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Backward compatibility for backtest."""
-    if margin_cap <= 0 or max_leverage <= 0:
+    """Compute margin from target loss with fixed leverage."""
+    if max_leverage <= 0:
         return None, None, "invalid_config"
-    req_leverage = compute_required_leverage(
-        entry_price=entry_price,
-        atr_value=atr_value,
-        sl_atr_mult=sl_atr_mult,
-        margin_usd=margin_cap,
-        target_loss_usd=target_loss_usd,
-    )
-    if req_leverage is None:
-        return margin_cap, max_leverage, None
-    leverage_used = max(req_leverage, min_leverage)
+    leverage_used = float(max_leverage)
+    if min_leverage > 0:
+        leverage_used = max(leverage_used, min_leverage)
     if leverage_step and leverage_step > 0:
-        leverage_used = math.ceil(leverage_used / leverage_step) * leverage_step
-    if leverage_used > max_leverage:
-        return None, None, "leverage_exceeds_max"
+        leverage_used = math.floor(leverage_used / leverage_step) * leverage_step
+        if leverage_used <= 0:
+            leverage_used = leverage_step
     margin_required = compute_margin_from_targets(
         entry_price=entry_price,
         atr_value=atr_value,
@@ -5355,8 +5142,8 @@ def resolve_trade_sizing(
         target_loss_usd=target_loss_usd,
     )
     if margin_required is None or margin_required <= 0:
-        return margin_cap, leverage_used, None
-    if margin_required > margin_cap:
+        return None, None, "invalid_sizing"
+    if margin_cap and margin_cap > 0 and margin_required > margin_cap:
         return None, None, "margin_exceeds_cap"
     return margin_required, leverage_used, None
 
@@ -5367,6 +5154,44 @@ def compute_close_r(entry_price: float, close_price: float, side: int, r_value: 
     if side == 1:
         return (close_price - entry_price) / r_value
     return (entry_price - close_price) / r_value
+
+
+def compute_move_atr(entry_price: float, price: float, side: int, atr_value: float) -> Optional[float]:
+    if atr_value <= 0:
+        return None
+    if side == 1:
+        return (price - entry_price) / atr_value
+    return (entry_price - price) / atr_value
+
+
+def compute_trailing_stop_atr(
+    entry_price: float,
+    side: int,
+    atr_value: float,
+    best_move_atr: float,
+    gap_atr: float = 1.0,
+    start_atr: float = 3.0,
+) -> Optional[float]:
+    if atr_value <= 0 or best_move_atr is None:
+        return None
+    if best_move_atr < start_atr:
+        return None
+    stop_move_atr = best_move_atr - gap_atr
+    if stop_move_atr < 0:
+        return None
+    return entry_price + (stop_move_atr * atr_value) if side == 1 else entry_price - (stop_move_atr * atr_value)
+
+
+def compute_weighted_entry_price(
+    current_entry: float,
+    current_notional: float,
+    add_entry: float,
+    add_notional: float,
+) -> float:
+    total_notional = current_notional + add_notional
+    if total_notional <= 0:
+        return current_entry
+    return ((current_entry * current_notional) + (add_entry * add_notional)) / total_notional
 
 
 def compute_trailing_stop_r(best_close_r: float, current_stop_r: int, gap_r: float) -> int:
@@ -5642,17 +5467,8 @@ def run_live(cfg: LiveConfig) -> None:
         return None, "user_trades_empty"
 
     def determine_exit_reason(symbol: str, pos_state: PositionState) -> Tuple[str, Optional[str]]:
-        if pos_state.sl_algo_id is None and pos_state.fade_tp_algo_id is None:
+        if pos_state.sl_algo_id is None:
             return "manual", None
-        if pos_state.fade_tp_algo_id is not None:
-            try:
-                tp_order = query_algo_order(client, symbol, algo_id=pos_state.fade_tp_algo_id)
-            except ClientError as exc:
-                logging.warning("Algo TP order query failed. symbol=%s error=%s", symbol, exc)
-                tp_order = None
-            tp_status = algo_order_status(tp_order)
-            if algo_order_executed(tp_order):
-                return "tp", tp_status
         if pos_state.sl_algo_id is not None:
             try:
                 order = query_algo_order(client, symbol, algo_id=pos_state.sl_algo_id)
@@ -5679,23 +5495,6 @@ def run_live(cfg: LiveConfig) -> None:
 
         tick_size = filters_by_symbol.get(symbol, {}).get("tick_size", 0.00000001)
         
-        # Check if this is a fade position that hit TP
-        fade_tp_hit = False
-        if pos_state.is_fade and pos_state.fade_tp_price is not None and exit_price > 0:
-            if pos_state.entry_side == -1:  # SHORT fade
-                # TP hit if exit price is close to or below the TP price
-                fade_tp_hit = exit_price <= pos_state.fade_tp_price * 1.01  # 1% tolerance
-            # Determine fade exit reason (prefer algo reason if known)
-            if exit_reason == "tp":
-                exit_reason = "FADE_TP"
-                fade_tp_hit = True
-            elif exit_reason == "trailing_sl":
-                exit_reason = "FADE_SL"
-            elif fade_tp_hit:
-                exit_reason = "FADE_TP"
-            else:
-                exit_reason = "FADE_SL"
-        
         log_event(cfg.log_path, {
             "event": "position_closed",
             "symbol": symbol,
@@ -5707,7 +5506,7 @@ def run_live(cfg: LiveConfig) -> None:
             "sl_algo_id": pos_state.sl_algo_id,
             "sl_algo_status": sl_status,
             "is_fade": pos_state.is_fade,
-            "fade_tp_hit": fade_tp_hit,
+            "fade_tp_hit": None,
         })
 
         append_live_trade(cfg.live_trades_csv, {
@@ -5729,8 +5528,6 @@ def run_live(cfg: LiveConfig) -> None:
 
         if pos_state.sl_algo_id:
             cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
-        if pos_state.fade_tp_algo_id:
-            cancel_algo_order_safely(client, symbol, algo_id=pos_state.fade_tp_algo_id)
         if symbol in state.positions:
             del state.positions[symbol]
         
@@ -5801,16 +5598,20 @@ def run_live(cfg: LiveConfig) -> None:
             pos_state = PositionState(
                 symbol=symbol,
                 entry_price=entry_price,
+                base_entry_price=entry_price,
                 entry_side=side,
                 entry_qty=qty,
                 entry_atr=entry_atr,
                 trail_r_value=entry_atr,
-                trail_best_close_r=0.0,
-                trail_stop_r=cfg.trail_initial_stop_r,
+                trail_best_move_atr=0.0,
+                next_scale_atr=1.0,
+                scale_increment_usd=float(cfg.target_loss_usd or 0.0),
                 entry_time_iso=_utc_now_iso(),
                 entry_close_ms=int(time.time() * 1000),
                 entry_margin_usd=margin_usd,
                 entry_leverage=leverage,
+                total_margin_usd=margin_usd,
+                total_notional_usd=margin_usd * leverage,
             )
             state.positions[symbol] = pos_state
             restored += 1
@@ -5881,155 +5682,87 @@ def run_live(cfg: LiveConfig) -> None:
     # Helper: Update trailing stop for a position using latest price
     # -----------------------------------------------------------------
     def update_trailing_stop(symbol: str, pos_state: PositionState) -> None:
-        """Update trailing stop for a position based on latest price.
-        
-        Supports two modes:
-        - dynamic_atr: Uses candle high (LONG) or low (SHORT) with ATR multiplier
-        - r_ladder: Uses last price with R-unit ladder system
-        """
+        """Update SL/trailing stop and scale-in using last price."""
         if symbol not in filters_by_symbol:
             return
-        
-        filters = filters_by_symbol[symbol]
-        
-        close_time_ms = None
-        high_price = None
-        low_price = None
-        close_price = None
-        
-        entry_price = pos_state.entry_price
-        side_sign = pos_state.entry_side
-        signal_atr = pos_state.trail_r_value  # signal_atr is stored in trail_r_value
-        
-        if signal_atr <= 0:
-            return
-        
-        next_sl_price = None
-        candidate_stop_r = None
-        
-        if cfg.trailing_mode == "dynamic_atr":
-            # Fetch latest candle for trailing stop check
-            try:
-                klines = client.klines(symbol=symbol, interval=DYNAMIC_TRAIL_CHECK_INTERVAL, limit=2)
-            except ClientError as exc:
-                logging.warning("Trailing klines fetch failed. symbol=%s error=%s", symbol, exc)
-                return
-            
-            if len(klines) < 2:
-                return
-            
-            # Use the last closed candle
-            closed_klines = klines[:-1]
-            close_time_ms = int(closed_klines[-1][6])
-            
-            # Check if this is a new candle
-            if close_time_ms == state.last_trail_close_ms.get(symbol):
-                return
-            state.last_trail_close_ms[symbol] = close_time_ms
-            
-            df = klines_to_df(closed_klines)
-            candle = df.iloc[-1]
-            high_price = float(candle["high"])
-            low_price = float(candle["low"])
-            close_price = float(candle["close"])
-            
-            # Dynamic ATR trailing - uses high (LONG) or low (SHORT) with ATR multiplier
-            
-            # Select price source for trailing
-            if cfg.dynamic_trail_price_source == "high_low":
-                trail_price = high_price if side_sign == 1 else low_price
-            else:
-                trail_price = close_price
-            
-            # Calculate new stop using ATR
-            atr_stop = compute_dynamic_atr_stop(trail_price, signal_atr, cfg.dynamic_trail_atr_mult, side_sign)
-            
-            # Only set stop if price has moved activation_r in our favor
-            activation_threshold = signal_atr * cfg.dynamic_trail_activation_r
-            if side_sign == 1:
-                price_moved_enough = close_price >= entry_price + activation_threshold
-            else:
-                price_moved_enough = close_price <= entry_price - activation_threshold
-            
-            if not price_moved_enough:
-                return
-            
-            if pos_state.sl_price is not None and atr_stop == pos_state.sl_price:
-                return
-            
-            next_sl_price = atr_stop
-            
-        else:
-            # R-ladder trailing (original logic)
-            try:
-                bid, ask = get_book_ticker(client, symbol)
-            except ClientError as exc:
-                logging.warning("Book ticker fetch failed. symbol=%s error=%s", symbol, exc)
-                return
-            
-            last_price = (bid + ask) / 2.0
-            if last_price <= 0:
-                return
-            
-            close_time_ms = int(time.time() * 1000)
-            close_price = last_price
 
-            close_r = compute_close_r(entry_price, close_price, side_sign, signal_atr)
-            if close_r is None:
-                return
-            
-            # Update best close R
-            pos_state.trail_best_close_r = max(pos_state.trail_best_close_r, close_r)
-            
-            # Calculate new trailing stop level
-            candidate_stop_r = compute_trailing_stop_r(
-                pos_state.trail_best_close_r,
-                pos_state.trail_stop_r,
-                cfg.trail_gap_r,
-            )
-            
-            # Only place stops at breakeven (0R) or better - no negative stops
-            if candidate_stop_r < 0:
-                return
-            
-            # Place stop when:
-            # 1. First time reaching ladder threshold (sl_price is None and candidate_stop_r >= 0)
-            # 2. Stop level improves (candidate_stop_r > trail_stop_r)
-            is_first_stop = pos_state.sl_price is None and candidate_stop_r >= 0
-            is_improvement = candidate_stop_r > pos_state.trail_stop_r
-            
-            if not (is_first_stop or is_improvement):
-                return
-            
-            # Calculate new SL price
-            next_sl_price = compute_trailing_sl_price(
-                entry_price,
-                side_sign,
-                signal_atr,
-                candidate_stop_r,
-                cfg.trail_buffer_r,
-            )
-        
-        if next_sl_price is None:
+        filters = filters_by_symbol[symbol]
+        try:
+            bid, ask = get_book_ticker(client, symbol)
+        except ClientError as exc:
+            logging.warning("Book ticker fetch failed. symbol=%s error=%s", symbol, exc)
             return
-        
+
+        last_price = (bid + ask) / 2.0
+        if last_price <= 0:
+            return
+
+        close_time_ms = int(time.time() * 1000)
+        side_sign = pos_state.entry_side
+        entry_atr = pos_state.entry_atr
+        if entry_atr <= 0:
+            return
+
+        scaling_happened = False
+        # Scale in at each +1 ATR (starting at +1 ATR)
+        move_atr_for_scale = compute_move_atr(pos_state.base_entry_price, last_price, side_sign, entry_atr)
+        while move_atr_for_scale is not None and move_atr_for_scale >= pos_state.next_scale_atr:
+            add_margin = float(pos_state.scale_increment_usd or 0.0)
+            if add_margin <= 0:
+                break
+            add_qty_str = compute_position_qty(last_price, add_margin, pos_state.entry_leverage, filters["step_size"])
+            try:
+                add_qty_num = float(add_qty_str)
+            except (TypeError, ValueError):
+                add_qty_num = 0.0
+            if add_qty_num < filters["min_qty"]:
+                break
+            add_side = "BUY" if side_sign == 1 else "SELL"
+            add_order = market_order(
+                symbol,
+                add_side,
+                add_qty_str,
+                client,
+                client_order_id=f"ATR_SCALE_{close_time_ms}",
+            )
+            if not add_order:
+                break
+            add_notional = add_margin * pos_state.entry_leverage
+            pos_state.entry_price = compute_weighted_entry_price(
+                pos_state.entry_price, pos_state.total_notional_usd, last_price, add_notional
+            )
+            pos_state.entry_qty += add_qty_num
+            pos_state.total_margin_usd += add_margin
+            pos_state.total_notional_usd += add_notional
+            pos_state.next_scale_atr += 1.0
+            scaling_happened = True
+            move_atr_for_scale = compute_move_atr(pos_state.base_entry_price, last_price, side_sign, entry_atr)
+
+        # Update trailing stop state
+        move_atr_current = compute_move_atr(pos_state.entry_price, last_price, side_sign, entry_atr)
+        if move_atr_current is not None:
+            pos_state.trail_best_move_atr = max(pos_state.trail_best_move_atr, move_atr_current)
+
+        initial_sl = compute_sl_price(pos_state.entry_price, side_sign, entry_atr, sl_atr_mult=1.0)
+        trailing_sl = compute_trailing_stop_atr(
+            pos_state.entry_price,
+            side_sign,
+            entry_atr,
+            pos_state.trail_best_move_atr,
+            gap_atr=1.0,
+            start_atr=3.0,
+        )
+        if trailing_sl is None:
+            next_sl_price = initial_sl
+        else:
+            next_sl_price = max(initial_sl, trailing_sl) if side_sign == 1 else min(initial_sl, trailing_sl)
+
         next_sl_price_str = format_to_step(next_sl_price, filters["tick_size"])
-        
         try:
             next_sl_price_rounded = float(next_sl_price_str)
         except (TypeError, ValueError):
             return
-        
-        # Check if new SL price improves over current
-        improves = True
-        if pos_state.sl_price is not None:
-            current_sl_price = pos_state.sl_price
-            improves = (next_sl_price_rounded > current_sl_price if side_sign == 1 
-                       else next_sl_price_rounded < current_sl_price)
-        
-        if not improves or next_sl_price_rounded <= 0:
-            return
-        
+
         # Get current position quantity from exchange
         try:
             pos_info = get_position_info(client, symbol)
@@ -6037,29 +5770,37 @@ def run_live(cfg: LiveConfig) -> None:
         except Exception as exc:
             logging.warning("Failed to get position info for %s: %s", symbol, exc)
             return
-        
+
         if position_amt == 0.0:
             handle_position_exit(symbol, pos_state)
             return
-        
+
         qty = abs(position_amt)
         qty_str = format_to_step(qty, filters["step_size"])
-        
         try:
             qty_num = float(qty_str)
         except (TypeError, ValueError):
             qty_num = 0.0
-        
         if qty_num < filters["min_qty"]:
             return
-        
+
+        update_required = scaling_happened
+        if pos_state.sl_price is None:
+            update_required = True
+        else:
+            improves = (next_sl_price_rounded > pos_state.sl_price if side_sign == 1 else next_sl_price_rounded < pos_state.sl_price)
+            if improves:
+                update_required = True
+        if not update_required:
+            return
+
         # Cancel existing SL algo order if any
         if pos_state.sl_algo_id:
             cancel_algo_order_safely(client, symbol, algo_id=pos_state.sl_algo_id)
             pos_state.sl_algo_id = None
             pos_state.sl_algo_client_order_id = None
-        
-        # Place trailing stop as an algo conditional STOP_MARKET order
+
+        # Place SL/trailing STOP_MARKET order
         sl_side = "SELL" if side_sign == 1 else "BUY"
         sl_client_id = f"ATR_SL_T_{close_time_ms}"
         sl_order = algo_stop_limit_order(
@@ -6085,28 +5826,20 @@ def run_live(cfg: LiveConfig) -> None:
             return
 
         prev_sl_price = pos_state.sl_price
-        prev_stop_r = pos_state.trail_stop_r if cfg.trailing_mode == "r_ladder" else None
         pos_state.sl_algo_id = _extract_int(sl_order, ("algoId", "algoOrderId", "orderId", "id"))
         pos_state.sl_algo_client_order_id = sl_client_id
         pos_state.sl_price = next_sl_price_rounded
-        if candidate_stop_r is not None:
-            pos_state.trail_stop_r = candidate_stop_r
-        
-        # Get tick_size for proper price precision in log
+
         sl_tick_size = filters.get("tick_size", 0.00000001)
         append_live_trailing_stop_update(cfg.live_trailing_stop_updates_file, {
             "event": "trailing_stop_update",
             "symbol": symbol,
             "side": "LONG" if side_sign == 1 else "SHORT",
-            "trailing_mode": cfg.trailing_mode,
+            "trailing_mode": "atr_gap",
             "close_time_ms": close_time_ms,
             "prev_trailing_stop": format_price_optional(prev_sl_price, sl_tick_size),
             "new_trailing_stop": format_price_optional(next_sl_price_rounded, sl_tick_size),
-            "prev_trailing_stop_r": prev_stop_r if prev_sl_price is not None else None,
-            "new_trailing_stop_r": candidate_stop_r if cfg.trailing_mode == "r_ladder" else None,
-            "trail_price": format_price_optional(high_price if side_sign == 1 else low_price, sl_tick_size)
-            if cfg.trailing_mode == "dynamic_atr" else None,
-            "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
+            "best_move_atr": format_float_2(pos_state.trail_best_move_atr),
             "order_id": pos_state.sl_algo_id,
         })
         log_event(cfg.log_path, {
@@ -6114,10 +5847,8 @@ def run_live(cfg: LiveConfig) -> None:
             "symbol": symbol,
             "side": "LONG" if side_sign == 1 else "SHORT",
             "sl_price": format_price_for_logging(next_sl_price_rounded, sl_tick_size),
-            "trailing_mode": cfg.trailing_mode,
-            "trail_price": format_price_for_logging(high_price if side_sign == 1 else low_price, sl_tick_size) if cfg.trailing_mode == "dynamic_atr" else None,
-            "stop_r": candidate_stop_r,
-            "best_close_r": format_float_2(pos_state.trail_best_close_r) if cfg.trailing_mode == "r_ladder" else None,
+            "trailing_mode": "atr_gap",
+            "best_move_atr": format_float_2(pos_state.trail_best_move_atr),
             "order_id": pos_state.sl_algo_id,
         })
 
@@ -6325,7 +6056,7 @@ def run_live(cfg: LiveConfig) -> None:
         if entry_price_for_qty <= 0:
             return False
         
-        # Static position sizing: margin_usd x leverage (adjust for symbol max leverage)
+        # Risk-based sizing: target_loss_usd with -1 ATR stop
         leverage_used, margin_usd_used, target_notional, max_leverage = resolve_effective_leverage_and_margin(
             cfg.leverage,
             cfg.margin_usd,
@@ -6333,19 +6064,6 @@ def run_live(cfg: LiveConfig) -> None:
         )
         if abs(leverage_used - round(leverage_used)) < 1e-6:
             leverage_used = float(int(round(leverage_used)))
-
-        # Log when leverage is adjusted due to symbol limits
-        if leverage_used != cfg.leverage:
-            log_event(cfg.log_path, {
-                "event": "leverage_adjusted",
-                "symbol": symbol,
-                "requested_leverage": cfg.leverage,
-                "adjusted_leverage": leverage_used,
-                "max_leverage": max_leverage,
-                "base_margin_usd": format_float_2(cfg.margin_usd),
-                "adjusted_margin_usd": format_float_2(margin_usd_used),
-                "target_notional": format_float_2(target_notional),
-            })
 
         # Ensure leverage is set
         current_leverage = state.current_leverage_by_symbol.get(symbol)
@@ -6364,6 +6082,37 @@ def run_live(cfg: LiveConfig) -> None:
                 })
                 return False
         
+        margin_usd_used = compute_margin_from_targets(
+            entry_price=entry_price_for_qty,
+            atr_value=signal_atr,
+            sl_atr_mult=1.0,
+            leverage=leverage_used,
+            target_loss_usd=cfg.target_loss_usd,
+        )
+        if margin_usd_used is None or margin_usd_used <= 0:
+            log_event(cfg.log_path, {
+                "event": "skip_sizing",
+                "symbol": symbol,
+                "target_loss_usd": format_float_2(cfg.target_loss_usd),
+                "atr": format_float_2(signal_atr),
+            })
+            return False
+
+        target_notional = margin_usd_used * leverage_used
+
+        # Log when leverage is adjusted due to symbol limits
+        if leverage_used != cfg.leverage:
+            log_event(cfg.log_path, {
+                "event": "leverage_adjusted",
+                "symbol": symbol,
+                "requested_leverage": cfg.leverage,
+                "adjusted_leverage": leverage_used,
+                "max_leverage": max_leverage,
+                "base_margin_usd": format_float_2(cfg.margin_usd),
+                "adjusted_margin_usd": format_float_2(margin_usd_used),
+                "target_notional": format_float_2(target_notional),
+            })
+
         # Calculate quantity
         qty_str = compute_position_qty(entry_price_for_qty, margin_usd_used, leverage_used, filters["step_size"])
         try:
@@ -6406,6 +6155,7 @@ def run_live(cfg: LiveConfig) -> None:
                 entry_close_ms=close_time_ms,
                 entry_margin_usd=margin_usd_used,
                 entry_leverage=leverage_used,
+                scale_increment_usd=float(cfg.target_loss_usd or 0.0),
                 trade_id=trade_id,
                 signal_reason=signal_reason,
                 # Fade fields (for bos_long_fade)
@@ -6491,16 +6241,20 @@ def run_live(cfg: LiveConfig) -> None:
                         pos_state = PositionState(
                             symbol=symbol,
                             entry_price=entry_price,
+                            base_entry_price=entry_price,
                             entry_side=side,
                             entry_qty=qty,
                             entry_atr=pending.pending_atr,
                             trail_r_value=r_value,
-                            trail_best_close_r=0.0,
-                            trail_stop_r=cfg.trail_initial_stop_r,  # Initial stop R level from config
+                            trail_best_move_atr=0.0,
+                            next_scale_atr=1.0,
+                            scale_increment_usd=pending.scale_increment_usd or cfg.target_loss_usd,
                             entry_time_iso=_utc_now_iso(),
                             entry_close_ms=pending.entry_close_ms,
                             entry_margin_usd=pending.entry_margin_usd or cfg.margin_usd,
                             entry_leverage=pending.entry_leverage or cfg.leverage,
+                            total_margin_usd=pending.entry_margin_usd or cfg.margin_usd,
+                            total_notional_usd=(pending.entry_margin_usd or cfg.margin_usd) * (pending.entry_leverage or cfg.leverage),
                             trade_id=pending.trade_id,
                             signal_reason=pending.signal_reason,
                             # Fade fields (for bos_long_fade)
@@ -6522,43 +6276,44 @@ def run_live(cfg: LiveConfig) -> None:
                             "quantity": format_float_2(qty),
                             "r_value": format_price_for_logging(r_value, entry_tick_size),
                         })
-                        
-                        # For fade positions, place fixed TP as TAKE_PROFIT_MARKET
-                        if pos_state.is_fade and pos_state.fade_tp_price is not None:
-                            fade_tp_str = format_to_step(pos_state.fade_tp_price, filters["tick_size"])
-                            qty_str = format_to_step(qty, filters["step_size"])
-                            fade_tp_side = "BUY" if side == -1 else "SELL"  # Opposite of position
-                            fade_tp_client_id = f"ATR_FADE_TP_{int(time.time() * 1000)}"
-                            
-                            fade_tp_order = algo_take_profit_market_order(
-                                symbol=symbol,
-                                side=fade_tp_side,
-                                quantity=qty_str,
-                                trigger_price=fade_tp_str,
-                                client=client,
-                                client_order_id=fade_tp_client_id,
-                                algo_type=cfg.algo_type,
-                                working_type=cfg.algo_working_type,
-                                price_protect=cfg.algo_price_protect,
-                                reduce_only=True,
-                            )
-                            
-                            if fade_tp_order:
-                                pos_state.fade_tp_algo_id = _extract_int(fade_tp_order, ("algoId", "algoOrderId", "orderId", "id"))
-                                pos_state.fade_tp_algo_client_order_id = fade_tp_client_id
-                                log_event(cfg.log_path, {
-                                    "event": "fade_tp_placed",
-                                    "symbol": symbol,
-                                    "fade_tp_price": format_price_for_logging(pos_state.fade_tp_price, entry_tick_size),
-                                    "tp_algo_id": pos_state.fade_tp_algo_id,
-                                })
-                            else:
-                                log_event(cfg.log_path, {
-                                    "event": "fade_tp_place_failed",
-                                    "symbol": symbol,
-                                    "fade_tp_price": format_price_for_logging(pos_state.fade_tp_price, entry_tick_size),
-                                    "error": "Algo TP order failed (see logs)",
-                                })
+
+                        # Place initial SL at -1 ATR immediately
+                        sl_price = compute_sl_price(entry_price, side, pos_state.entry_atr, sl_atr_mult=1.0)
+                        sl_price_str = format_to_step(sl_price, filters["tick_size"])
+                        qty_str = format_to_step(qty, filters["step_size"])
+                        sl_side = "SELL" if side == 1 else "BUY"
+                        sl_client_id = f"ATR_SL_INIT_{int(time.time() * 1000)}"
+                        sl_order = algo_stop_limit_order(
+                            symbol=symbol,
+                            side=sl_side,
+                            quantity=qty_str,
+                            trigger_price=sl_price_str,
+                            price=None,
+                            client=client,
+                            client_order_id=sl_client_id,
+                            algo_type=cfg.algo_type,
+                            working_type=cfg.algo_working_type,
+                            price_protect=cfg.algo_price_protect,
+                            reduce_only=True,
+                            order_type="STOP_MARKET",
+                        )
+                        if sl_order:
+                            pos_state.sl_algo_id = _extract_int(sl_order, ("algoId", "algoOrderId", "orderId", "id"))
+                            pos_state.sl_algo_client_order_id = sl_client_id
+                            pos_state.sl_price = float(sl_price_str)
+                            log_event(cfg.log_path, {
+                                "event": "sl_initial_placed",
+                                "symbol": symbol,
+                                "sl_price": format_price_for_logging(pos_state.sl_price, entry_tick_size),
+                                "order_id": pos_state.sl_algo_id,
+                            })
+                        else:
+                            log_event(cfg.log_path, {
+                                "event": "sl_initial_failed",
+                                "symbol": symbol,
+                                "sl_price": format_price_for_logging(sl_price, entry_tick_size),
+                                "error": "Algo STOP order failed (see logs)",
+                            })
                     
                     del state.pending_entries[symbol]
                 

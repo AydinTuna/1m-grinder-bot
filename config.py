@@ -323,7 +323,8 @@ class BacktestConfig:
     entry_limit_timeout_bars: int = 1
     leverage: float = 10.0  # fixed leverage for static sizing
     initial_capital: float = 5.0  # starting equity (margin cap per trade)
-    margin_usd: float = 5.0  # static margin per trade
+    margin_usd: float = 5.0  # static margin per trade (legacy; target_loss_usd preferred)
+    target_loss_usd: float = 20.0  # target loss in USD for sizing (-1 ATR)
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -364,7 +365,8 @@ class LiveConfig:
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
     leverage: int = 10  # fixed leverage for static sizing
-    margin_usd: float = 100.0  # static margin per trade
+    margin_usd: float = 20.0  # static margin per trade (legacy; target_loss_usd preferred)
+    target_loss_usd: float = 20.0  # target loss in USD for sizing (-1 ATR)
 
     # Strategy thresholds
     thr1: float = 2.0
@@ -401,5 +403,5 @@ class LiveConfig:
     live_swing_levels_file: str = str(get_live_swing_levels_path())  # detected swing levels for live trading
     live_trailing_stop_updates_file: str = str(get_live_trailing_stop_updates_path())
     live_trailing_stop_realtime_file: str = str(get_live_trailing_stop_realtime_path())
-    post_only: bool = True
+    post_only: bool = False
     use_testnet: bool = True
