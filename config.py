@@ -16,10 +16,10 @@ from typing import List, Optional, Dict, Any
 #   MAJOR: Breaking changes (signal logic completely rewritten)
 #   MINOR: Signal modifications (direction changes, new signal types)
 #   PATCH: Bug fixes, config tuning
-STRATEGY_VERSION: str = "1.6.4"
+STRATEGY_VERSION: str = "1.6.5"
 
 # Brief description of current version
-STRATEGY_VERSION_NOTE: str = "Version bump to 1.6.4 (no signal logic changes)"
+STRATEGY_VERSION_NOTE: str = "Version bump to 1.6.5 (no signal logic changes)"
 
 
 # =============================================================================
@@ -316,8 +316,8 @@ class BacktestConfig:
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.1  # 0.1 = 10%
     swing_timeframe: str = "1d"
-    swing_left: int = 2
-    swing_right: int = 2
+    swing_left: int = 7
+    swing_right: int = 7
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     entry_limit_timeout_bars: int = 1
@@ -359,8 +359,8 @@ class LiveConfig:
     atr_warmup_bars: Optional[int] = None  # defaults to atr_len when None
     signal_atr_tolerance_pct: float = 0.05  # 0.05 = 5%
     swing_timeframe: str = "1d"
-    swing_left: int = 2
-    swing_right: int = 2
+    swing_left: int = 7
+    swing_right: int = 7
     swing_resample_rule: str = "1d"
     swing_proximity_atr_mult: float = 0.25
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
