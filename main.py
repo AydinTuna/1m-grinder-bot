@@ -6896,6 +6896,8 @@ def run_backtest(
     
     # Signal summary and export
     if all_signals:
+        # Ensure versioned output directories exist (signals saved even with no trades)
+        ensure_output_dirs()
         combined_signals = pd.concat(all_signals, ignore_index=True)
         
         # Sort by timestamp
