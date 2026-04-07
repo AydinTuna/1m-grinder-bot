@@ -9,3 +9,4 @@ output/
 backtets_params.json
 trail_stop_params.json
 *.md
+.DS_Store
