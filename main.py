@@ -70,6 +70,8 @@ from config import (
     LiveConfig,
     LIVE_TRADE_FIELDS,
     LIVE_SIGNAL_FIELDS,
+    LIVE_EVENT_LOG_FIELDS,
+    LIVE_TRAILING_STOP_UPDATE_FIELDS,
     BACKTEST_SIGNAL_FIELDS,
     BACKTEST_TRADE_FIELDS,
     STRATEGY_VERSION,
@@ -1007,22 +1009,37 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_csv_value(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    return value
+
+
+def append_csv_row(csv_path: str, fieldnames: List[str], payload: Dict[str, object]) -> None:
+    if not csv_path:
+        return
+    file_exists = os.path.exists(csv_path)
+    should_write_header = not file_exists or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="ascii") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if should_write_header:
+            writer.writeheader()
+        row = {field: _normalize_csv_value(payload.get(field)) for field in fieldnames}
+        writer.writerow(row)
+
+
 def log_event(log_path: str, event: Dict[str, object]) -> None:
     payload = dict(event)
     payload["ts"] = _utc_now_iso()
-    with open(log_path, "a", encoding="ascii") as f:
-        json.dump(payload, f, ensure_ascii=True)
-        f.write("\n")
+    append_csv_row(log_path, LIVE_EVENT_LOG_FIELDS, payload)
 
 
 def append_live_trailing_stop_update(file_path: str, update: Dict[str, object]) -> None:
-    if not file_path:
-        return
     payload = dict(update)
     payload["ts"] = _utc_now_iso()
-    with open(file_path, "a", encoding="ascii") as f:
-        json.dump(payload, f, ensure_ascii=True)
-        f.write("\n")
+    append_csv_row(file_path, LIVE_TRAILING_STOP_UPDATE_FIELDS, payload)
 
 
 def format_float_1(value: Optional[float]) -> Optional[float]:
@@ -2709,34 +2726,12 @@ def limit_order_inactive(order: Optional[Dict[str, object]]) -> bool:
 
 
 def append_live_trade(csv_path: str, trade: Dict[str, object]) -> None:
-    if not csv_path:
-        return
-    file_exists = os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="ascii") as f:
-        writer = csv.DictWriter(f, fieldnames=LIVE_TRADE_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        row = {}
-        for field in LIVE_TRADE_FIELDS:
-            value = trade.get(field)
-            row[field] = "" if value is None else value
-        writer.writerow(row)
+    append_csv_row(csv_path, LIVE_TRADE_FIELDS, trade)
 
 
 def append_live_signal(csv_path: str, signal_data: Dict[str, object]) -> None:
     """Append a signal to the live signals CSV file."""
-    if not csv_path:
-        return
-    file_exists = os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="ascii") as f:
-        writer = csv.DictWriter(f, fieldnames=LIVE_SIGNAL_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        row = {}
-        for field in LIVE_SIGNAL_FIELDS:
-            value = signal_data.get(field)
-            row[field] = "" if value is None else value
-        writer.writerow(row)
+    append_csv_row(csv_path, LIVE_SIGNAL_FIELDS, signal_data)
 
 
 def build_swing_levels_entry(
@@ -5505,8 +5500,6 @@ def run_live(cfg: LiveConfig) -> None:
             "stop_price": format_price_optional(pos_state.sl_price, tick_size),
             "sl_algo_id": pos_state.sl_algo_id,
             "sl_algo_status": sl_status,
-            "is_fade": pos_state.is_fade,
-            "fade_tp_hit": None,
         })
 
         append_live_trade(cfg.live_trades_csv, {
@@ -5936,10 +5929,6 @@ def run_live(cfg: LiveConfig) -> None:
                 "atr": format_price_for_logging(atr_value, tick_size),
                 "signal": signal,
                 "signal_reason": signal_reason,
-                "fade_direction": signal_result.fade_direction,
-                "fade_entry": format_price_for_logging(signal_result.fade_entry, tick_size) if signal_result.fade_entry else None,
-                "fade_tp": format_price_for_logging(signal_result.fade_tp, tick_size) if signal_result.fade_tp else None,
-                "fade_sl": None,
             })
         
         if signal == 0 or signal_atr is None or atr_value is None:

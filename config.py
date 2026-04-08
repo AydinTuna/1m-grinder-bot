@@ -126,8 +126,8 @@ def get_live_trades_path() -> Path:
 
 
 def get_live_log_path() -> Path:
-    """Get file path for live trading log."""
-    return get_live_logs_dir() / "trade_log.jsonl"
+    """Get file path for live trading event log CSV."""
+    return get_live_logs_dir() / "trade_log.csv"
 
 
 def get_live_swing_levels_path() -> Path:
@@ -136,8 +136,8 @@ def get_live_swing_levels_path() -> Path:
 
 
 def get_live_trailing_stop_updates_path() -> Path:
-    """Get file path for live trailing stop updates JSONL."""
-    return get_live_trailing_stop_updates_dir() / "trailing_stop_updates.jsonl"
+    """Get file path for live trailing stop updates CSV."""
+    return get_live_trailing_stop_updates_dir() / "trailing_stop_updates.csv"
 
 
 def get_live_trailing_stop_realtime_path() -> Path:
@@ -265,6 +265,81 @@ LIVE_SIGNAL_FIELDS: List[str] = [
     "signal_reason",     # e.g. "swing_high_rejection_short", "momentum_long", etc.
     "trade_id",          # Unique ID if signal was acted upon (links to trade)
     "strategy_version",  # Version of strategy that generated this signal
+]
+
+LIVE_EVENT_LOG_FIELDS: List[str] = [
+    "ts",
+    "event",
+    "symbol",
+    "side",
+    "status",
+    "message",
+    "error",
+    "error_code",
+    "status_code",
+    "entry_time",
+    "exit_time",
+    "close_time_ms",
+    "entry_price",
+    "exit_price",
+    "signal_entry_price",
+    "signal_atr",
+    "entry_atr",
+    "atr",
+    "r_value",
+    "body",
+    "open",
+    "high",
+    "low",
+    "close",
+    "quantity",
+    "stop_price",
+    "sl_price",
+    "prev_trailing_stop",
+    "new_trailing_stop",
+    "spread_pct",
+    "margin_usd",
+    "base_margin_usd",
+    "adjusted_margin_usd",
+    "target_loss_usd",
+    "target_notional",
+    "leverage",
+    "base_leverage",
+    "requested_leverage",
+    "adjusted_leverage",
+    "max_leverage",
+    "signal",
+    "signal_reason",
+    "exit_reason",
+    "exit_price_source",
+    "order_id",
+    "order_type",
+    "sl_algo_id",
+    "sl_algo_status",
+    "trailing_mode",
+    "best_move_atr",
+    "positions",
+    "pending_entries",
+    "count",
+    "max_open_positions",
+    "total_symbols",
+    "entry_signal_workers",
+    "signal_interval",
+    "symbols",
+    "tracked_symbols",
+]
+
+LIVE_TRAILING_STOP_UPDATE_FIELDS: List[str] = [
+    "ts",
+    "event",
+    "symbol",
+    "side",
+    "trailing_mode",
+    "close_time_ms",
+    "prev_trailing_stop",
+    "new_trailing_stop",
+    "best_move_atr",
+    "order_id",
 ]
 
 # Fields for backtest signals with trade outcome tracking
