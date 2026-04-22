@@ -21,4 +21,4 @@ jobs:
             cd "${{ secrets.SERVER_PATH }}"
             git fetch origin
             git pull origin main
-            pm2 restart atr-strategy || pm2 start main.py --name atr-strategy --interpreter python3
+            pm2 restart atr-strategy || pm2 start main.py --name atr-strategy --interpreter python3 -- --mode live
