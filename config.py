@@ -145,6 +145,11 @@ def get_live_trailing_stop_realtime_path() -> Path:
     return get_live_trailing_stop_realtime_dir() / "trailing_stop_levels.json"
 
 
+def get_live_traded_close_times_path() -> Path:
+    """Get file path for persisted traded signal close times (restart-safe re-entry guard)."""
+    return get_live_signals_dir() / "traded_close_times.json"
+
+
 def ensure_output_dirs() -> None:
     """Create all output subdirectories if they don't exist."""
     dirs = [
@@ -261,7 +266,7 @@ LIVE_SIGNAL_FIELDS: List[str] = [
     "low",
     "close",
     "atr",
-    "status",            # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_OPEN_POSITION", "SKIPPED_PENDING"
+    "status",            # "ACTED", "SKIPPED_MAX_POS", "SKIPPED_HAS_POS", "SKIPPED_OPEN_POSITION", "SKIPPED_PENDING", "SKIPPED_ALREADY_TRADED"
     "signal_reason",     # e.g. "swing_high_rejection_short", "momentum_long", etc.
     "trade_id",          # Unique ID if signal was acted upon (links to trade)
     "strategy_version",  # Version of strategy that generated this signal
@@ -478,5 +483,6 @@ class LiveConfig:
     live_swing_levels_file: str = str(get_live_swing_levels_path())  # detected swing levels for live trading
     live_trailing_stop_updates_file: str = str(get_live_trailing_stop_updates_path())
     live_trailing_stop_realtime_file: str = str(get_live_trailing_stop_realtime_path())
+    traded_close_times_file: str = str(get_live_traded_close_times_path())
     post_only: bool = False
     use_testnet: bool = True

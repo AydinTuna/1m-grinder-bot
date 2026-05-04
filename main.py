@@ -973,7 +973,10 @@ class LiveState:
     last_trail_close_ms: Dict[str, int] = None  # type: ignore
     # Leverage set per symbol
     current_leverage_by_symbol: Dict[str, float] = None  # type: ignore
-    
+    # close_time_ms of the signal candle that was last acted upon per symbol.
+    # Persisted to disk so re-entry is blocked even after bot restarts.
+    traded_close_times: Dict[str, int] = None  # type: ignore
+
     def __post_init__(self) -> None:
         if self.positions is None:
             self.positions = {}
@@ -985,6 +988,8 @@ class LiveState:
             self.last_trail_close_ms = {}
         if self.current_leverage_by_symbol is None:
             self.current_leverage_by_symbol = {}
+        if self.traded_close_times is None:
+            self.traded_close_times = {}
     
     def position_count(self) -> int:
         """Returns the number of active strategy positions."""
@@ -1007,6 +1012,35 @@ class LiveState:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_traded_close_times(file_path: str) -> Dict[str, int]:
+    """Load persisted traded_close_times from disk.
+
+    Returns a dict mapping symbol -> close_time_ms of the last signal candle
+    that was acted upon.  Returns an empty dict on any error or if the file
+    does not exist yet.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): int(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except Exception:
+        return {}
+
+
+def save_traded_close_times(file_path: str, data: Dict[str, int]) -> None:
+    """Persist traded_close_times to disk (best-effort, never raises)."""
+    if not file_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def _normalize_csv_value(value: object) -> object:
@@ -5658,6 +5692,21 @@ def run_live(cfg: LiveConfig) -> None:
             "symbols": list(state.positions.keys()),
         })
 
+    # Load persisted traded_close_times so that re-entry is blocked even after
+    # a bot restart (the same signal candle won't open a second position).
+    state.traded_close_times = load_traded_close_times(cfg.traded_close_times_file)
+    # Pre-seed last_signal_close_ms from traded_close_times so the in-memory
+    # deduplication also kicks in immediately without a redundant API round-trip.
+    for _sym, _close_ms in state.traded_close_times.items():
+        if _sym not in state.last_signal_close_ms:
+            state.last_signal_close_ms[_sym] = _close_ms
+    if state.traded_close_times:
+        log_event(cfg.log_path, {
+            "event": "traded_close_times_loaded",
+            "count": len(state.traded_close_times),
+            "symbols": list(state.traded_close_times.keys()),
+        })
+
     signal_workers = max(1, int(cfg.entry_signal_workers))
     signal_log_lock = threading.Lock()
     swing_levels_lock = threading.Lock()
@@ -6377,12 +6426,20 @@ def run_live(cfg: LiveConfig) -> None:
                     candle_open = candle_high = candle_low = candle_close = 0.0
                 
                 # Determine signal status
+                signal_candle_close_ms = state.last_signal_close_ms.get(symbol)
                 if state.has_position(symbol):
                     status = "SKIPPED_HAS_POS"
                 elif symbol in exchange_open_symbols:
                     status = "SKIPPED_OPEN_POSITION"
                 elif state.has_pending_entry(symbol):
                     status = "SKIPPED_PENDING"
+                elif (
+                    signal_candle_close_ms is not None
+                    and signal_candle_close_ms == state.traded_close_times.get(symbol)
+                ):
+                    # This exact signal candle already resulted in a trade.
+                    # Block re-entry until a genuinely new candle fires.
+                    status = "SKIPPED_ALREADY_TRADED"
                 elif not state.can_open_position(cfg.max_open_positions):
                     status = "SKIPPED_MAX_POS"
                 else:
@@ -6451,6 +6508,15 @@ def run_live(cfg: LiveConfig) -> None:
                     ):
                         # Successfully placed entry order
                         logging.info("Entry order placed for %s", symbol)
+
+                        # Record that this signal candle has been traded so that
+                        # re-entry is blocked for the remainder of this candle's
+                        # lifetime — even across bot restarts.
+                        if signal_candle_close_ms is not None:
+                            state.traded_close_times[symbol] = signal_candle_close_ms
+                            save_traded_close_times(
+                                cfg.traded_close_times_file, state.traded_close_times
+                            )
                         
                         # Clear fade info after placing the fade position
                         if is_fade and symbol in fade_positions:
