@@ -446,7 +446,7 @@ class LiveConfig:
     atr_history_bars: int = 365  # bars to pull for stable ATR/EMA (1d candles)
     leverage: int = 10  # fixed leverage for static sizing
     margin_usd: float = 20.0  # static margin per trade (legacy; target_loss_usd preferred)
-    target_loss_usd: float = 20.0  # target loss in USD for sizing (-1 ATR)
+    target_loss_usd: float = 100.0  # target loss in USD for sizing (-1 ATR)
 
     # Strategy thresholds
     thr1: float = 2.0
