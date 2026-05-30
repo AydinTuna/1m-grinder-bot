@@ -413,7 +413,8 @@ class BacktestConfig:
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
-    
+    bos_penetration_body_ratio: float = 0.5  # BOS: penetration/body above => fade (opposite candle)
+
     # Risk/exit controls - trailing stop only
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)
@@ -451,7 +452,8 @@ class LiveConfig:
     # Strategy thresholds
     thr1: float = 2.0
     thr2: float = 2.0
-    
+    bos_penetration_body_ratio: float = 0.5  # BOS: penetration/body above => fade (opposite candle)
+
     # Risk/exit controls - trailing stop only (no TP/SL on entry)
     use_trailing_stop: bool = True
     trailing_mode: str = "r_ladder"  # "r_ladder" (current) or "dynamic_atr" (new)

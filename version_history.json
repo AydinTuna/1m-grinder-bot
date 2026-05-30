@@ -1,6 +1,27 @@
 {
   "versions": [
     {
+      "version": "1.6.6",
+      "date": "2026-05-29",
+      "changes": [
+        "BOS direction from close penetration vs body: deep break fades, shallow break follows candle",
+        "Split bos_short into bos_short_fade (LONG) and bos_short_break (SHORT)",
+        "Split bos_long into bos_long_fade (SHORT at close) and bos_long_break (LONG)",
+        "Added bos_penetration_body_ratio config (default 0.5)"
+      ],
+      "signal_directions": {
+        "hh_breakout_long": "LONG",
+        "ll_breakdown_short": "LONG",
+        "hh_red_above_hl_long": "LONG",
+        "hl_bounce_long": "LONG",
+        "lh_rejection_short": "SHORT",
+        "bos_short_fade": "LONG",
+        "bos_short_break": "SHORT",
+        "bos_long_fade": "SHORT",
+        "bos_long_break": "LONG"
+      }
+    },
+    {
       "version": "1.6.5",
       "date": "2026-02-03",
       "changes": [

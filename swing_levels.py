@@ -743,6 +743,7 @@ def build_market_structure_signals(
     body_atr_mult: float = 2.0,
     structure_proximity_atr_mult: float = 0.5,
     tolerance_pct: float = 0.0,
+    bos_penetration_body_ratio: float = 0.5,
 ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """
     Generate trading signals based on market structure (HH/HL/LL/LH).
@@ -766,14 +767,14 @@ def build_market_structure_signals(
     - Near LL level + green candle closing below LH → SHORT
     
     BREAK OF STRUCTURE (BOS) SIGNALS:
-    - In uptrend, if price closes below recent HL → SHORT (BOS)
-    - In downtrend, if price closes above recent LH → BOS LONG fade setup (SHORT first)
+    - Uptrend + red + close below HL, or downtrend + green + close above LH (big body).
+    - penetration = close distance beyond HL/LH; compare to bos_penetration_body_ratio * body.
+    - penetration > ratio * body → trade opposite candle (bos_short_fade / bos_long_fade).
+    - penetration <= ratio * body → trade with candle (bos_short_break / bos_long_break).
     
-    BOS_LONG_FADE TRADE:
-    - Market SELL (SHORT) at signal candle close
-    - SL at close + 1 ATR (cancels trade if hit)
-    - Exit uses trailing stop (classic trailing top)
-    - No long flip after exit
+    BOS_LONG_FADE (deep break only):
+    - Market SELL (SHORT) at signal candle close via signal_fade_* fields.
+    - Trailing stop manages exit; no long flip after exit.
     
     Returns:
         signal_dir: +1 long, -1 short, 0 none
@@ -947,23 +948,32 @@ def build_market_structure_signals(
     # =========================================================================
     # BREAK OF STRUCTURE (BOS) SIGNALS
     # =========================================================================
-    
-    # BOS Short: In uptrend, price closes below recent HL with big red body
-    bos_short = in_uptrend & big_body & is_red & last_hl.notna() & (df["close"] < last_hl)
-    signal[bos_short] = 1
-    signal_reason[bos_short] = "bos_short"
+    bos_ratio = max(0.0, float(bos_penetration_body_ratio))
 
-    # BOS Long Fade: In downtrend, price closes above recent LH with big green body
-    # This signal uses a FADE TRADE: SHORT first, then flip to LONG on TP
-    bos_long_fade = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
-    signal[bos_long_fade] = -1  # Fade position is SHORT
-    signal_reason[bos_long_fade] = "bos_long_fade"
+    # Uptrend bearish BOS: red candle closes below HL
+    bos_short_mask = in_uptrend & big_body & is_red & last_hl.notna() & (df["close"] < last_hl)
+    penetration_short = last_hl - df["close"]
+    deep_short = bos_short_mask & (penetration_short > bos_ratio * body)
+    shallow_short = bos_short_mask & ~deep_short
 
-    # Fade trade setup for bos_long_fade:
-    # 1. Market SELL (SHORT) at close
-    # 3. No fixed SL; trailing stop manages exit
-    signal_fade_direction[bos_long_fade] = -1  # SHORT fade first
-    signal_fade_entry[bos_long_fade] = df["close"]  # Market entry at close
+    signal[deep_short] = 1
+    signal_reason[deep_short] = "bos_short_fade"
+    signal[shallow_short] = -1
+    signal_reason[shallow_short] = "bos_short_break"
+
+    # Downtrend bullish BOS: green candle closes above LH
+    bos_long_mask = in_downtrend & big_body & is_green & last_lh.notna() & (df["close"] > last_lh)
+    penetration_long = df["close"] - last_lh
+    deep_long = bos_long_mask & (penetration_long > bos_ratio * body)
+    shallow_long = bos_long_mask & ~deep_long
+
+    signal[deep_long] = -1
+    signal_reason[deep_long] = "bos_long_fade"
+    signal_fade_direction[deep_long] = -1
+    signal_fade_entry[deep_long] = df["close"]
+
+    signal[shallow_long] = 1
+    signal_reason[shallow_long] = "bos_long_break"
 
     # Set signal ATR for active signals
     active = signal != 0

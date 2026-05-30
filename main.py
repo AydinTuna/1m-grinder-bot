@@ -418,6 +418,7 @@ def backtest_atr_grinder(df: pd.DataFrame, cfg: BacktestConfig) -> Tuple[pd.Data
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        bos_penetration_body_ratio=cfg.bos_penetration_body_ratio,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -3900,6 +3901,7 @@ def backtest_atr_grinder_lib(
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        bos_penetration_body_ratio=cfg.bos_penetration_body_ratio,
     )
 
     warmup_bars = cfg.atr_len if cfg.atr_warmup_bars is None else cfg.atr_warmup_bars
@@ -4965,6 +4967,7 @@ def compute_live_signal(df: pd.DataFrame, cfg: LiveConfig) -> Tuple[int, Optiona
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        bos_penetration_body_ratio=cfg.bos_penetration_body_ratio,
     )
 
     signal_val = int(signal.iloc[-1])
@@ -5027,6 +5030,7 @@ def compute_live_signal_extended(df: pd.DataFrame, cfg: LiveConfig) -> LiveSigna
         body_atr_mult=cfg.thr2,
         structure_proximity_atr_mult=cfg.swing_proximity_atr_mult,
         tolerance_pct=cfg.signal_atr_tolerance_pct,
+        bos_penetration_body_ratio=cfg.bos_penetration_body_ratio,
     )
 
     signal_val = int(signal.iloc[-1])
