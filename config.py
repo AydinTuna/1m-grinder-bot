@@ -404,7 +404,7 @@ class BacktestConfig:
     leverage: float = 10.0  # fixed leverage for static sizing
     initial_capital: float = 5.0  # starting equity (margin cap per trade)
     margin_usd: float = 5.0  # static margin per trade (legacy; target_loss_usd preferred)
-    target_loss_usd: float = 20.0  # target loss in USD for sizing (-1 ATR)
+    target_loss_usd: float = 100.0  # target loss in USD for sizing (-1 ATR)
 
     # Costs
     fee_rate: float = 0.0000    # per side (0.04% typical maker/taker varies)
@@ -487,4 +487,4 @@ class LiveConfig:
     live_trailing_stop_realtime_file: str = str(get_live_trailing_stop_realtime_path())
     traded_close_times_file: str = str(get_live_traded_close_times_path())
     post_only: bool = False
-    use_testnet: bool = False
+    use_testnet: bool = True
